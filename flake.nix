@@ -113,7 +113,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "goose-1.30.0" = "sha256-cKp7IN4nIACN75XWymZy0a07hdRy5xgkozErcJHcfFs=";
+              "goose-1.31.0" = "sha256-Cp1wNczg/YnouxwX7tFgyfodooL0ToTb7sWvstSK/wA=";
               "rmcp-1.2.0" = "sha256-pOmwJ6Lp3H5mM5IK/0OxLiVIwhIXKX/giw3qzJM6xAI=";
               "sacp-11.0.0" = "sha256-dcjr32HbUUBPDSMhz+xMBmfXEd3vImT+KVeKXfjXaOU=";
             };

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-goose = { git = "https://github.com/aaif-goose/goose", tag = "v1.30.0", default-features = false, features = ["rustls-tls"] }
+goose = { git = "https://github.com/aaif-goose/goose", tag = "v1.31.0", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
