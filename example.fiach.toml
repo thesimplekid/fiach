@@ -1,0 +1,26 @@
+[daemon]
+repos = ["owner/repo"]
+interval = 100
+model = "google/gemini-3.1-pro-preview"
+pr_state = ["open", "merged"] # Options: "open", "merged", "closed", "all" (can also be a comma-separated string)
+skip_prs = ["1870"] # Skip specific PR numbers globally or per repo
+drafts = false # Set to true to also review draft PRs
+out_dir = "reports" # Local directory to store reports
+report_mode = "sync-pr" # Options: local, pr-comment, sync-pr
+sync_repo = "thesimplekid/cdk-reviews" # GitHub repo to sync to if report_mode = "sync-pr"
+notify_on_empty = false
+max_turns = 300
+# with_skill = "rust-security" # Load a specific domain skill
+
+[review]
+model = "google/gemini-3.1-pro-preview"
+max_turns = 60
+timeout_mins = 30
+report_mode = "sync-pr"
+sync_repo = "thesimplekid/cdk-reviews"
+notify_on_empty = false
+# max_cost_usd = 5.0
+
+# Optional: Define additional context repositories to clone into the temporary workspace alongside the target PR
+# [context_groups."owner/repo"]
+# repos = ["owner/another-repo"]
