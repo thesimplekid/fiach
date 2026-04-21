@@ -166,6 +166,7 @@ pub async fn run_review(
             params.pr_number,
             &workspace.commit_hash,
             params.force,
+            params.timeout_mins,
         )?;
 
         if decision == state::ReviewDecision::Skip {

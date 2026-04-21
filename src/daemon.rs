@@ -157,6 +157,7 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
                                     pr.number,
                                     &pr.head_ref_oid,
                                     false,
+                                    params.timeout_mins,
                                 ) {
                                     if decision != crate::state::ReviewDecision::Skip {
                                         let meta = crate::state::ReviewMetadata {
@@ -200,6 +201,7 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
                                     pr.number,
                                     &pr.head_ref_oid,
                                     false,
+                                    params.timeout_mins,
                                 ) {
                                     if decision != crate::state::ReviewDecision::Skip {
                                         let meta = crate::state::ReviewMetadata {
@@ -237,6 +239,7 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
                                 pr.number,
                                 &pr.head_ref_oid,
                                 false,
+                                params.timeout_mins,
                             ) {
                                 Ok(crate::state::ReviewDecision::FirstReview)
                                 | Ok(crate::state::ReviewDecision::ReReview) => {
@@ -246,12 +249,13 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
                                             repo,
                                             pr.number,
                                             &pr.head_ref_oid,
-                                            false
+                                            false,
+                                            params.timeout_mins
                                         ),
                                         Ok(crate::state::ReviewDecision::ReReview)
                                     );
 
-                                    match crate::state::lock_for_review(&params.db_path, repo, pr.number, &pr.head_ref_oid) {
+                                    match crate::state::lock_for_review(&params.db_path, repo, pr.number, &pr.head_ref_oid, params.timeout_mins) {
                                         Ok(true) => {
                                             tracing::debug!(repo = %repo, pr = pr.number, "Successfully locked PR for review");
                                         }
@@ -299,7 +303,7 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
                                         output_price_per_m: params.output_price_per_m,
                                         is_rereview,
                                         execution: ReviewExecution {
-                                            skip_state_check: false,
+                                            skip_state_check: true,
                                             persist_side_effects: true,
                                             result_json: None,
                                         },

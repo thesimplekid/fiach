@@ -79,6 +79,7 @@ pub fn should_review(
     pr: u64,
     current_hash: &str,
     force: bool,
+    timeout_mins: u64,
 ) -> Result<ReviewDecision> {
     if force {
         tracing::debug!("Force flag set, bypassing state check");
@@ -111,11 +112,23 @@ pub fn should_review(
             match serde_json::from_str::<ReviewMetadata>(json_str) {
                 Ok(metadata) => {
                     if metadata.status == "in_progress" {
-                        tracing::debug!(
-                            repo, pr,
-                            "PR review is already in progress, skipping"
-                        );
-                        return Ok(ReviewDecision::Skip);
+                        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                        let age_secs = now - metadata.timestamp;
+                        let timeout_secs = (timeout_mins + 10) * 60; // 10 min grace period
+                        
+                        if age_secs as u64 > timeout_secs {
+                            tracing::warn!(
+                                repo, pr, age_secs, timeout_secs,
+                                "Found stale in_progress lock, proceeding with review"
+                            );
+                            // Fall through to commit hash check
+                        } else {
+                            tracing::debug!(
+                                repo, pr,
+                                "PR review is already in progress, skipping"
+                            );
+                            return Ok(ReviewDecision::Skip);
+                        }
                     }
                     if metadata.commit_hash == current_hash {
                         tracing::debug!(
@@ -175,7 +188,7 @@ pub fn mark_reviewed(db_path: &Path, repo: &str, pr: u64, metadata: &ReviewMetad
 
 /// Locks a PR for review by marking it as in_progress.
 /// Returns true if the lock was acquired, false if it's already in progress by another process.
-pub fn lock_for_review(db_path: &Path, repo: &str, pr: u64, commit_hash: &str) -> Result<bool> {
+pub fn lock_for_review(db_path: &Path, repo: &str, pr: u64, commit_hash: &str, timeout_mins: u64) -> Result<bool> {
     if !db_path.exists() {
         // Proceed and let Database::create handle it
     }
@@ -190,9 +203,21 @@ pub fn lock_for_review(db_path: &Path, repo: &str, pr: u64, commit_hash: &str) -
             
             if let Some(value) = pr_table.get(key.as_str())? {
                 let json_str = value.value();
+                #[allow(clippy::collapsible_if)]
                 if let Ok(metadata) = serde_json::from_str::<ReviewMetadata>(json_str) {
                     if metadata.status == "in_progress" {
-                        return Ok(false);
+                        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                        let age_secs = now - metadata.timestamp;
+                        let timeout_secs = (timeout_mins + 10) * 60; // 10 min grace period
+                        
+                        if age_secs as u64 <= timeout_secs {
+                            return Ok(false);
+                        } else {
+                            tracing::warn!(
+                                repo, pr, age_secs, timeout_secs,
+                                "Overwriting stale in_progress lock"
+                            );
+                        }
                     }
                 }
             }
@@ -287,7 +312,7 @@ pub fn list_reviews(db_path: &Path) -> Result<Vec<(String, u64, ReviewMetadata)>
         }
 
         // Sort by timestamp descending (newest first)
-        reviews.sort_by(|a, b| b.2.timestamp.cmp(&a.2.timestamp));
+        reviews.sort_by_key(|b| std::cmp::Reverse(b.2.timestamp));
 
         Ok(reviews)
     })
