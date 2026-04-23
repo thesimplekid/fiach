@@ -367,7 +367,7 @@
                   repos = cfg.repos;
                   interval = cfg.interval;
                   updated_within_days = cfg.updatedWithinDays;
-                  pr_states = cfg.prStates;
+                  pr_state = cfg.prStates;
                   pr_limit = cfg.prLimit;
                   model = cfg.model;
                   persona = cfg.persona;
