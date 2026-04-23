@@ -188,6 +188,7 @@ pub async fn run_daemon(
                                             report_url: None,
                                             is_rereview: decision == crate::state::ReviewDecision::ReReview,
                                             time_reviewed: Some(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default()),
+                                            retry_count: 0,
                                         };
                                         let _ = crate::state::mark_reviewed(
                                             &params.db_path,
@@ -232,6 +233,7 @@ pub async fn run_daemon(
                                             report_url: None,
                                             is_rereview: decision == crate::state::ReviewDecision::ReReview,
                                             time_reviewed: Some(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default()),
+                                            retry_count: 0,
                                         };
                                         let _ = crate::state::mark_reviewed(
                                             &params.db_path,
@@ -254,18 +256,18 @@ pub async fn run_daemon(
                                 params.timeout_mins,
                             ) {
                                 Ok(crate::state::ReviewDecision::FirstReview)
-                                | Ok(crate::state::ReviewDecision::ReReview) => {
-                                    let is_rereview = matches!(
-                                        crate::state::should_review(
-                                            &params.db_path,
-                                            repo,
-                                            pr.number,
-                                            &pr.head_ref_oid,
-                                            false,
-                                            params.timeout_mins
-                                        ),
-                                        Ok(crate::state::ReviewDecision::ReReview)
-                                    );
+                                | Ok(crate::state::ReviewDecision::ReReview)
+                                | Ok(crate::state::ReviewDecision::RetryFailed) => {
+                                    let decision = crate::state::should_review(
+                                        &params.db_path,
+                                        repo,
+                                        pr.number,
+                                        &pr.head_ref_oid,
+                                        false,
+                                        params.timeout_mins,
+                                    )?;
+                                    let is_rereview =
+                                        matches!(decision, crate::state::ReviewDecision::ReReview);
 
                                     match crate::state::lock_for_review(
                                         &params.db_path,
@@ -294,7 +296,14 @@ pub async fn run_daemon(
                                         }
                                     }
 
-                                    tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "New PR or commit needs review");
+                                    match decision {
+                                        crate::state::ReviewDecision::RetryFailed => {
+                                            tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "Retrying previously failed PR review");
+                                        }
+                                        _ => {
+                                            tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "New PR or commit needs review");
+                                        }
+                                    }
 
                                     let safe_repo = repo.replace('/', "_");
                                     let out_file_name = format!(
@@ -346,6 +355,16 @@ pub async fn run_daemon(
                                     };
 
                                     if let Err(e) = review_result {
+                                        let retry_count = crate::state::get_pr_review(
+                                            &params.db_path,
+                                            repo,
+                                            pr.number,
+                                        )
+                                        .ok()
+                                        .flatten()
+                                        .map(|m| m.retry_count)
+                                        .unwrap_or(0);
+
                                         let meta = crate::state::ReviewMetadata {
                                             commit_hash: pr.head_ref_oid.clone(),
                                             model: "daemon".to_string(),
@@ -362,6 +381,7 @@ pub async fn run_daemon(
                                             report_url: None,
                                             is_rereview,
                                             time_reviewed: Some(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default()),
+                                            retry_count,
                                         };
                                         let _ = crate::state::mark_reviewed(
                                             &params.db_path,
@@ -498,17 +518,15 @@ async fn trigger_manual_review(
     let pr_details: PrDetails =
         serde_json::from_slice(&output.stdout).context("Failed to parse PR details")?;
 
-    let is_rereview = matches!(
-        crate::state::should_review(
-            &params.db_path,
-            &repo,
-            pr_number,
-            &pr_details.head_ref_oid,
-            false,
-            params.timeout_mins
-        ),
-        Ok(crate::state::ReviewDecision::ReReview)
-    );
+    let decision = crate::state::should_review(
+        &params.db_path,
+        &repo,
+        pr_number,
+        &pr_details.head_ref_oid,
+        false,
+        params.timeout_mins,
+    )?;
+    let is_rereview = matches!(decision, crate::state::ReviewDecision::ReReview);
 
     match crate::state::lock_for_review(
         &params.db_path,
@@ -530,7 +548,14 @@ async fn trigger_manual_review(
         }
     }
 
-    tracing::info!(repo = %repo, pr = pr_number, commit = %pr_details.head_ref_oid, "Starting manual PR review");
+    match decision {
+        crate::state::ReviewDecision::RetryFailed => {
+            tracing::info!(repo = %repo, pr = pr_number, commit = %pr_details.head_ref_oid, "Retrying previously failed manual PR review");
+        }
+        _ => {
+            tracing::info!(repo = %repo, pr = pr_number, commit = %pr_details.head_ref_oid, "Starting manual PR review");
+        }
+    }
 
     let safe_repo = repo.replace('/', "_");
     let out_file_name = format!(
@@ -576,6 +601,12 @@ async fn trigger_manual_review(
     };
 
     if let Err(e) = review_result {
+        let retry_count = crate::state::get_pr_review(&params.db_path, &repo, pr_number)
+            .ok()
+            .flatten()
+            .map(|m| m.retry_count)
+            .unwrap_or(0);
+
         let meta = crate::state::ReviewMetadata {
             commit_hash: pr_details.head_ref_oid.clone(),
             model: "daemon".to_string(),
@@ -596,6 +627,7 @@ async fn trigger_manual_review(
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default(),
             ),
+            retry_count,
         };
         let _ = crate::state::mark_reviewed(&params.db_path, &repo, pr_number, &meta);
 
@@ -720,13 +752,17 @@ async fn run_sandboxed_review(
     cmd.arg(format!("--setenv=SSL_CERT_FILE={}", ssl_cert_file));
     cmd.arg(format!("--setenv=NIX_SSL_CERT_FILE={}", nix_ssl_cert_file));
 
-    // Network mode.  "veth" requires the entrypoint script inside the
+    // Network mode.  "bridge" attaches to the host's br-nspawn network.
+    // "veth" requires the entrypoint script inside the
     // container to configure host0 -- which needs CAP_NET_ADMIN inside the
     // container's net namespace.  "host" shares the host network and needs
     // no extra capabilities.  "private" gives loopback only.
     #[allow(clippy::collapsible_if)]
     if let Some(net) = &params.sandbox_network {
-        if net == "veth" {
+        if net == "bridge" {
+            cmd.arg("--network-bridge=br-nspawn");
+            cmd.arg("--capability=CAP_NET_ADMIN"); // Required for dhcpcd to set IP/routes
+        } else if net == "veth" {
             cmd.arg("--network-veth");
             cmd.arg("--capability=CAP_NET_ADMIN");
         } else if net == "private" {

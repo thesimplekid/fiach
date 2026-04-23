@@ -944,6 +944,11 @@ pub async fn run_review(
                         .format(&time::format_description::well_known::Rfc3339)
                         .unwrap_or_default(),
                 ),
+                retry_count: state::get_pr_review(&params.db_path, &params.repo, params.pr_number)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.retry_count)
+                    .unwrap_or(0),
             },
             should_notify,
             report_path: report_file.to_path_buf(),

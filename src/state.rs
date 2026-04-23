@@ -32,6 +32,8 @@ pub struct ReviewMetadata {
     pub is_rereview: bool,
     #[serde(default)]
     pub time_reviewed: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,6 +41,7 @@ pub enum ReviewDecision {
     Skip,
     FirstReview,
     ReReview,
+    RetryFailed,
 }
 
 fn with_retries<T, F>(mut action: F) -> Result<T>
@@ -131,6 +134,15 @@ pub fn should_review(
                         }
                     }
                     if metadata.commit_hash == current_hash {
+                        if metadata.status == "failed" {
+                            tracing::info!(
+                                commit = %current_hash,
+                                retries = metadata.retry_count,
+                                "Retrying previously failed review at the same commit"
+                            );
+                            return Ok(ReviewDecision::RetryFailed);
+                        }
+
                         tracing::debug!(
                             commit = %current_hash,
                             model = %metadata.model,
@@ -251,6 +263,25 @@ pub fn lock_for_review(
                         .format(&time::format_description::well_known::Rfc3339)
                         .unwrap_or_default(),
                 ),
+                retry_count: 0,
+            };
+
+            let metadata = if let Some(value) = pr_table.get(key.as_str())? {
+                let json_str = value.value();
+                if let Ok(previous) = serde_json::from_str::<ReviewMetadata>(json_str) {
+                    if previous.commit_hash == commit_hash && previous.status == "failed" {
+                        ReviewMetadata {
+                            retry_count: previous.retry_count.saturating_add(1),
+                            ..metadata
+                        }
+                    } else {
+                        metadata
+                    }
+                } else {
+                    metadata
+                }
+            } else {
+                metadata
             };
 
             let json_str =
