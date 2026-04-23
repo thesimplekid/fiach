@@ -178,7 +178,7 @@ In your `flake.nix` or `configuration.nix`:
             # Polling settings
             interval = 300;
             updatedWithinDays = 120;
-            prStates = [ "open" ];
+            prStates = [ "open" "merged" ];
             prLimit = 1000;
             
             # The persona to use (defaults to builtin:security if omitted)

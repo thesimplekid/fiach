@@ -44,7 +44,7 @@ pub async fn start_server(port: u16, state: AppState) -> Result<()> {
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!("Starting web server on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
