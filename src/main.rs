@@ -196,6 +196,14 @@ enum Commands {
         #[arg(long)]
         output_price: Option<f64>,
 
+        /// Number of days to look back for updated PRs
+        #[arg(long)]
+        updated_within_days: Option<u32>,
+
+        /// Maximum number of PRs to fetch from GitHub
+        #[arg(long)]
+        pr_limit: Option<u32>,
+
         /// Rootfs path for sandboxed execution via systemd-nspawn
         #[arg(long)]
         sandbox_rootfs: Option<PathBuf>,
@@ -360,6 +368,8 @@ async fn main() -> Result<()> {
             drafts,
             input_price,
             output_price,
+            updated_within_days,
+            pr_limit,
             sandbox_rootfs,
             sandbox_network,
             sandbox_extra_args,
@@ -445,6 +455,10 @@ async fn main() -> Result<()> {
                 max_cost_usd: max_cost.or(daemon_cfg.max_cost_usd),
                 input_price_per_m: input_price.or(daemon_cfg.input_price_per_m),
                 output_price_per_m: output_price.or(daemon_cfg.output_price_per_m),
+                updated_within_days: updated_within_days
+                    .or(daemon_cfg.updated_within_days)
+                    .unwrap_or(120),
+                pr_limit: pr_limit.or(daemon_cfg.pr_limit).unwrap_or(1000),
                 sandbox_rootfs: sandbox_rootfs.or(daemon_cfg.sandbox_rootfs),
                 sandbox_network: sandbox_network.or(daemon_cfg.sandbox_network),
                 sandbox_extra_args: sandbox_extra_args.or(daemon_cfg.sandbox_extra_args),

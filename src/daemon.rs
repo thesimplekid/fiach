@@ -30,6 +30,8 @@ pub struct DaemonParams {
     pub max_cost_usd: Option<f64>,
     pub input_price_per_m: Option<f64>,
     pub output_price_per_m: Option<f64>,
+    pub updated_within_days: u32,
+    pub pr_limit: u32,
     pub sandbox_rootfs: Option<PathBuf>,
     pub sandbox_network: Option<String>,
     pub sandbox_extra_args: Option<Vec<String>>,
@@ -84,10 +86,11 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
 
             tracing::debug!(repo = %repo, "Checking for open PRs");
 
-            // Look for PRs updated in the last 4 months (120 days)
-            let four_months_ago = OffsetDateTime::now_utc() - time::Duration::days(120);
+            // Look for PRs updated in the last N days
+            let time_ago =
+                OffsetDateTime::now_utc() - time::Duration::days(params.updated_within_days.into());
             let format = format_description::parse("[year]-[month]-[day]").unwrap();
-            let search_date = four_months_ago.format(&format).unwrap();
+            let search_date = time_ago.format(&format).unwrap();
 
             for state in &params.pr_states {
                 if cancel_token.is_cancelled() {
@@ -108,7 +111,7 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
                         "--search",
                         &search_query,
                         "--limit",
-                        "1000",
+                        &params.pr_limit.to_string(),
                         "--json",
                         "number,headRefOid,headRefName,title",
                     ])
@@ -255,7 +258,13 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
                                         Ok(crate::state::ReviewDecision::ReReview)
                                     );
 
-                                    match crate::state::lock_for_review(&params.db_path, repo, pr.number, &pr.head_ref_oid, params.timeout_mins) {
+                                    match crate::state::lock_for_review(
+                                        &params.db_path,
+                                        repo,
+                                        pr.number,
+                                        &pr.head_ref_oid,
+                                        params.timeout_mins,
+                                    ) {
                                         Ok(true) => {
                                             tracing::debug!(repo = %repo, pr = pr.number, "Successfully locked PR for review");
                                         }
@@ -265,7 +274,12 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
                                             continue;
                                         }
                                         Err(e) => {
-                                            tracing::error!("Failed to lock PR {} in {}: {}", pr.number, repo, e);
+                                            tracing::error!(
+                                                "Failed to lock PR {} in {}: {}",
+                                                pr.number,
+                                                repo,
+                                                e
+                                            );
                                             failed += 1;
                                             continue;
                                         }
@@ -459,8 +473,12 @@ async fn run_sandboxed_review(
         &review_params.repo,
         review_params.pr_number,
     )?;
-    std::fs::create_dir_all(&run_dir)
-        .with_context(|| format!("Failed to create sandbox run directory at {}", run_dir.display()))?;
+    std::fs::create_dir_all(&run_dir).with_context(|| {
+        format!(
+            "Failed to create sandbox run directory at {}",
+            run_dir.display()
+        )
+    })?;
     let report_path = run_dir.join("report.md");
     let result_json = run_dir.join("result.json");
     let runtime_rootfs = prepare_runtime_rootfs(rootfs, &run_dir).await?;
@@ -477,7 +495,10 @@ async fn run_sandboxed_review(
     ] {
         let path = runtime_rootfs.join(dir.trim_start_matches('/'));
         std::fs::create_dir_all(&path).with_context(|| {
-            format!("Failed to create sandbox runtime directory at {}", path.display())
+            format!(
+                "Failed to create sandbox runtime directory at {}",
+                path.display()
+            )
         })?;
     }
 
@@ -493,7 +514,10 @@ async fn run_sandboxed_review(
     // in /bin (populated by the Nix-built rootfs's pathsToLink = [ "/bin" ... ]).
     cmd.arg("--setenv=PATH=/bin");
     cmd.arg(format!("--setenv=HOME={}", sandbox_home));
-    cmd.arg(format!("--setenv=XDG_STATE_HOME={}", sandbox_xdg_state_home));
+    cmd.arg(format!(
+        "--setenv=XDG_STATE_HOME={}",
+        sandbox_xdg_state_home
+    ));
     cmd.arg(format!(
         "--bind={}:{}",
         run_dir.display(),
@@ -518,8 +542,8 @@ async fn run_sandboxed_review(
     // the parent service does not export Nix certificate environment vars.
     let ssl_cert_file = std::env::var("SSL_CERT_FILE")
         .unwrap_or_else(|_| "/etc/ssl/certs/ca-bundle.crt".to_string());
-    let nix_ssl_cert_file = std::env::var("NIX_SSL_CERT_FILE")
-        .unwrap_or_else(|_| ssl_cert_file.clone());
+    let nix_ssl_cert_file =
+        std::env::var("NIX_SSL_CERT_FILE").unwrap_or_else(|_| ssl_cert_file.clone());
     cmd.arg(format!("--setenv=SSL_CERT_FILE={}", ssl_cert_file));
     cmd.arg(format!("--setenv=NIX_SSL_CERT_FILE={}", nix_ssl_cert_file));
 

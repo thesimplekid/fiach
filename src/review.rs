@@ -133,7 +133,12 @@ pub async fn run_review(
         let skill_path = skills_dir
             .as_ref()
             .map(|dir| dir.join(skill_name).join("SKILL.md"))
-            .unwrap_or_else(|| PathBuf::from(".agents").join("skills").join(skill_name).join("SKILL.md"));
+            .unwrap_or_else(|| {
+                PathBuf::from(".agents")
+                    .join("skills")
+                    .join(skill_name)
+                    .join("SKILL.md")
+            });
         if !skill_path.exists() {
             let available = list_available_skills(skills_dir.as_deref());
             if available.is_empty() {
@@ -205,8 +210,9 @@ pub async fn run_review(
 
     // Ensure parent directory exists
     if let Some(parent) = std::path::Path::new(&report_path).parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create report directory at {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create report directory at {}", parent.display())
+        })?;
     }
 
     tracing::info!(
@@ -967,13 +973,12 @@ pub async fn run_review(
 
         if let Some(result_json) = &params.execution.result_json {
             if let Some(parent) = result_json.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| {
-                        format!(
-                            "Failed to create review result directory at {}",
-                            parent.display()
-                        )
-                    })?;
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "Failed to create review result directory at {}",
+                        parent.display()
+                    )
+                })?;
             }
             fs::write(result_json, serde_json::to_vec_pretty(&completed)?)
                 .context("Failed to write sandbox review result")?;

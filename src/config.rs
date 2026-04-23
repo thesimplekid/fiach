@@ -57,6 +57,8 @@ pub struct DaemonConfig {
     pub max_cost_usd: Option<f64>,
     pub input_price_per_m: Option<f64>,
     pub output_price_per_m: Option<f64>,
+    pub updated_within_days: Option<u32>,
+    pub pr_limit: Option<u32>,
     // Sandbox options
     pub sandbox_rootfs: Option<PathBuf>,
     pub sandbox_network: Option<String>,

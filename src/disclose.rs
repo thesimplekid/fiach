@@ -220,8 +220,8 @@ async fn create_sync_pr(
     let existing_report_path = repo_dir.join(repo).join(format!("pr-{}.md", pr_number));
 
     let final_report_content = if existing_report_path.exists() {
-        let old_content =
-            std::fs::read_to_string(&existing_report_path).context("Failed to read existing report")?;
+        let old_content = std::fs::read_to_string(&existing_report_path)
+            .context("Failed to read existing report")?;
         if old_content == report_content {
             tracing::info!("Report content is identical to existing report, skipping update");
 
@@ -259,8 +259,12 @@ async fn create_sync_pr(
 
     let dest_dir = repo_dir.join(repo);
 
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("Failed to create destination directories at {}", dest_dir.display()))?;
+    std::fs::create_dir_all(&dest_dir).with_context(|| {
+        format!(
+            "Failed to create destination directories at {}",
+            dest_dir.display()
+        )
+    })?;
 
     std::fs::write(&existing_report_path, final_report_content)
         .context("Failed to write report file")?;
@@ -284,7 +288,10 @@ async fn create_sync_pr(
     } else {
         commit_hash
     };
-    let commit_msg = format!("audit({}-pr{}): {} ({})", safe_repo_name, pr_number, title, short_hash);
+    let commit_msg = format!(
+        "audit({}-pr{}): {} ({})",
+        safe_repo_name, pr_number, title, short_hash
+    );
     let output = Command::new("git")
         .args([
             "-c",
@@ -376,7 +383,10 @@ async fn create_sync_pr(
     }
 
     // gh pr create
-    let pr_body = format!("Automated vulnerability report for {}#{} at commit {}", repo, pr_number, commit_hash);
+    let pr_body = format!(
+        "Automated vulnerability report for {}#{} at commit {}",
+        repo, pr_number, commit_hash
+    );
     let display_title = format!("{}#{} ({}): {}", repo, pr_number, short_hash, title);
     let output = Command::new("gh")
         .args([
@@ -404,7 +414,6 @@ async fn create_sync_pr(
 
     Ok(pr_url)
 }
-
 
 fn combine_reports(old: &str, new: &str) -> String {
     let (old_frontmatter, old_body) = split_report(old);

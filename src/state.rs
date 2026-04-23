@@ -115,18 +115,18 @@ pub fn should_review(
                         let now = time::OffsetDateTime::now_utc().unix_timestamp();
                         let age_secs = now - metadata.timestamp;
                         let timeout_secs = (timeout_mins + 10) * 60; // 10 min grace period
-                        
+
                         if age_secs as u64 > timeout_secs {
                             tracing::warn!(
-                                repo, pr, age_secs, timeout_secs,
+                                repo,
+                                pr,
+                                age_secs,
+                                timeout_secs,
                                 "Found stale in_progress lock, proceeding with review"
                             );
                             // Fall through to commit hash check
                         } else {
-                            tracing::debug!(
-                                repo, pr,
-                                "PR review is already in progress, skipping"
-                            );
+                            tracing::debug!(repo, pr, "PR review is already in progress, skipping");
                             return Ok(ReviewDecision::Skip);
                         }
                     }
@@ -188,7 +188,13 @@ pub fn mark_reviewed(db_path: &Path, repo: &str, pr: u64, metadata: &ReviewMetad
 
 /// Locks a PR for review by marking it as in_progress.
 /// Returns true if the lock was acquired, false if it's already in progress by another process.
-pub fn lock_for_review(db_path: &Path, repo: &str, pr: u64, commit_hash: &str, timeout_mins: u64) -> Result<bool> {
+pub fn lock_for_review(
+    db_path: &Path,
+    repo: &str,
+    pr: u64,
+    commit_hash: &str,
+    timeout_mins: u64,
+) -> Result<bool> {
     if !db_path.exists() {
         // Proceed and let Database::create handle it
     }
@@ -196,11 +202,11 @@ pub fn lock_for_review(db_path: &Path, repo: &str, pr: u64, commit_hash: &str, t
     with_retries(|| {
         let db = Database::create(db_path).context("Failed to open or create redb database")?;
         let write_txn = db.begin_write()?;
-        
+
         {
             let mut pr_table = write_txn.open_table(PR_STATE)?;
             let key = format!("{}_{}", repo, pr);
-            
+
             if let Some(value) = pr_table.get(key.as_str())? {
                 let json_str = value.value();
                 #[allow(clippy::collapsible_if)]
@@ -209,19 +215,22 @@ pub fn lock_for_review(db_path: &Path, repo: &str, pr: u64, commit_hash: &str, t
                         let now = time::OffsetDateTime::now_utc().unix_timestamp();
                         let age_secs = now - metadata.timestamp;
                         let timeout_secs = (timeout_mins + 10) * 60; // 10 min grace period
-                        
+
                         if age_secs as u64 <= timeout_secs {
                             return Ok(false);
                         } else {
                             tracing::warn!(
-                                repo, pr, age_secs, timeout_secs,
+                                repo,
+                                pr,
+                                age_secs,
+                                timeout_secs,
                                 "Overwriting stale in_progress lock"
                             );
                         }
                     }
                 }
             }
-            
+
             let metadata = ReviewMetadata {
                 commit_hash: commit_hash.to_string(),
                 model: "daemon".to_string(),
@@ -237,13 +246,18 @@ pub fn lock_for_review(db_path: &Path, repo: &str, pr: u64, commit_hash: &str, t
                 cost_usd: Some(0.0),
                 report_url: None,
                 is_rereview: false,
-                time_reviewed: Some(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default()),
+                time_reviewed: Some(
+                    time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
+                ),
             };
-            
-            let json_str = serde_json::to_string(&metadata).context("Failed to serialize ReviewMetadata")?;
+
+            let json_str =
+                serde_json::to_string(&metadata).context("Failed to serialize ReviewMetadata")?;
             pr_table.insert(key.as_str(), json_str.as_str())?;
         }
-        
+
         write_txn.commit()?;
         Ok(true)
     })

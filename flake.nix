@@ -178,6 +178,18 @@
             description = "Polling interval in seconds";
           };
 
+          updatedWithinDays = lib.mkOption {
+            type = lib.types.int;
+            default = 120;
+            description = "Number of days to look back for updated PRs";
+          };
+
+          prLimit = lib.mkOption {
+            type = lib.types.int;
+            default = 1000;
+            description = "Maximum number of PRs to fetch from GitHub per polling cycle";
+          };
+
           model = lib.mkOption {
             type = lib.types.str;
             default = "openrouter/google/gemini-3.1-pro-preview";
@@ -349,6 +361,8 @@
                 daemon = {
                   repos = cfg.repos;
                   interval = cfg.interval;
+                  updated_within_days = cfg.updatedWithinDays;
+                  pr_limit = cfg.prLimit;
                   model = cfg.model;
                   persona = cfg.persona;
                   db_path = "${cfg.dataDir}/fiach.redb";
