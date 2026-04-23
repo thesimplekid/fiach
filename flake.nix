@@ -184,6 +184,12 @@
             description = "Number of days to look back for updated PRs";
           };
 
+          prStates = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ "open" ];
+            description = "List of PR states to poll (e.g. ['open', 'closed', 'merged'])";
+          };
+
           prLimit = lib.mkOption {
             type = lib.types.int;
             default = 1000;
@@ -362,6 +368,7 @@
                   repos = cfg.repos;
                   interval = cfg.interval;
                   updated_within_days = cfg.updatedWithinDays;
+                  pr_states = cfg.prStates;
                   pr_limit = cfg.prLimit;
                   model = cfg.model;
                   persona = cfg.persona;

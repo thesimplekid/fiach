@@ -172,8 +172,14 @@ In your `flake.nix` or `configuration.nix`:
           services.fiach = {
             enable = true;
             
-            # The repos to poll (active in the last 4 months)
+            # The repos to poll
             repos = [ "my-org/core-app" "my-org/website" ];
+            
+            # Polling settings
+            interval = 300;
+            updatedWithinDays = 120;
+            prStates = [ "open" ];
+            prLimit = 1000;
             
             # The persona to use (defaults to builtin:security if omitted)
             persona = "builtin:security";
@@ -208,6 +214,30 @@ In your `flake.nix` or `configuration.nix`:
   };
 }
 ```
+
+### Available Configuration Options
+
+The following options are available under `services.fiach`:
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enable` | boolean | `false` | Enable the Fiach Daemon. |
+| `repos` | list of string | *none* | List of repositories to monitor (e.g., `["org/repo"]`). |
+| `interval` | integer | `300` | Polling interval in seconds. |
+| `updatedWithinDays` | integer | `120` | Number of days to look back for updated PRs. |
+| `prStates` | list of string | `["open"]` | List of PR states to poll (e.g., `["open"]`, `["open", "merged"]`). |
+| `prLimit` | integer | `1000` | Maximum number of PRs to fetch from GitHub per polling cycle. |
+| `model` | string | `"openrouter/google/gemini-3.1-pro-preview"` | OpenRouter model to use. |
+| `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and `OPENROUTER_API_KEY`. |
+| `persona` | string | `"builtin:security"` | Persona source to use (e.g., `"builtin:security"` or an absolute path). |
+| `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`) | `"local"` | Mode for reporting findings. |
+| `syncRepo` | string or null | `null` | GitHub repository to sync reports to. Required if `reportMode` is `"sync-pr"`. |
+| `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no vulnerabilities were found. |
+| `dataDir` | string | `"/var/lib/fiach"` | Directory to store state database and reports. |
+| `contextGroups` | attrset | `{}` | Context groups mapped by target repo (contains `repos` list). |
+| `sandbox.enable` | boolean | `false` | Enable Sandboxed PR reviews via systemd-nspawn. |
+| `sandbox.networkMode`| enum (`"host"`, `"private"`, `"veth"`) | `"host"` | Network mode for the sandbox. |
+| `sandbox.extraArgs` | list of string | `[]` | Extra arguments to pass to `systemd-nspawn`. |
 
 ### Sandbox Networking Limits
 
