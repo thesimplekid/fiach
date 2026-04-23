@@ -1,5 +1,5 @@
 {
-  description = "CTF Reviewer";
+  description = "Fiach";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -113,8 +113,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "goose-1.31.0" = "sha256-Cp1wNczg/YnouxwX7tFgyfodooL0ToTb7sWvstSK/wA=";
-              "rmcp-1.2.0" = "sha256-pOmwJ6Lp3H5mM5IK/0OxLiVIwhIXKX/giw3qzJM6xAI=";
+              "goose-1.32.0" = "sha256-n0u98JY10klMqvPALNxifnHQJWqaTBfKEIZrWfZAVSY=";
               "sacp-11.0.0" = "sha256-dcjr32HbUUBPDSMhz+xMBmfXEd3vImT+KVeKXfjXaOU=";
             };
           };
