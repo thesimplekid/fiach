@@ -1247,6 +1247,7 @@ name = "fiach"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "config",
  "dotenvy",
@@ -1260,6 +1261,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4841,6 +4843,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

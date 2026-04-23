@@ -18,6 +18,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 - **Skip PRs:** Ability to skip specific PRs by number or `repo#number` format.
 - **State Tracking:** Uses a lightweight, embedded Rust database (`redb`) to remember which commit hashes have already been reviewed, preventing redundant LLM calls.
 - **Workspace Isolation:** Clones the repository and checks out the PR branch into a temporary directory *before* giving control to the AI agent, saving valuable context window and turns.
+- **Interactive Web Server:** The daemon includes a built-in HTTP server to monitor its status, view review history, and manually trigger reviews on-demand without waiting for the next polling cycle.
 
 ---
 
@@ -91,6 +92,33 @@ cargo run -- review \
   --persona "builtin:code-quality" \
   --report-mode local
 ```
+
+### 4. Interacting with the Daemon Web Server
+
+When running the daemon, an interactive web server starts automatically on port `3000` (configurable via `--port`). This allows you to inspect the daemon's history and trigger reviews on demand.
+
+- **Check health:**
+  ```bash
+  curl http://localhost:3000/health
+  ```
+- **List all reviewed PRs:**
+  ```bash
+  curl http://localhost:3000/reviews
+  ```
+- **Trigger a manual review immediately:**
+  ```bash
+  curl -X POST -H "Content-Type: application/json" \
+       -d '{"owner":"my-org", "repo":"repo", "pr":42}' \
+       http://localhost:3000/review
+  ```
+- **Get JSON metadata for a specific review:**
+  ```bash
+  curl "http://localhost:3000/review?owner=my-org&repo=repo&pr=42"
+  ```
+- **Read the Markdown report for a specific review:**
+  ```bash
+  curl "http://localhost:3000/review/content?owner=my-org&repo=repo&pr=42"
+  ```
 
 ---
 
@@ -217,6 +245,7 @@ This lets NixOS/systemd deployments keep using bundled skills such as `rust-secu
 - `src/main.rs`: CLI argument parsing and orchestration.
 - `src/daemon.rs`: Polling loop, PR discovery via GitHub CLI (`updated:>=`), and deduplication.
 - `src/review.rs`: Sets up the Goose agent, injects the persona, and streams LLM output.
+- `src/server.rs`: Axum-based interactive web server for daemon management and reporting.
 - `src/workspace.rs`: Manages cloning the repo and checking out the PR into a temporary directory.
 - `src/disclose.rs`: Handles the `ReportMode` logic (commenting or creating Sync PRs).
 - `src/state.rs`: Manages the `redb` database for tracking reviewed commit hashes.

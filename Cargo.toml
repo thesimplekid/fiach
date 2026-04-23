@@ -20,6 +20,8 @@ redb = "4"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tempfile = "3.27.0"
 config = { version = "0.15.22", features = ["toml"] }
+axum = "0.8.9"
+tower-http = { version = "0.6.8", features = ["trace"] }
 
 # Goose's workspace [patch.crates-io] doesn't propagate to downstream consumers.
 # sacp "unstable" feature only exists in the git fork, not on crates.io.

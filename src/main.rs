@@ -3,6 +3,7 @@ mod daemon;
 mod disclose;
 mod persona;
 mod review;
+mod server;
 mod state;
 mod workspace;
 
@@ -215,6 +216,10 @@ enum Commands {
         /// Extra arguments to pass to systemd-nspawn
         #[arg(long)]
         sandbox_extra_args: Option<Vec<String>>,
+
+        /// Port for the interactive web server (defaults to 3000)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// List history of reviewed PRs
     History {
@@ -373,6 +378,7 @@ async fn main() -> Result<()> {
             sandbox_rootfs,
             sandbox_network,
             sandbox_extra_args,
+            port,
         } => {
             let daemon_cfg = config.daemon.unwrap_or_default();
 
@@ -432,6 +438,7 @@ async fn main() -> Result<()> {
                 max_turns: max_turns.or(daemon_cfg.max_turns).unwrap_or(60),
                 timeout_mins: timeout_mins.or(daemon_cfg.timeout_mins).unwrap_or(30),
                 db_path: db_path
+                    .clone()
                     .or(daemon_cfg.db_path)
                     .unwrap_or_else(|| PathBuf::from("fiach.redb")),
                 max_retries: max_retries.or(daemon_cfg.max_retries).unwrap_or(3),
@@ -464,7 +471,24 @@ async fn main() -> Result<()> {
                 sandbox_extra_args: sandbox_extra_args.or(daemon_cfg.sandbox_extra_args),
             };
 
-            daemon::run_daemon(params, cancel_token).await
+            let port = port.unwrap_or(3000);
+            let (tx, rx) = tokio::sync::mpsc::channel(100);
+            let app_state = server::AppState {
+                db_path: params.db_path.clone(),
+                out_dir: params
+                    .out_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("reports")),
+                daemon_tx: tx,
+            };
+
+            tokio::spawn(async move {
+                if let Err(e) = server::start_server(port, app_state).await {
+                    tracing::error!("Web server error: {}", e);
+                }
+            });
+
+            daemon::run_daemon(params, rx, cancel_token).await
         }
         Commands::History {
             db_path,

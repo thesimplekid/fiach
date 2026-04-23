@@ -264,6 +264,31 @@ pub fn lock_for_review(
 }
 
 /// Retrieves review metadata for a specific commit hash.
+pub fn get_pr_review(db_path: &Path, repo: &str, pr: u64) -> Result<Option<ReviewMetadata>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    with_retries(|| {
+        let db = Database::create(db_path).context("Failed to open redb database")?;
+        let read_txn = db.begin_read()?;
+
+        let table = match read_txn.open_table(PR_STATE) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+
+        let key = format!("{}_{}", repo, pr);
+        if let Some(value) = table.get(key.as_str())? {
+            let json_str = value.value();
+            let metadata: ReviewMetadata = serde_json::from_str(json_str)?;
+            Ok(Some(metadata))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
 pub fn get_commit_review(
     db_path: &Path,
     repo: &str,

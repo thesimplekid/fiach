@@ -5,10 +5,15 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::disclose::DiscloseConfig;
 use crate::review::{CompletedReview, ReviewExecution, ReviewParams, run_review};
+
+pub enum DaemonMessage {
+    TriggerReview { repo: String, pr_number: u64 },
+}
 
 pub struct DaemonParams {
     pub repos: String,
@@ -47,7 +52,11 @@ struct PullRequest {
     title: String,
 }
 
-pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -> Result<()> {
+pub async fn run_daemon(
+    params: DaemonParams,
+    mut rx: mpsc::Receiver<DaemonMessage>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
     let repo_list: Vec<String> = params
         .repos
         .split(',')
@@ -435,9 +444,173 @@ pub async fn run_daemon(params: DaemonParams, cancel_token: CancellationToken) -
         );
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
+            Some(msg) = rx.recv() => {
+                match msg {
+                    DaemonMessage::TriggerReview { repo, pr_number } => {
+                        tracing::info!("Received trigger to review {}/{}", repo, pr_number);
+                        if let Err(e) = trigger_manual_review(&params, repo, pr_number, cancel_token.clone()).await {
+                            tracing::error!("Failed to manually trigger review: {}", e);
+                        }
+                    }
+                }
+            }
             _ = cancel_token.cancelled() => {
                 tracing::info!("Sleep interrupted, shutting down");
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn trigger_manual_review(
+    params: &DaemonParams,
+    repo: String,
+    pr_number: u64,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    tracing::info!(repo = %repo, pr = pr_number, "Fetching manual PR details");
+
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            &repo,
+            "--json",
+            "headRefOid",
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to fetch PR details: {}", stderr);
+    }
+
+    #[derive(Deserialize)]
+    struct PrDetails {
+        #[serde(rename = "headRefOid")]
+        head_ref_oid: String,
+    }
+
+    let pr_details: PrDetails =
+        serde_json::from_slice(&output.stdout).context("Failed to parse PR details")?;
+
+    let is_rereview = matches!(
+        crate::state::should_review(
+            &params.db_path,
+            &repo,
+            pr_number,
+            &pr_details.head_ref_oid,
+            false,
+            params.timeout_mins
+        ),
+        Ok(crate::state::ReviewDecision::ReReview)
+    );
+
+    match crate::state::lock_for_review(
+        &params.db_path,
+        &repo,
+        pr_number,
+        &pr_details.head_ref_oid,
+        params.timeout_mins,
+    ) {
+        Ok(true) => {
+            tracing::debug!(repo = %repo, pr = pr_number, "Successfully locked PR for review");
+        }
+        Ok(false) => {
+            tracing::info!(repo = %repo, pr = pr_number, "PR is currently locked by another process, skipping");
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::error!("Failed to lock PR {} in {}: {}", pr_number, repo, e);
+            return Err(e);
+        }
+    }
+
+    tracing::info!(repo = %repo, pr = pr_number, commit = %pr_details.head_ref_oid, "Starting manual PR review");
+
+    let safe_repo = repo.replace('/', "_");
+    let out_file_name = format!(
+        "{}_PR{}_{}_report.md",
+        safe_repo,
+        pr_number,
+        &pr_details.head_ref_oid[..7]
+    );
+    let output_path = params.out_dir.as_ref().map(|dir| dir.join(out_file_name));
+
+    let review_params = ReviewParams {
+        repo: repo.clone(),
+        pr_number,
+        model: params.model.clone(),
+        output: output_path,
+        skill: params.skill.clone(),
+        persona: params.persona.clone(),
+        max_turns: params.max_turns,
+        timeout_mins: params.timeout_mins,
+        db_path: params.db_path.clone(),
+        force: false,
+        max_retries: params.max_retries,
+        retry_delay_secs: params.retry_delay_secs,
+        disclose_config: params.disclose_config.clone(),
+        context_groups: params.context_groups.clone(),
+        max_cost_usd: params.max_cost_usd,
+        input_price_per_m: params.input_price_per_m,
+        output_price_per_m: params.output_price_per_m,
+        is_rereview,
+        execution: ReviewExecution {
+            skip_state_check: true,
+            persist_side_effects: true,
+            result_json: None,
+        },
+    };
+
+    let review_result = if params.sandbox_rootfs.is_some() {
+        run_sandboxed_review(params, &review_params, cancel_token.clone()).await
+    } else {
+        run_review(review_params, cancel_token.clone())
+            .await
+            .map(|_| ())
+    };
+
+    if let Err(e) = review_result {
+        let meta = crate::state::ReviewMetadata {
+            commit_hash: pr_details.head_ref_oid.clone(),
+            model: "daemon".to_string(),
+            timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
+            findings_count: 0,
+            status: "failed".to_string(),
+            severity: "none".to_string(),
+            pr_classification: "none".to_string(),
+            duration_secs: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cost_usd: Some(0.0),
+            report_url: None,
+            is_rereview,
+            time_reviewed: Some(
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            ),
+        };
+        let _ = crate::state::mark_reviewed(&params.db_path, &repo, pr_number, &meta);
+
+        if cancel_token.is_cancelled() {
+            return Err(e);
+        }
+        tracing::error!(
+            "Failed to manually review PR {} in {}: {}",
+            pr_number,
+            repo,
+            e
+        );
+        if crate::review::is_fatal_error(&e) {
+            tracing::error!("Fatal error encountered, stopping daemon");
+            return Err(e);
         }
     }
 
