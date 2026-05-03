@@ -218,6 +218,12 @@
             description = "Mode for reporting findings. Options: local, pr-comment, sync-pr";
           };
 
+          maxTurns = lib.mkOption {
+            type = lib.types.int;
+            default = 60;
+            description = "Maximum number of turns for the agent (prevents runaway costs)";
+          };
+
           syncRepo = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
             default = null;
@@ -374,6 +380,7 @@
                   db_path = "${cfg.dataDir}/fiach.redb";
                   out_dir = "${cfg.dataDir}/reports";
                   report_mode = cfg.reportMode;
+                  max_turns = cfg.maxTurns;
                 } // lib.optionalAttrs (cfg.syncRepo != null) {
                   sync_repo = cfg.syncRepo;
                 } // lib.optionalAttrs cfg.notifyOnEmpty {
