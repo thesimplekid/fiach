@@ -345,6 +345,19 @@
                 cp -R ${./.agents/skills} $out/etc/fiach/skills
               '';
 
+              # systemd-nspawn rejects directory roots that do not look like an
+              # OS tree. The sandbox only needs a small command environment, but
+              # newer systemd releases still require /usr and os-release.
+              sandboxOsRelease = pkgs.runCommand "fiach-sandbox-os-release" {} ''
+                mkdir -p $out/etc $out/usr/lib
+                cat > $out/etc/os-release <<EOF
+                NAME="Fiach Sandbox"
+                ID=fiach-sandbox
+                PRETTY_NAME="Fiach Sandbox"
+                EOF
+                ln -s ../../etc/os-release $out/usr/lib/os-release
+              '';
+
               sandboxRootfs = pkgs.buildEnv {
                 name = "fiach-sandbox-rootfs";
                 paths = with pkgs; [
@@ -363,8 +376,9 @@
                   python3
                   sandboxEntrypoint
                   sandboxSkills
+                  sandboxOsRelease
                 ];
-                pathsToLink = [ "/bin" "/etc" "/share" ];
+                pathsToLink = [ "/bin" "/etc" "/share" "/usr" ];
               };
 
               tomlFormat = pkgs.formats.toml {};
