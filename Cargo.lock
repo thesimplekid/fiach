@@ -6278,13 +6278,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "sacp"
-version = "11.0.0"
-source = "git+https://github.com/agentclientprotocol/symposium-acp?rev=14086c9#14086c93482ea0618ea6ca7a4d1288953569147e"
-
-[[patch.unused]]
-name = "sacp-derive"
-version = "11.0.0"
-source = "git+https://github.com/agentclientprotocol/symposium-acp?rev=14086c9#14086c93482ea0618ea6ca7a4d1288953569147e"
