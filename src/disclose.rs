@@ -42,6 +42,14 @@ pub struct DiscloseConfig {
     pub notify_on_empty: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct ExistingSyncPr {
+    number: u64,
+    url: String,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+}
+
 pub async fn handle_disclosure(
     report_path: &Path,
     repo: &str,
@@ -141,10 +149,13 @@ async fn create_sync_pr(
         .context("Failed to create temporary directory for sync PR")?;
 
     let repo_dir = tmp_dir.path().join("repo");
+    let repo_dir_str = repo_dir
+        .to_str()
+        .context("Sync repository path must be valid UTF-8")?;
 
     // Clone the sync repo
     let output = Command::new("gh")
-        .args(["repo", "clone", sync_repo, repo_dir.to_str().unwrap()])
+        .args(["repo", "clone", sync_repo, repo_dir_str])
         .output()
         .await
         .context("Failed to run `gh repo clone`")?;
@@ -163,6 +174,8 @@ async fn create_sync_pr(
 
     let safe_repo_name = repo.replace("/", "-");
     let branch_name = format!("report/{}-pr{}", safe_repo_name, pr_number);
+    let base_branch = current_git_branch(&repo_dir).await?;
+    let existing_open_pr = find_open_sync_pr(&repo_dir, &branch_name, &base_branch).await?;
 
     // Check if the branch exists on remote
     let output = Command::new("git")
@@ -174,48 +187,13 @@ async fn create_sync_pr(
 
     let branch_exists = !output.stdout.is_empty();
 
-    if branch_exists {
-        tracing::info!(
-            "Branch {} exists on remote, fetching and checking out",
-            branch_name
-        );
-        let output = Command::new("git")
-            .args(["fetch", "origin", &branch_name])
-            .current_dir(&repo_dir)
-            .output()
-            .await
-            .context("Failed to fetch remote branch")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to fetch remote branch: {}", stderr);
-        }
-
-        let output = Command::new("git")
-            .args(["checkout", &branch_name])
-            .current_dir(&repo_dir)
-            .output()
-            .await
-            .context("Failed to checkout remote branch")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to checkout remote branch: {}", stderr);
-        }
-    } else {
-        // Create a new branch
-        let output = Command::new("git")
-            .args(["checkout", "-b", &branch_name])
-            .current_dir(&repo_dir)
-            .output()
-            .await
-            .context("Failed to create branch")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to create git branch: {}", stderr);
-        }
-    }
+    checkout_report_branch(
+        &repo_dir,
+        &branch_name,
+        &base_branch,
+        branch_exists && existing_open_pr.is_some(),
+    )
+    .await?;
 
     let existing_report_path = repo_dir.join(repo).join(format!("pr-{}.md", pr_number));
 
@@ -225,28 +203,8 @@ async fn create_sync_pr(
         if old_content == report_content {
             tracing::info!("Report content is identical to existing report, skipping update");
 
-            // Still need to return the PR URL
-            let pr_list = Command::new("gh")
-                .args([
-                    "pr",
-                    "list",
-                    "--head",
-                    &branch_name,
-                    "--state",
-                    "open",
-                    "--json",
-                    "url",
-                ])
-                .current_dir(&repo_dir)
-                .output()
-                .await
-                .context("Failed to run gh pr list")?;
-
-            let prs: Vec<serde_json::Value> =
-                serde_json::from_slice(&pr_list.stdout).unwrap_or_default();
-            if !prs.is_empty() {
-                let pr_url = prs[0]["url"].as_str().unwrap_or("unknown").to_string();
-                return Ok(pr_url);
+            if let Some(pr) = existing_open_pr {
+                return Ok(pr.url);
             }
             return Ok("unknown".to_string());
         }
@@ -316,28 +274,8 @@ async fn create_sync_pr(
         {
             tracing::info!("No changes to commit, skipping PR creation");
 
-            // Still need to return the PR URL
-            let pr_list = Command::new("gh")
-                .args([
-                    "pr",
-                    "list",
-                    "--head",
-                    &branch_name,
-                    "--state",
-                    "open",
-                    "--json",
-                    "url",
-                ])
-                .current_dir(&repo_dir)
-                .output()
-                .await
-                .context("Failed to run gh pr list")?;
-
-            let prs: Vec<serde_json::Value> =
-                serde_json::from_slice(&pr_list.stdout).unwrap_or_default();
-            if !prs.is_empty() {
-                let pr_url = prs[0]["url"].as_str().unwrap_or("unknown").to_string();
-                return Ok(pr_url);
+            if let Some(pr) = existing_open_pr {
+                return Ok(pr.url);
             }
             return Ok("unknown".to_string());
         }
@@ -357,27 +295,8 @@ async fn create_sync_pr(
         bail!("Failed to git push: {}", stderr);
     }
 
-    // Check for existing PR
-    let pr_list = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--head",
-            &branch_name,
-            "--state",
-            "open",
-            "--json",
-            "url",
-        ])
-        .current_dir(&repo_dir)
-        .output()
-        .await
-        .context("Failed to run gh pr list")?;
-
-    let prs: Vec<serde_json::Value> = serde_json::from_slice(&pr_list.stdout).unwrap_or_default();
-
-    if !prs.is_empty() {
-        let pr_url = prs[0]["url"].as_str().unwrap_or("unknown").to_string();
+    if let Some(pr) = find_open_sync_pr(&repo_dir, &branch_name, &base_branch).await? {
+        let pr_url = pr.url;
         tracing::info!("Updated existing Sync PR: {}", pr_url);
         return Ok(pr_url);
     }
@@ -396,6 +315,8 @@ async fn create_sync_pr(
             &display_title,
             "--body",
             &pr_body,
+            "--base",
+            &base_branch,
             "--head",
             &branch_name,
         ])
@@ -413,6 +334,157 @@ async fn create_sync_pr(
     tracing::info!("Successfully created Sync PR: {}", pr_url);
 
     Ok(pr_url)
+}
+
+async fn current_git_branch(repo_dir: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(repo_dir)
+        .output()
+        .await
+        .context("Failed to determine sync repo default branch")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to determine sync repo default branch: {}", stderr);
+    }
+
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        bail!("Sync repo clone is not on a branch");
+    }
+
+    Ok(branch)
+}
+
+async fn checkout_report_branch(
+    repo_dir: &Path,
+    branch_name: &str,
+    base_branch: &str,
+    update_existing_pr_branch: bool,
+) -> Result<()> {
+    let remote_ref = if update_existing_pr_branch {
+        let branch_ref = format!("refs/heads/{branch_name}:refs/remotes/origin/{branch_name}");
+        let output = Command::new("git")
+            .args(["fetch", "origin", &branch_ref])
+            .current_dir(repo_dir)
+            .output()
+            .await
+            .context("Failed to fetch remote report branch")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to fetch remote report branch: {}", stderr);
+        }
+
+        tracing::info!(
+            branch = %branch_name,
+            "Updating existing open sync PR branch"
+        );
+        format!("origin/{branch_name}")
+    } else {
+        let base_ref = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
+        let output = Command::new("git")
+            .args(["fetch", "origin", &base_ref])
+            .current_dir(repo_dir)
+            .output()
+            .await
+            .context("Failed to fetch sync repo base branch")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to fetch sync repo base branch: {}", stderr);
+        }
+
+        tracing::info!(
+            branch = %branch_name,
+            base = %base_branch,
+            "Creating report branch from sync repo base branch"
+        );
+        format!("origin/{base_branch}")
+    };
+
+    let output = Command::new("git")
+        .args(["checkout", "-B", branch_name, &remote_ref])
+        .current_dir(repo_dir)
+        .output()
+        .await
+        .context("Failed to checkout report branch")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to checkout report branch: {}", stderr);
+    }
+
+    Ok(())
+}
+
+async fn find_open_sync_pr(
+    repo_dir: &Path,
+    branch_name: &str,
+    base_branch: &str,
+) -> Result<Option<ExistingSyncPr>> {
+    let pr_list = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--head",
+            branch_name,
+            "--state",
+            "open",
+            "--json",
+            "number,url,baseRefName",
+        ])
+        .current_dir(repo_dir)
+        .output()
+        .await
+        .context("Failed to run gh pr list")?;
+
+    if !pr_list.status.success() {
+        let stderr = String::from_utf8_lossy(&pr_list.stderr);
+        bail!("Failed to list sync PRs: {}", stderr);
+    }
+
+    let prs = parse_open_sync_prs(&pr_list.stdout)?;
+
+    if let Some(pr) = prs
+        .iter()
+        .find(|pr| pr.base_ref_name == base_branch)
+        .cloned()
+    {
+        return Ok(Some(pr));
+    }
+
+    if let Some(mut pr) = prs.into_iter().next() {
+        tracing::warn!(
+            pr = pr.number,
+            current_base = %pr.base_ref_name,
+            target_base = %base_branch,
+            "Retargeting sync PR to repository default branch"
+        );
+
+        let pr_number = pr.number.to_string();
+        let output = Command::new("gh")
+            .args(["pr", "edit", &pr_number, "--base", base_branch])
+            .current_dir(repo_dir)
+            .output()
+            .await
+            .context("Failed to run gh pr edit")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to retarget sync PR: {}", stderr);
+        }
+
+        pr.base_ref_name = base_branch.to_string();
+        return Ok(Some(pr));
+    }
+
+    Ok(None)
+}
+
+fn parse_open_sync_prs(stdout: &[u8]) -> Result<Vec<ExistingSyncPr>> {
+    serde_json::from_slice(stdout).context("Failed to parse gh pr list output")
 }
 
 fn combine_reports(old: &str, new: &str) -> String {
@@ -467,4 +539,39 @@ fn extract_title(content: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_open_sync_prs_reads_base_branch() {
+        let prs = parse_open_sync_prs(
+            br#"[
+                {
+                    "number": 5,
+                    "url": "https://github.com/thesimplekid/cdk-reviews/pull/5",
+                    "baseRefName": "main"
+                }
+            ]"#,
+        )
+        .expect("valid PR JSON should parse");
+
+        assert_eq!(
+            prs,
+            vec![ExistingSyncPr {
+                number: 5,
+                url: "https://github.com/thesimplekid/cdk-reviews/pull/5".to_string(),
+                base_ref_name: "main".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_open_sync_prs_rejects_invalid_json() {
+        let result = parse_open_sync_prs(b"not json");
+
+        assert!(result.is_err());
+    }
 }
