@@ -233,7 +233,7 @@ enum Commands {
         #[arg(long)]
         sandbox_rootfs: Option<PathBuf>,
 
-        /// Network mode for sandbox (e.g. host, private, veth)
+        /// Network mode for sandbox (e.g. host, bridge, private, veth)
         #[arg(long)]
         sandbox_network: Option<String>,
 

@@ -673,9 +673,9 @@ async fn run_sandboxed_review(
 
     #[allow(clippy::collapsible_if)]
     if let Some(net) = &params.sandbox_network {
-        if net != "veth" && net != "private" && net != "host" {
+        if net != "bridge" && net != "veth" && net != "private" && net != "host" {
             anyhow::bail!(
-                "Invalid sandbox network mode: {}. Must be host, private, or veth.",
+                "Invalid sandbox network mode: {}. Must be host, bridge, private, or veth.",
                 net
             );
         }
