@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -690,6 +691,7 @@ async fn run_sandboxed_review(
     })?;
     let report_path = run_dir.join("report.md");
     let result_json = run_dir.join("result.json");
+    let nspawn_log = run_dir.join("nspawn.log");
     let runtime_rootfs = prepare_runtime_rootfs(rootfs, &run_dir).await?;
     let sandbox_home = "/tmp";
     let sandbox_xdg_state_home = "/tmp/.local/state";
@@ -846,9 +848,19 @@ async fn run_sandboxed_review(
         repo = %review_params.repo,
         pr = %review_params.pr_number,
         rootfs = %runtime_rootfs.display(),
+        log = %nspawn_log.display(),
         network = ?params.sandbox_network,
         "Launching sandboxed review"
     );
+
+    let log_file = std::fs::File::create(&nspawn_log)
+        .with_context(|| format!("Failed to create sandbox log at {}", nspawn_log.display()))?;
+    cmd.stdout(Stdio::from(
+        log_file
+            .try_clone()
+            .context("Failed to clone sandbox log file")?,
+    ));
+    cmd.stderr(Stdio::from(log_file));
 
     let mut child = cmd.spawn().context("Failed to spawn systemd-nspawn")?;
 

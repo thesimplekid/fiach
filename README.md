@@ -20,6 +20,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 - **Worker Limit:** Run multiple PR reviews concurrently with an optional cap for resource-constrained hosts.
 - **State Tracking:** Uses a lightweight, embedded Rust database (`redb`) to remember which commit hashes have already been reviewed, preventing redundant LLM calls.
 - **Workspace Isolation:** Clones the repository and checks out the PR branch into a temporary directory *before* giving control to the AI agent, saving valuable context window and turns.
+- **Per-Review Sandbox Logs:** Sandboxed reviews write `nspawn.log` next to their report artifacts for easier debugging.
 - **Interactive Web Server:** The daemon includes a built-in HTTP server to monitor its status, view review history, and manually trigger reviews on-demand without waiting for the next polling cycle.
 
 ---
@@ -269,6 +270,7 @@ The following options are available under `services.fiach`:
 In daemon sandbox mode, the sandbox no longer gets write access to the whole `fiach` data directory.
 
 - The sandbox writes only per-review artifacts in a dedicated run directory.
+- The sandbox stdout/stderr stream is saved as `reports/runs/<repo>_PR<number>/nspawn.log` by default.
 - Review state in `fiach.redb` is recorded by the host daemon after the sandbox exits successfully.
 - Disclosure side effects are also performed by the host daemon after it validates the sandbox output.
 
