@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::{StreamExt, stream};
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description};
 use tokio::process::Command;
@@ -32,6 +33,7 @@ pub struct DaemonParams {
     pub pr_states: Vec<String>,
     pub skip_prs: Vec<String>,
     pub allowed_author_associations: Vec<String>,
+    pub max_workers: usize,
     pub drafts: Option<bool>,
     pub max_cost_usd: Option<f64>,
     pub input_price_per_m: Option<f64>,
@@ -59,6 +61,23 @@ fn is_allowed_author_association(association: &str, allowed: &[String]) -> bool 
     allowed
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(association))
+}
+
+fn worker_concurrency(max_workers: usize, job_count: usize) -> usize {
+    if job_count == 0 {
+        1
+    } else if max_workers == 0 {
+        job_count
+    } else {
+        max_workers.min(job_count)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrProcessStatus {
+    Reviewed,
+    Skipped,
+    Failed,
 }
 
 pub async fn run_daemon(
@@ -157,296 +176,28 @@ pub async fn run_daemon(
                         let mut skipped = 0;
                         let mut failed = 0;
 
-                        for pr in &prs {
+                        let concurrency = worker_concurrency(params.max_workers, prs.len());
+                        tracing::info!(
+                            repo = %repo,
+                            state = %state,
+                            max_workers = params.max_workers,
+                            concurrency = concurrency,
+                            "Processing PRs with worker limit"
+                        );
+
+                        let mut outcomes = stream::iter(prs.iter())
+                            .map(|pr| process_daemon_pr(&params, repo, pr, cancel_token.clone()))
+                            .buffer_unordered(concurrency);
+
+                        while let Some(outcome) = outcomes.next().await {
+                            match outcome? {
+                                PrProcessStatus::Reviewed => reviewed += 1,
+                                PrProcessStatus::Skipped => skipped += 1,
+                                PrProcessStatus::Failed => failed += 1,
+                            }
+
                             if cancel_token.is_cancelled() {
                                 break;
-                            }
-
-                            // Check if PR should be skipped
-                            let skip = params.skip_prs.iter().any(|s| {
-                                s == &pr.number.to_string()
-                                    || s == &format!("{}#{}", repo, pr.number)
-                            });
-
-                            if skip {
-                                tracing::info!(repo = %repo, pr = pr.number, "Skipping PR as requested");
-                                skipped += 1;
-                                #[allow(clippy::collapsible_if)]
-                                if let Ok(decision) = crate::state::should_review(
-                                    &params.db_path,
-                                    repo,
-                                    pr.number,
-                                    &pr.head_ref_oid,
-                                    false,
-                                    params.timeout_mins,
-                                ) {
-                                    if decision != crate::state::ReviewDecision::Skip {
-                                        let meta = crate::state::ReviewMetadata {
-                                            commit_hash: pr.head_ref_oid.clone(),
-                                            model: "daemon".to_string(),
-                                            timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
-                                            findings_count: 0,
-                                            status: "skipped".to_string(),
-                                            severity: "none".to_string(),
-                                            pr_classification: "none".to_string(),
-                                            duration_secs: 0,
-                                            input_tokens: 0,
-                                            output_tokens: 0,
-                                            total_tokens: 0,
-                                            cost_usd: Some(0.0),
-                                            report_url: None,
-                                            is_rereview: decision == crate::state::ReviewDecision::ReReview,
-                                            time_reviewed: Some(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default()),
-                                            retry_count: 0,
-                                        };
-                                        let _ = crate::state::mark_reviewed(
-                                            &params.db_path,
-                                            repo,
-                                            pr.number,
-                                            &meta,
-                                        );
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if !is_allowed_author_association(
-                                &pr.author_association,
-                                &params.allowed_author_associations,
-                            ) {
-                                tracing::info!(
-                                    repo = %repo,
-                                    pr = pr.number,
-                                    author_association = %pr.author_association,
-                                    allowed = ?params.allowed_author_associations,
-                                    "Skipping PR because author association is not allowed"
-                                );
-                                skipped += 1;
-                                continue;
-                            }
-
-                            // Skip backport PRs as they often fail to checkout
-                            if pr.head_ref_name.starts_with("backport-")
-                                || pr.title.starts_with("[Backport")
-                            {
-                                tracing::info!(repo = %repo, pr = pr.number, "Skipping backport PR");
-                                skipped += 1;
-                                #[allow(clippy::collapsible_if)]
-                                if let Ok(decision) = crate::state::should_review(
-                                    &params.db_path,
-                                    repo,
-                                    pr.number,
-                                    &pr.head_ref_oid,
-                                    false,
-                                    params.timeout_mins,
-                                ) {
-                                    if decision != crate::state::ReviewDecision::Skip {
-                                        let meta = crate::state::ReviewMetadata {
-                                            commit_hash: pr.head_ref_oid.clone(),
-                                            model: "daemon".to_string(),
-                                            timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
-                                            findings_count: 0,
-                                            status: "skipped".to_string(),
-                                            severity: "none".to_string(),
-                                            pr_classification: "none".to_string(),
-                                            duration_secs: 0,
-                                            input_tokens: 0,
-                                            output_tokens: 0,
-                                            total_tokens: 0,
-                                            cost_usd: Some(0.0),
-                                            report_url: None,
-                                            is_rereview: decision == crate::state::ReviewDecision::ReReview,
-                                            time_reviewed: Some(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default()),
-                                            retry_count: 0,
-                                        };
-                                        let _ = crate::state::mark_reviewed(
-                                            &params.db_path,
-                                            repo,
-                                            pr.number,
-                                            &meta,
-                                        );
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Check if already reviewed
-                            match crate::state::should_review(
-                                &params.db_path,
-                                repo,
-                                pr.number,
-                                &pr.head_ref_oid,
-                                false,
-                                params.timeout_mins,
-                            ) {
-                                Ok(crate::state::ReviewDecision::FirstReview)
-                                | Ok(crate::state::ReviewDecision::ReReview)
-                                | Ok(crate::state::ReviewDecision::RetryFailed) => {
-                                    let decision = crate::state::should_review(
-                                        &params.db_path,
-                                        repo,
-                                        pr.number,
-                                        &pr.head_ref_oid,
-                                        false,
-                                        params.timeout_mins,
-                                    )?;
-                                    let is_rereview =
-                                        matches!(decision, crate::state::ReviewDecision::ReReview);
-
-                                    match crate::state::lock_for_review(
-                                        &params.db_path,
-                                        repo,
-                                        pr.number,
-                                        &pr.head_ref_oid,
-                                        params.timeout_mins,
-                                    ) {
-                                        Ok(true) => {
-                                            tracing::debug!(repo = %repo, pr = pr.number, "Successfully locked PR for review");
-                                        }
-                                        Ok(false) => {
-                                            tracing::info!(repo = %repo, pr = pr.number, "PR is currently locked by another process, skipping");
-                                            skipped += 1;
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to lock PR {} in {}: {}",
-                                                pr.number,
-                                                repo,
-                                                e
-                                            );
-                                            failed += 1;
-                                            continue;
-                                        }
-                                    }
-
-                                    match decision {
-                                        crate::state::ReviewDecision::RetryFailed => {
-                                            tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "Retrying previously failed PR review");
-                                        }
-                                        _ => {
-                                            tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "New PR or commit needs review");
-                                        }
-                                    }
-
-                                    let safe_repo = repo.replace('/', "_");
-                                    let out_file_name = format!(
-                                        "{}_PR{}_{}_report.md",
-                                        safe_repo,
-                                        pr.number,
-                                        &pr.head_ref_oid[..7]
-                                    );
-                                    let output_path =
-                                        params.out_dir.as_ref().map(|dir| dir.join(out_file_name));
-
-                                    let review_params = ReviewParams {
-                                        repo: repo.clone(),
-                                        pr_number: pr.number,
-                                        model: params.model.clone(),
-                                        output: output_path,
-                                        skill: params.skill.clone(),
-                                        persona: params.persona.clone(),
-                                        max_turns: params.max_turns,
-                                        timeout_mins: params.timeout_mins,
-                                        db_path: params.db_path.clone(),
-                                        force: false,
-                                        max_retries: params.max_retries,
-                                        retry_delay_secs: params.retry_delay_secs,
-                                        disclose_config: params.disclose_config.clone(),
-                                        context_groups: params.context_groups.clone(),
-                                        max_cost_usd: params.max_cost_usd,
-                                        input_price_per_m: params.input_price_per_m,
-                                        output_price_per_m: params.output_price_per_m,
-                                        is_rereview,
-                                        execution: ReviewExecution {
-                                            skip_state_check: true,
-                                            persist_side_effects: true,
-                                            result_json: None,
-                                        },
-                                    };
-
-                                    let review_result = if params.sandbox_rootfs.is_some() {
-                                        run_sandboxed_review(
-                                            &params,
-                                            &review_params,
-                                            cancel_token.clone(),
-                                        )
-                                        .await
-                                    } else {
-                                        run_review(review_params, cancel_token.clone())
-                                            .await
-                                            .map(|_| ())
-                                    };
-
-                                    if let Err(e) = review_result {
-                                        let retry_count = crate::state::get_pr_review(
-                                            &params.db_path,
-                                            repo,
-                                            pr.number,
-                                        )
-                                        .ok()
-                                        .flatten()
-                                        .map(|m| m.retry_count)
-                                        .unwrap_or(0);
-
-                                        let meta = crate::state::ReviewMetadata {
-                                            commit_hash: pr.head_ref_oid.clone(),
-                                            model: "daemon".to_string(),
-                                            timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
-                                            findings_count: 0,
-                                            status: "failed".to_string(),
-                                            severity: "none".to_string(),
-                                            pr_classification: "none".to_string(),
-                                            duration_secs: 0,
-                                            input_tokens: 0,
-                                            output_tokens: 0,
-                                            total_tokens: 0,
-                                            cost_usd: Some(0.0),
-                                            report_url: None,
-                                            is_rereview,
-                                            time_reviewed: Some(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default()),
-                                            retry_count,
-                                        };
-                                        let _ = crate::state::mark_reviewed(
-                                            &params.db_path,
-                                            repo,
-                                            pr.number,
-                                            &meta,
-                                        );
-
-                                        if cancel_token.is_cancelled() {
-                                            return Err(e);
-                                        }
-                                        tracing::error!(
-                                            "Failed to review PR {} in {}: {}",
-                                            pr.number,
-                                            repo,
-                                            e
-                                        );
-                                        failed += 1;
-                                        if crate::review::is_fatal_error(&e) {
-                                            tracing::error!(
-                                                "Fatal error encountered, stopping daemon"
-                                            );
-                                            return Err(e);
-                                        }
-                                    } else {
-                                        reviewed += 1;
-                                    }
-                                }
-                                Ok(crate::state::ReviewDecision::Skip) => {
-                                    // Already reviewed
-                                    skipped += 1;
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to check review state for PR {} in {}: {}",
-                                        pr.number,
-                                        repo,
-                                        e
-                                    );
-                                    failed += 1;
-                                }
                             }
                         }
 
@@ -505,6 +256,232 @@ pub async fn run_daemon(
     }
 
     Ok(())
+}
+
+fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, pr: &PullRequest) {
+    #[allow(clippy::collapsible_if)]
+    if let Ok(decision) = crate::state::should_review(
+        &params.db_path,
+        repo,
+        pr.number,
+        &pr.head_ref_oid,
+        false,
+        params.timeout_mins,
+    ) {
+        if decision != crate::state::ReviewDecision::Skip {
+            let meta = crate::state::ReviewMetadata {
+                commit_hash: pr.head_ref_oid.clone(),
+                model: "daemon".to_string(),
+                timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
+                findings_count: 0,
+                status: "skipped".to_string(),
+                severity: "none".to_string(),
+                pr_classification: "none".to_string(),
+                duration_secs: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cost_usd: Some(0.0),
+                report_url: None,
+                is_rereview: decision == crate::state::ReviewDecision::ReReview,
+                time_reviewed: Some(
+                    time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
+                ),
+                retry_count: 0,
+            };
+            let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);
+        }
+    }
+}
+
+async fn process_daemon_pr(
+    params: &DaemonParams,
+    repo: &str,
+    pr: &PullRequest,
+    cancel_token: CancellationToken,
+) -> Result<PrProcessStatus> {
+    if cancel_token.is_cancelled() {
+        return Ok(PrProcessStatus::Skipped);
+    }
+
+    let skip = params
+        .skip_prs
+        .iter()
+        .any(|s| s == &pr.number.to_string() || s == &format!("{}#{}", repo, pr.number));
+
+    if skip {
+        tracing::info!(repo = %repo, pr = pr.number, "Skipping PR as requested");
+        mark_skipped_if_needed(params, repo, pr);
+        return Ok(PrProcessStatus::Skipped);
+    }
+
+    if !is_allowed_author_association(&pr.author_association, &params.allowed_author_associations) {
+        tracing::info!(
+            repo = %repo,
+            pr = pr.number,
+            author_association = %pr.author_association,
+            allowed = ?params.allowed_author_associations,
+            "Skipping PR because author association is not allowed"
+        );
+        return Ok(PrProcessStatus::Skipped);
+    }
+
+    if pr.head_ref_name.starts_with("backport-") || pr.title.starts_with("[Backport") {
+        tracing::info!(repo = %repo, pr = pr.number, "Skipping backport PR");
+        mark_skipped_if_needed(params, repo, pr);
+        return Ok(PrProcessStatus::Skipped);
+    }
+
+    match crate::state::should_review(
+        &params.db_path,
+        repo,
+        pr.number,
+        &pr.head_ref_oid,
+        false,
+        params.timeout_mins,
+    ) {
+        Ok(crate::state::ReviewDecision::FirstReview)
+        | Ok(crate::state::ReviewDecision::ReReview)
+        | Ok(crate::state::ReviewDecision::RetryFailed) => {
+            let decision = crate::state::should_review(
+                &params.db_path,
+                repo,
+                pr.number,
+                &pr.head_ref_oid,
+                false,
+                params.timeout_mins,
+            )?;
+            let is_rereview = matches!(decision, crate::state::ReviewDecision::ReReview);
+
+            match crate::state::lock_for_review(
+                &params.db_path,
+                repo,
+                pr.number,
+                &pr.head_ref_oid,
+                params.timeout_mins,
+            ) {
+                Ok(true) => {
+                    tracing::debug!(repo = %repo, pr = pr.number, "Successfully locked PR for review");
+                }
+                Ok(false) => {
+                    tracing::info!(repo = %repo, pr = pr.number, "PR is currently locked by another process, skipping");
+                    return Ok(PrProcessStatus::Skipped);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to lock PR {} in {}: {}", pr.number, repo, e);
+                    return Ok(PrProcessStatus::Failed);
+                }
+            }
+
+            match decision {
+                crate::state::ReviewDecision::RetryFailed => {
+                    tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "Retrying previously failed PR review");
+                }
+                _ => {
+                    tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "New PR or commit needs review");
+                }
+            }
+
+            let safe_repo = repo.replace('/', "_");
+            let out_file_name = format!(
+                "{}_PR{}_{}_report.md",
+                safe_repo,
+                pr.number,
+                &pr.head_ref_oid[..7]
+            );
+            let output_path = params.out_dir.as_ref().map(|dir| dir.join(out_file_name));
+
+            let review_params = ReviewParams {
+                repo: repo.to_string(),
+                pr_number: pr.number,
+                model: params.model.clone(),
+                output: output_path,
+                skill: params.skill.clone(),
+                persona: params.persona.clone(),
+                max_turns: params.max_turns,
+                timeout_mins: params.timeout_mins,
+                db_path: params.db_path.clone(),
+                force: false,
+                max_retries: params.max_retries,
+                retry_delay_secs: params.retry_delay_secs,
+                disclose_config: params.disclose_config.clone(),
+                context_groups: params.context_groups.clone(),
+                max_cost_usd: params.max_cost_usd,
+                input_price_per_m: params.input_price_per_m,
+                output_price_per_m: params.output_price_per_m,
+                is_rereview,
+                execution: ReviewExecution {
+                    skip_state_check: true,
+                    persist_side_effects: true,
+                    result_json: None,
+                },
+            };
+
+            let review_result = if params.sandbox_rootfs.is_some() {
+                run_sandboxed_review(params, &review_params, cancel_token.clone()).await
+            } else {
+                run_review(review_params, cancel_token.clone())
+                    .await
+                    .map(|_| ())
+            };
+
+            if let Err(e) = review_result {
+                let retry_count = crate::state::get_pr_review(&params.db_path, repo, pr.number)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.retry_count)
+                    .unwrap_or(0);
+
+                let meta = crate::state::ReviewMetadata {
+                    commit_hash: pr.head_ref_oid.clone(),
+                    model: "daemon".to_string(),
+                    timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    findings_count: 0,
+                    status: "failed".to_string(),
+                    severity: "none".to_string(),
+                    pr_classification: "none".to_string(),
+                    duration_secs: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_usd: Some(0.0),
+                    report_url: None,
+                    is_rereview,
+                    time_reviewed: Some(
+                        time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default(),
+                    ),
+                    retry_count,
+                };
+                let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);
+
+                if cancel_token.is_cancelled() {
+                    return Err(e);
+                }
+                tracing::error!("Failed to review PR {} in {}: {}", pr.number, repo, e);
+                if crate::review::is_fatal_error(&e) {
+                    tracing::error!("Fatal error encountered, stopping daemon");
+                    return Err(e);
+                }
+                return Ok(PrProcessStatus::Failed);
+            }
+
+            Ok(PrProcessStatus::Reviewed)
+        }
+        Ok(crate::state::ReviewDecision::Skip) => Ok(PrProcessStatus::Skipped),
+        Err(e) => {
+            tracing::error!(
+                "Failed to check review state for PR {} in {}: {}",
+                pr.number,
+                repo,
+                e
+            );
+            Ok(PrProcessStatus::Failed)
+        }
+    }
 }
 
 async fn trigger_manual_review(
@@ -993,5 +970,14 @@ mod tests {
         assert!(is_allowed_author_association("collaborator", &allowed));
         assert!(is_allowed_author_association("MEMBER", &allowed));
         assert!(!is_allowed_author_association("FIRST_TIMER", &allowed));
+    }
+
+    #[test]
+    fn worker_concurrency_caps_jobs_and_allows_unlimited() {
+        assert_eq!(worker_concurrency(1, 10), 1);
+        assert_eq!(worker_concurrency(3, 10), 3);
+        assert_eq!(worker_concurrency(20, 10), 10);
+        assert_eq!(worker_concurrency(0, 10), 10);
+        assert_eq!(worker_concurrency(0, 0), 1);
     }
 }

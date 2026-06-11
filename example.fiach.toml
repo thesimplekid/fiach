@@ -5,6 +5,7 @@ model = "google/gemini-3.1-pro-preview"
 pr_state = ["open", "merged"] # Options: "open", "merged", "closed", "all" (can also be a comma-separated string)
 skip_prs = ["1870"] # Skip specific PR numbers globally or per repo
 allowed_author_associations = ["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]
+max_workers = 1 # Maximum concurrent PR reviews per polling query; 0 means unlimited
 drafts = false # Set to true to also review draft PRs
 out_dir = "reports" # Local directory to store reports
 report_mode = "sync-pr" # Options: local, pr-comment, sync-pr

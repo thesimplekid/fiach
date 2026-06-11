@@ -17,6 +17,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 - **Configuration File:** Uses `fiach.toml` for easy setup of `daemon`, `review`, and additional repository contexts. Copy `example.fiach.toml` to `fiach.toml` to get started.
 - **Skip PRs:** Ability to skip specific PRs by number or `repo#number` format.
 - **Author Allowlist:** Restrict daemon reviews to trusted GitHub author associations before executing any reviewer workspace.
+- **Worker Limit:** Run multiple PR reviews concurrently with an optional cap for resource-constrained hosts.
 - **State Tracking:** Uses a lightweight, embedded Rust database (`redb`) to remember which commit hashes have already been reviewed, preventing redundant LLM calls.
 - **Workspace Isolation:** Clones the repository and checks out the PR branch into a temporary directory *before* giving control to the AI agent, saving valuable context window and turns.
 - **Interactive Web Server:** The daemon includes a built-in HTTP server to monitor its status, view review history, and manually trigger reviews on-demand without waiting for the next polling cycle.
@@ -69,7 +70,8 @@ cargo run -- daemon \
   --interval 300 \
   --model "openrouter/google/gemini-3.1-pro-preview" \
   --skip-prs "123,my-org/core-backend#456" \
-  --allowed-author-associations "COLLABORATOR,CONTRIBUTOR,MEMBER,OWNER"
+  --allowed-author-associations "COLLABORATOR,CONTRIBUTOR,MEMBER,OWNER" \
+  --max-workers 4
 ```
 
 ### 2. Single PR Review (PR Comment Mode)
@@ -182,6 +184,7 @@ In your `flake.nix` or `configuration.nix`:
             updatedWithinDays = 120;
             prStates = [ "open" "merged" ];
             prLimit = 1000;
+            maxWorkers = 1;
             
             # The persona to use (defaults to builtin:security if omitted)
             persona = "builtin:security";
@@ -230,6 +233,7 @@ The following options are available under `services.fiach`:
 | `prStates` | list of string | `["open"]` | List of PR states to poll (e.g., `["open"]`, `["open", "merged"]`). |
 | `prLimit` | integer | `1000` | Maximum number of PRs to fetch from GitHub per polling cycle. |
 | `allowedAuthorAssociations` | list of string | `["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]` | GitHub PR author associations allowed to trigger daemon reviews. |
+| `maxWorkers` | integer | `1` | Maximum number of PR reviews to run concurrently per polling query. `0` means unlimited. |
 | `model` | string | `"openrouter/google/gemini-3.1-pro-preview"` | OpenRouter model to use. |
 | `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and `OPENROUTER_API_KEY`. |
 | `persona` | string | `"builtin:security"` | Persona source to use (e.g., `"builtin:security"` or an absolute path). |

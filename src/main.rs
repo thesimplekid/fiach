@@ -189,6 +189,10 @@ enum Commands {
         #[arg(long)]
         allowed_author_associations: Option<String>,
 
+        /// Maximum number of PR reviews to run concurrently per polling query. 0 means unlimited.
+        #[arg(long)]
+        max_workers: Option<usize>,
+
         /// Whether to fetch drafts (true), only ready PRs (false), or both (omitted). Default is false.
         #[arg(long)]
         drafts: Option<bool>,
@@ -375,6 +379,7 @@ async fn main() -> Result<()> {
             pr_state,
             skip_prs,
             allowed_author_associations,
+            max_workers,
             drafts,
             input_price,
             output_price,
@@ -440,6 +445,7 @@ async fn main() -> Result<()> {
                         "OWNER".to_string(),
                     ]
                 });
+            let max_workers = max_workers.or(daemon_cfg.max_workers).unwrap_or(1);
 
             tracing::info!(
                 repos = %repos_str,
@@ -449,6 +455,7 @@ async fn main() -> Result<()> {
                 pr_states = ?pr_states,
                 skip_prs = ?skip_prs_list,
                 allowed_author_associations = ?allowed_author_associations,
+                max_workers = max_workers,
                 "Starting fiach daemon"
             );
 
@@ -482,6 +489,7 @@ async fn main() -> Result<()> {
                 pr_states,
                 skip_prs: skip_prs_list,
                 allowed_author_associations,
+                max_workers,
                 drafts: drafts.or(daemon_cfg.drafts).or(Some(false)), // Default to false
                 max_cost_usd: max_cost.or(daemon_cfg.max_cost_usd),
                 input_price_per_m: input_price.or(daemon_cfg.input_price_per_m),

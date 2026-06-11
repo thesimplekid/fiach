@@ -194,6 +194,18 @@
             description = "Maximum number of PRs to fetch from GitHub per polling cycle";
           };
 
+          allowedAuthorAssociations = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ "COLLABORATOR" "CONTRIBUTOR" "MEMBER" "OWNER" ];
+            description = "GitHub PR author associations allowed to trigger daemon reviews";
+          };
+
+          maxWorkers = lib.mkOption {
+            type = lib.types.int;
+            default = 1;
+            description = "Maximum number of PR reviews to run concurrently per polling query. 0 means unlimited.";
+          };
+
           model = lib.mkOption {
             type = lib.types.str;
             default = "openrouter/google/gemini-3.1-pro-preview";
@@ -388,6 +400,8 @@
                   updated_within_days = cfg.updatedWithinDays;
                   pr_state = cfg.prStates;
                   pr_limit = cfg.prLimit;
+                  allowed_author_associations = cfg.allowedAuthorAssociations;
+                  max_workers = cfg.maxWorkers;
                   model = cfg.model;
                   persona = cfg.persona;
                   db_path = "${cfg.dataDir}/fiach.redb";

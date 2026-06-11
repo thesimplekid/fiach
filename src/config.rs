@@ -54,6 +54,7 @@ pub struct DaemonConfig {
     pub pr_state: Option<MultiString>,
     pub skip_prs: Option<Vec<String>>,
     pub allowed_author_associations: Option<Vec<String>>,
+    pub max_workers: Option<usize>,
     pub drafts: Option<bool>,
     pub max_cost_usd: Option<f64>,
     pub input_price_per_m: Option<f64>,
