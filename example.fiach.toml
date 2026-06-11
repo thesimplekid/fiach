@@ -1,6 +1,7 @@
 [daemon]
 repos = ["owner/repo"]
 interval = 100
+provider = "openrouter" # Options: openrouter, anthropic, openai, google
 model = "google/gemini-3.1-pro-preview"
 pr_state = ["open", "merged"] # Options: "open", "merged", "closed", "all" (can also be a comma-separated string)
 skip_prs = ["1870"] # Skip specific PR numbers globally or per repo
@@ -15,6 +16,7 @@ max_turns = 300
 # with_skill = "rust-security" # Load a specific domain skill
 
 [review]
+provider = "openrouter"
 model = "google/gemini-3.1-pro-preview"
 max_turns = 60
 timeout_mins = 30

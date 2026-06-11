@@ -75,8 +75,10 @@ pub struct ReviewParams {
     pub repo: String,
     /// PR number to review
     pub pr_number: u64,
-    /// OpenRouter model identifier (e.g., "anthropic/claude-sonnet-4")
+    /// Model identifier for the configured provider.
     pub model: String,
+    /// Goose provider name (e.g., openrouter, anthropic, openai, google).
+    pub provider: String,
     /// Optional path to write the final report. If None, it will be generated
     /// in the current working directory as "PR{pr}_{hash}.md" after the
     /// workspace is prepared.
@@ -224,10 +226,10 @@ pub async fn run_review(
         "Starting review"
     );
 
-    // 2. Create the OpenRouter provider
-    let provider = create_with_named_model("openrouter", &params.model, Vec::new())
+    // 2. Create the configured LLM provider
+    let provider = create_with_named_model(&params.provider, &params.model, Vec::new())
         .await
-        .context("Failed to create OpenRouter provider")?;
+        .with_context(|| format!("Failed to create {} provider", params.provider))?;
 
     // 3. Create the agent and a hidden session rooted in the workspace
     let agent = Agent::new();
@@ -586,6 +588,7 @@ pub async fn run_review(
                                         peak_input_tokens = peak_input_tokens.max((2 * current_input) / (accumulated_turn_count as u64 + 1));
 
                                         let current_cost = estimate_cost(
+                                            &params.provider,
                                             &params.model,
                                             peak_input_tokens,
                                             current_output + total_output_tokens, // Include discovery output
@@ -858,6 +861,7 @@ pub async fn run_review(
     let duration_secs = start_time.elapsed().as_secs();
     let total_tokens = total_processed_tokens;
     let cost_usd = estimate_cost(
+        &params.provider,
         &params.model,
         peak_input_tokens,
         total_output_tokens,
@@ -1053,24 +1057,29 @@ fn parse_frontmatter_field(content: &str, key: &str) -> Option<String> {
 
 /// Estimate the cost in USD based on token usage and model pricing.
 fn estimate_cost(
+    provider: &str,
     model_id: &str,
     input_tokens: u64,
     output_tokens: u64,
     input_override: Option<f64>,
     output_override: Option<f64>,
 ) -> Option<f64> {
-    // OpenRouter model IDs are often in the format "provider/model"
-    let (provider, model) = if let Some((p, m)) = model_id.split_once('/') {
-        (p, m)
+    // OpenRouter model IDs are often in the format "upstream-provider/model".
+    let (canonical_provider, model) = if provider == "openrouter" {
+        if let Some((p, m)) = model_id.split_once('/') {
+            (p, m)
+        } else {
+            (provider, model_id)
+        }
     } else {
-        ("openrouter", model_id)
+        (provider, model_id)
     };
 
     let (input_cost_per_m, output_cost_per_m) =
         if let (Some(i), Some(o)) = (input_override, output_override) {
             (i, o)
         } else {
-            let canonical = maybe_get_canonical_model(provider, model)?;
+            let canonical = maybe_get_canonical_model(canonical_provider, model)?;
             (
                 input_override.unwrap_or(canonical.cost.input?),
                 output_override.unwrap_or(canonical.cost.output?),

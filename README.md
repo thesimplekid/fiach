@@ -29,12 +29,13 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 - **Rust:** `1.94.0` (or use the provided Nix flake: `nix develop`)
 - **GitHub CLI (`gh`):** Must be installed and authenticated (`gh auth login`).
 - **Environment Variables:**
-  - `OPENROUTER_API_KEY`: For LLM access.
+  - `OPENROUTER_API_KEY`: For default OpenRouter LLM access.
+  - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`: Required only when using the matching direct provider.
   - `GITHUB_TOKEN`: For repository cloning and PR interaction.
 
 ### Credential Scope
 
-The review agent can execute shell commands. In sandbox mode, `fiach` forwards `OPENROUTER_API_KEY` and `GITHUB_TOKEN` into the `systemd-nspawn` container so the review can reach OpenRouter and GitHub.
+The review agent can execute shell commands. In sandbox mode, `fiach` forwards configured provider API keys and `GITHUB_TOKEN` into the `systemd-nspawn` container so the review can reach the selected LLM provider and GitHub.
 
 The sandbox also bootstraps its own runtime environment for service deployments:
 - a CA bundle path for `git` and `gh`
@@ -45,6 +46,7 @@ Treat both credentials as readable by the agent during a review. Use least-privi
 - Prefer a fine-grained `GITHUB_TOKEN` scoped only to the repositories `fiach` must review and disclose to.
 - Avoid broad write access, org-wide scopes, or access to unrelated private repositories.
 - Use an `OPENROUTER_API_KEY` with the smallest practical billing and account exposure.
+- If using a direct provider, apply the same least-privilege and billing limits to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`.
 - Do not reuse high-trust personal credentials for the daemon.
 
 You can copy the environment template to get started:
@@ -68,7 +70,8 @@ cargo run -- daemon \
   --report-mode sync-pr \
   --sync-repo "my-org/security-audits" \
   --interval 300 \
-  --model "openrouter/google/gemini-3.1-pro-preview" \
+  --provider "openrouter" \
+  --model "google/gemini-3.1-pro-preview" \
   --skip-prs "123,my-org/core-backend#456" \
   --allowed-author-associations "COLLABORATOR,CONTRIBUTOR,MEMBER,OWNER" \
   --max-workers 4
@@ -185,6 +188,7 @@ In your `flake.nix` or `configuration.nix`:
             prStates = [ "open" "merged" ];
             prLimit = 1000;
             maxWorkers = 1;
+            provider = "openrouter";
             
             # The persona to use (defaults to builtin:security if omitted)
             persona = "builtin:security";
@@ -234,8 +238,9 @@ The following options are available under `services.fiach`:
 | `prLimit` | integer | `1000` | Maximum number of PRs to fetch from GitHub per polling cycle. |
 | `allowedAuthorAssociations` | list of string | `["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]` | GitHub PR author associations allowed to trigger daemon reviews. |
 | `maxWorkers` | integer | `1` | Maximum number of PR reviews to run concurrently per polling query. `0` means unlimited. |
-| `model` | string | `"openrouter/google/gemini-3.1-pro-preview"` | OpenRouter model to use. |
-| `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and `OPENROUTER_API_KEY`. |
+| `provider` | string | `"openrouter"` | Goose provider to use, such as `"openrouter"`, `"anthropic"`, `"openai"`, or `"google"`. |
+| `model` | string | `"google/gemini-3.1-pro-preview"` | Model to use with the selected provider. |
+| `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and the selected provider API key. |
 | `persona` | string | `"builtin:security"` | Persona source to use (e.g., `"builtin:security"` or an absolute path). |
 | `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`) | `"local"` | Mode for reporting findings. |
 | `syncRepo` | string or null | `null` | GitHub repository to sync reports to. Required if `reportMode` is `"sync-pr"`. |

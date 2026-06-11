@@ -208,13 +208,19 @@
 
           model = lib.mkOption {
             type = lib.types.str;
-            default = "openrouter/google/gemini-3.1-pro-preview";
-            description = "OpenRouter model to use";
+            default = "google/gemini-3.1-pro-preview";
+            description = "Model to use with the selected provider";
+          };
+
+          provider = lib.mkOption {
+            type = lib.types.enum [ "openrouter" "anthropic" "openai" "google" ];
+            default = "openrouter";
+            description = "Goose provider to use for reviews";
           };
 
           environmentFile = lib.mkOption {
             type = lib.types.path;
-            description = "Path to environment file containing GITHUB_TOKEN and OPENROUTER_API_KEY";
+            description = "Path to environment file containing GITHUB_TOKEN and the selected provider API key";
           };
 
           persona = lib.mkOption {
@@ -402,6 +408,7 @@
                   pr_limit = cfg.prLimit;
                   allowed_author_associations = cfg.allowedAuthorAssociations;
                   max_workers = cfg.maxWorkers;
+                  provider = cfg.provider;
                   model = cfg.model;
                   persona = cfg.persona;
                   db_path = "${cfg.dataDir}/fiach.redb";

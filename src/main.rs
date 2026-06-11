@@ -42,9 +42,13 @@ enum Commands {
         #[arg(long)]
         pr: u64,
 
-        /// OpenRouter model to use
+        /// Model to use with the selected provider
         #[arg(long)]
         model: Option<String>,
+
+        /// Goose provider to use (openrouter, anthropic, openai, google)
+        #[arg(long)]
+        provider: Option<String>,
 
         /// Path to write the security report. If not provided, defaults to
         /// "./reports/PR{pr_number}_{commit_hash}.md" in the current working directory.
@@ -125,9 +129,13 @@ enum Commands {
         #[arg(long)]
         interval: Option<u64>,
 
-        /// OpenRouter model to use
+        /// Model to use with the selected provider
         #[arg(long)]
         model: Option<String>,
+
+        /// Goose provider to use (openrouter, anthropic, openai, google)
+        #[arg(long)]
+        provider: Option<String>,
 
         /// Explicitly instruct the agent to use a specific skill.
         #[arg(long)]
@@ -283,6 +291,7 @@ async fn main() -> Result<()> {
             repo,
             pr,
             model,
+            provider,
             output,
             with_skill,
             persona,
@@ -306,6 +315,9 @@ async fn main() -> Result<()> {
             let model = model
                 .or(rev_cfg.model)
                 .unwrap_or_else(|| "google/gemini-3.1-pro-preview".to_string());
+            let provider = provider
+                .or(rev_cfg.provider)
+                .unwrap_or_else(|| "openrouter".to_string());
             let persona_str = persona
                 .or(rev_cfg.persona)
                 .unwrap_or_else(|| "builtin:security".to_string());
@@ -318,6 +330,7 @@ async fn main() -> Result<()> {
             tracing::info!(
                 repo = %repo,
                 pr = pr,
+                provider = %provider,
                 model = %model,
                 output = ?output.clone().or_else(|| rev_cfg.output.clone()),
                 with_skill = ?with_skill.clone().or_else(|| rev_cfg.with_skill.clone()),
@@ -329,6 +342,7 @@ async fn main() -> Result<()> {
                 repo,
                 pr_number: pr,
                 model,
+                provider,
                 output: output.or(rev_cfg.output),
                 skill: with_skill.or(rev_cfg.with_skill),
                 persona,
@@ -364,6 +378,7 @@ async fn main() -> Result<()> {
             repos,
             interval,
             model,
+            provider,
             with_skill,
             persona,
             max_turns,
@@ -404,6 +419,9 @@ async fn main() -> Result<()> {
             let model = model
                 .or(daemon_cfg.model)
                 .unwrap_or_else(|| "google/gemini-3.1-pro-preview".to_string());
+            let provider = provider
+                .or(daemon_cfg.provider)
+                .unwrap_or_else(|| "openrouter".to_string());
             let persona_str = persona
                 .or(daemon_cfg.persona)
                 .unwrap_or_else(|| "builtin:security".to_string());
@@ -450,6 +468,7 @@ async fn main() -> Result<()> {
             tracing::info!(
                 repos = %repos_str,
                 interval_secs = interval_secs,
+                provider = %provider,
                 model = %model,
                 persona = ?persona,
                 pr_states = ?pr_states,
@@ -462,6 +481,7 @@ async fn main() -> Result<()> {
             let params = daemon::DaemonParams {
                 repos: repos_str,
                 interval: interval_secs,
+                provider,
                 model,
                 skill: with_skill.or(daemon_cfg.with_skill),
                 persona,

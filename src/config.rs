@@ -39,6 +39,7 @@ impl MultiString {
 pub struct DaemonConfig {
     pub repos: Option<Vec<String>>,
     pub interval: Option<u64>,
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub with_skill: Option<String>,
     pub persona: Option<String>,
@@ -69,6 +70,7 @@ pub struct DaemonConfig {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ReviewConfig {
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub output: Option<PathBuf>,
     pub with_skill: Option<String>,

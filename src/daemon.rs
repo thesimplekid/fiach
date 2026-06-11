@@ -19,6 +19,7 @@ pub enum DaemonMessage {
 pub struct DaemonParams {
     pub repos: String,
     pub interval: u64,
+    pub provider: String,
     pub model: String,
     pub skill: Option<String>,
     pub persona: crate::persona::PersonaSource,
@@ -396,6 +397,7 @@ async fn process_daemon_pr(
             let review_params = ReviewParams {
                 repo: repo.to_string(),
                 pr_number: pr.number,
+                provider: params.provider.clone(),
                 model: params.model.clone(),
                 output: output_path,
                 skill: params.skill.clone(),
@@ -570,6 +572,7 @@ async fn trigger_manual_review(
     let review_params = ReviewParams {
         repo: repo.clone(),
         pr_number,
+        provider: params.provider.clone(),
         model: params.model.clone(),
         output: output_path,
         skill: params.skill.clone(),
@@ -740,6 +743,15 @@ async fn run_sandboxed_review(
     if let Ok(val) = std::env::var("OPENROUTER_API_KEY") {
         cmd.arg(format!("--setenv=OPENROUTER_API_KEY={}", val));
     }
+    if let Ok(val) = std::env::var("OPENAI_API_KEY") {
+        cmd.arg(format!("--setenv=OPENAI_API_KEY={}", val));
+    }
+    if let Ok(val) = std::env::var("ANTHROPIC_API_KEY") {
+        cmd.arg(format!("--setenv=ANTHROPIC_API_KEY={}", val));
+    }
+    if let Ok(val) = std::env::var("GOOGLE_API_KEY") {
+        cmd.arg(format!("--setenv=GOOGLE_API_KEY={}", val));
+    }
     if let Ok(val) = std::env::var("GITHUB_TOKEN") {
         cmd.arg(format!("--setenv=GITHUB_TOKEN={}", val));
     }
@@ -786,6 +798,7 @@ async fn run_sandboxed_review(
     cmd.arg("review");
     cmd.arg("--repo").arg(&review_params.repo);
     cmd.arg("--pr").arg(review_params.pr_number.to_string());
+    cmd.arg("--provider").arg(&review_params.provider);
     cmd.arg("--model").arg(&review_params.model);
 
     let _ = &review_params.output;
