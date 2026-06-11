@@ -16,6 +16,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 - **Smart Daemon:** Automatically polls for open PRs that have been active in the **last 4 months (120 days)**.
 - **Configuration File:** Uses `fiach.toml` for easy setup of `daemon`, `review`, and additional repository contexts. Copy `example.fiach.toml` to `fiach.toml` to get started.
 - **Skip PRs:** Ability to skip specific PRs by number or `repo#number` format.
+- **Author Allowlist:** Restrict daemon reviews to trusted GitHub author associations before executing any reviewer workspace.
 - **State Tracking:** Uses a lightweight, embedded Rust database (`redb`) to remember which commit hashes have already been reviewed, preventing redundant LLM calls.
 - **Workspace Isolation:** Clones the repository and checks out the PR branch into a temporary directory *before* giving control to the AI agent, saving valuable context window and turns.
 - **Interactive Web Server:** The daemon includes a built-in HTTP server to monitor its status, view review history, and manually trigger reviews on-demand without waiting for the next polling cycle.
@@ -67,7 +68,8 @@ cargo run -- daemon \
   --sync-repo "my-org/security-audits" \
   --interval 300 \
   --model "openrouter/google/gemini-3.1-pro-preview" \
-  --skip-prs "123,my-org/core-backend#456"
+  --skip-prs "123,my-org/core-backend#456" \
+  --allowed-author-associations "COLLABORATOR,CONTRIBUTOR,MEMBER,OWNER"
 ```
 
 ### 2. Single PR Review (PR Comment Mode)
@@ -227,6 +229,7 @@ The following options are available under `services.fiach`:
 | `updatedWithinDays` | integer | `120` | Number of days to look back for updated PRs. |
 | `prStates` | list of string | `["open"]` | List of PR states to poll (e.g., `["open"]`, `["open", "merged"]`). |
 | `prLimit` | integer | `1000` | Maximum number of PRs to fetch from GitHub per polling cycle. |
+| `allowedAuthorAssociations` | list of string | `["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]` | GitHub PR author associations allowed to trigger daemon reviews. |
 | `model` | string | `"openrouter/google/gemini-3.1-pro-preview"` | OpenRouter model to use. |
 | `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and `OPENROUTER_API_KEY`. |
 | `persona` | string | `"builtin:security"` | Persona source to use (e.g., `"builtin:security"` or an absolute path). |

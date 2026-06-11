@@ -53,6 +53,7 @@ pub struct DaemonConfig {
     pub notify_on_empty: Option<bool>,
     pub pr_state: Option<MultiString>,
     pub skip_prs: Option<Vec<String>>,
+    pub allowed_author_associations: Option<Vec<String>>,
     pub drafts: Option<bool>,
     pub max_cost_usd: Option<f64>,
     pub input_price_per_m: Option<f64>,

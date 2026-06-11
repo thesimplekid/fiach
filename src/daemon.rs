@@ -31,6 +31,7 @@ pub struct DaemonParams {
     pub context_groups: std::collections::HashMap<String, crate::config::ContextGroup>,
     pub pr_states: Vec<String>,
     pub skip_prs: Vec<String>,
+    pub allowed_author_associations: Vec<String>,
     pub drafts: Option<bool>,
     pub max_cost_usd: Option<f64>,
     pub input_price_per_m: Option<f64>,
@@ -49,7 +50,15 @@ struct PullRequest {
     head_ref_oid: String,
     #[serde(rename = "headRefName")]
     head_ref_name: String,
+    #[serde(rename = "authorAssociation")]
+    author_association: String,
     title: String,
+}
+
+fn is_allowed_author_association(association: &str, allowed: &[String]) -> bool {
+    allowed
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(association))
 }
 
 pub async fn run_daemon(
@@ -122,7 +131,7 @@ pub async fn run_daemon(
                         "--limit",
                         &params.pr_limit.to_string(),
                         "--json",
-                        "number,headRefOid,headRefName,title",
+                        "number,headRefOid,headRefName,authorAssociation,title",
                     ])
                     .output()
                     .await;
@@ -198,6 +207,21 @@ pub async fn run_daemon(
                                         );
                                     }
                                 }
+                                continue;
+                            }
+
+                            if !is_allowed_author_association(
+                                &pr.author_association,
+                                &params.allowed_author_associations,
+                            ) {
+                                tracing::info!(
+                                    repo = %repo,
+                                    pr = pr.number,
+                                    author_association = %pr.author_association,
+                                    allowed = ?params.allowed_author_associations,
+                                    "Skipping PR because author association is not allowed"
+                                );
+                                skipped += 1;
                                 continue;
                             }
 
@@ -956,4 +980,18 @@ fn read_completed_review(path: &Path) -> Result<CompletedReview> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read sandbox result JSON at {}", path.display()))?;
     serde_json::from_slice(&bytes).context("Failed to parse sandbox result JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn author_association_filter_is_case_insensitive() {
+        let allowed = vec!["COLLABORATOR".to_string(), "MEMBER".to_string()];
+
+        assert!(is_allowed_author_association("collaborator", &allowed));
+        assert!(is_allowed_author_association("MEMBER", &allowed));
+        assert!(!is_allowed_author_association("FIRST_TIMER", &allowed));
+    }
 }

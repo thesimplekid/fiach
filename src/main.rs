@@ -185,6 +185,10 @@ enum Commands {
         #[arg(long)]
         skip_prs: Option<String>,
 
+        /// Comma-separated list of GitHub author associations allowed to trigger reviews
+        #[arg(long)]
+        allowed_author_associations: Option<String>,
+
         /// Whether to fetch drafts (true), only ready PRs (false), or both (omitted). Default is false.
         #[arg(long)]
         drafts: Option<bool>,
@@ -370,6 +374,7 @@ async fn main() -> Result<()> {
             max_cost,
             pr_state,
             skip_prs,
+            allowed_author_associations,
             drafts,
             input_price,
             output_price,
@@ -419,6 +424,23 @@ async fn main() -> Result<()> {
                 skip_prs_list.extend(s.split(',').map(|s| s.trim().to_string()));
             }
 
+            let allowed_author_associations = allowed_author_associations
+                .map(|s| {
+                    s.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .or(daemon_cfg.allowed_author_associations)
+                .unwrap_or_else(|| {
+                    vec![
+                        "COLLABORATOR".to_string(),
+                        "CONTRIBUTOR".to_string(),
+                        "MEMBER".to_string(),
+                        "OWNER".to_string(),
+                    ]
+                });
+
             tracing::info!(
                 repos = %repos_str,
                 interval_secs = interval_secs,
@@ -426,6 +448,7 @@ async fn main() -> Result<()> {
                 persona = ?persona,
                 pr_states = ?pr_states,
                 skip_prs = ?skip_prs_list,
+                allowed_author_associations = ?allowed_author_associations,
                 "Starting fiach daemon"
             );
 
@@ -458,6 +481,7 @@ async fn main() -> Result<()> {
                 context_groups: config.context_groups,
                 pr_states,
                 skip_prs: skip_prs_list,
+                allowed_author_associations,
                 drafts: drafts.or(daemon_cfg.drafts).or(Some(false)), // Default to false
                 max_cost_usd: max_cost.or(daemon_cfg.max_cost_usd),
                 input_price_per_m: input_price.or(daemon_cfg.input_price_per_m),
