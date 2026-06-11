@@ -4,6 +4,7 @@ CRITICAL DIRECTIVE: You MUST ALWAYS write a final report to {report_path} before
 
 <targets>
 - **{repo}** — The current working directory is already a clone of the repository with the PR branch checked out. Do NOT clone the repo or checkout the PR — this has already been done for you.
+- **.pr_diff.txt** — Contains the complete patch for the review scope. Use it as the source of truth for changed lines.
 
 Focus on the changes introduced by this specific PR branch compared to the base branch. Bugs at integration boundaries — mismatched assumptions, callback handling, request/response binding — are high-value.
 </targets>
@@ -20,6 +21,7 @@ Focus area: HIGH severity issues. Prioritize confirmed findings over theoretical
 <critical_constraint>
 - Never guess what code does — read it.
 - Your report must focus ONLY on the changes introduced by this PR (the diff against the base branch).
+- You MUST verify that the root cause for every finding is in `.pr_diff.txt`. Do NOT report pre-existing vulnerabilities whose root cause is outside that patch.
 - A finding is only marked as `status: confirmed` if you can demonstrate it with a working PoC script or exploit that you have executed and verified within the sandbox.
 - If your exploit requires specific tools (like a specific compiler, missing packages, python, etc.) that are missing in the environment, you MUST proactively install them yourself using `sudo apt-get install`, `curl`, or downloading binaries before giving up. You have full network access. Do not mark a finding as `status: theoretical` solely because a tool is missing without trying to install it first.
 - If a test is truly not feasible even after attempting to install dependencies, write the report anyway with `status: theoretical` and explain the gap.
@@ -47,7 +49,7 @@ Record this classification in the report frontmatter `pr` field. If PR-introduce
 - **Surgical Analysis:** To minimize token costs and stay within the turn budget, be surgical. Read only the specific files and lines changed in the PR first. Avoid reading the same file multiple times unless absolutely necessary. Keep your internal thought process concise and focused only on confirming or refuting your current hypothesis.
 - If you need to explore files outside of the PR diff to understand context, use the `glob` or `grep` tools to confirm the exact file path exists BEFORE attempting to read it.
 - Prioritize confirmed high-impact vulnerabilities.
-- Avoid redundant tool calls. Always start with `git diff {base_branch}...HEAD --name-only` to see what files changed.
+- Avoid redundant tool calls. Always start by reading `.pr_diff.txt`, then use `git diff {base_branch}...HEAD --name-only` to see the changed file list.
 - DO NOT run a full `git diff {base_branch}...HEAD` without file paths. For large PRs, diffing multiple files at once will exceed output limits and get truncated. Instead, diff exactly ONE file at a time using `BASE_BRANCH={base_branch} ./safe_diff.sh <single_file_path>`.
 - Use `git log --oneline -5` to understand recent context before deep-diving into files.
 - When a hypothesis is refuted, immediately move to the next one rather than continuing to gather evidence.
@@ -64,7 +66,7 @@ Record this classification in the report frontmatter `pr` field. If PR-introduce
 Advance to the next phase only when the current phase's exit criteria are satisfied.
 
 ## Phase 1 — Context & Threat Model
-1. Use `git diff {base_branch}...HEAD --name-only` to see what files changed. Then use `BASE_BRANCH={base_branch} ./safe_diff.sh <single_file_path>` on ONE relevant file at a time to understand exactly what lines were changed. Do NOT diff multiple files at once.
+1. Read `.pr_diff.txt` to understand the complete patch. Then use `git diff {base_branch}...HEAD --name-only` to see what files changed and `BASE_BRANCH={base_branch} ./safe_diff.sh <single_file_path>` on ONE relevant file at a time for paged inspection. Do NOT diff multiple files at once.
    If `safe_diff.sh` tells you the diff is paginated, run it again with the next page number (e.g., `BASE_BRANCH={base_branch} ./safe_diff.sh <file> 2`) to read the rest.
 2. Identify trust boundaries affected by these changes.
 3. Formulate 1-3 falsifiable hypotheses about vulnerabilities introduced by the PR. Format each hypothesis strictly as: [File:Line] [Specific Data Flow] -> [Security Boundary Crossed] -> [Impact].

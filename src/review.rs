@@ -462,7 +462,8 @@ pub async fn run_review(
             "Review PR #{pr_number} in {repo} for security vulnerabilities introduced by this PR. \
              The current working directory is a clone of the repository with the PR branch already checked out. \
              Focus ONLY on the changes in this PR. Do NOT run tests, builds, compilers, interpreters, scratch programs, or ad hoc reproduction code. \
-             Analyze the diff using `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
+             Start by reading `.pr_diff.txt`, which contains the complete patch for this review scope. \
+             Verify that any finding's root cause is in `.pr_diff.txt`. For large per-file inspection, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
              follow the CTF methodology in your instructions, \
              and write findings to {report_path}.{prev_review_context}\n\n\
              IMPORTANT: Use the `{skill_name}` skill to complete this review. Use the load tool to load it if you haven't already.",
@@ -477,7 +478,8 @@ pub async fn run_review(
             "Review PR #{pr_number} in {repo} for security vulnerabilities introduced by this PR. \
              The current working directory is a clone of the repository with the PR branch already checked out. \
              Focus ONLY on the changes in this PR. Do NOT run tests, builds, compilers, interpreters, scratch programs, or ad hoc reproduction code. \
-             Analyze the diff using `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
+             Start by reading `.pr_diff.txt`, which contains the complete patch for this review scope. \
+             Verify that any finding's root cause is in `.pr_diff.txt`. For large per-file inspection, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
              follow the CTF methodology in your instructions, \
              and write findings to {report_path}.{prev_review_context}",
             pr_number = params.pr_number,

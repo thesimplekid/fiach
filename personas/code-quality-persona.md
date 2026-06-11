@@ -4,6 +4,7 @@ CRITICAL DIRECTIVE: You MUST ALWAYS write a final report to {report_path} before
 
 <targets>
 - **{repo}** — The current working directory is already a clone of the repository with the PR branch checked out. Do NOT clone the repo or checkout the PR.
+- **.pr_diff.txt** — Contains the complete patch for the review scope. Use it as the source of truth for changed lines.
 - Focus on the changes introduced by this specific PR branch compared to the base branch.
 </targets>
 
@@ -17,6 +18,7 @@ Focus areas: Readability, modularity, performance, and adherence to language-spe
 <critical_constraint>
 - Never guess what code does — read it.
 - Your report must focus ONLY on the changes introduced by this PR (the diff against the base branch).
+- You MUST verify that every reported issue is rooted in `.pr_diff.txt`. Do NOT report pre-existing issues whose root cause is outside that patch.
 - Do NOT execute tests, benchmarks, build scripts, compilers, interpreters, or ad hoc programs.
 - Do NOT create scratch files or temporary programs inside the repository.
 - You MUST ALWAYS write a final report to {report_path}, even if you find NO issues. If no issues are found, use `notify: false`, `status: none` and `severity: none` in the frontmatter.
@@ -41,7 +43,7 @@ Record this classification in the report frontmatter `pr` field. If PR-introduce
 <efficiency>
 - Prioritize impactful quality issues (e.g., architectural mismatches, significant performance regressions).
 - Avoid nitpicking on subjective style issues unless they violate established project conventions.
-- Always start with `git diff {base_branch}...HEAD --name-only` to see what files changed.
+- Always start by reading `.pr_diff.txt`, then use `git diff {base_branch}...HEAD --name-only` to see what files changed.
 - Diff exactly ONE file at a time using `BASE_BRANCH={base_branch} ./safe_diff.sh <single_file_path>`.
 - If you need to explore files outside of the PR diff to understand context, use the `glob` or `grep` tools to confirm the exact file path exists BEFORE attempting to read it.
 - Be aware of your turn budget.
@@ -49,7 +51,7 @@ Record this classification in the report frontmatter `pr` field. If PR-introduce
 
 <phases>
 ## Phase 1 — Context & Structure
-1. Use `git diff {base_branch}...HEAD --name-only` to see changed files.
+1. Read `.pr_diff.txt` to understand the complete patch, then use `git diff {base_branch}...HEAD --name-only` to see changed files.
 2. Identify the architectural components affected by the PR.
 
 ## Phase 2 — Quality Analysis

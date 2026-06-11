@@ -162,7 +162,33 @@ pub async fn prepare(
         .trim()
         .to_string();
 
-    // 4. Create safe_diff.sh helper script to handle large diffs
+    // 4. Materialize the complete PR diff for prompts that need a single
+    // source of truth for changed lines.
+    let pr_diff_output = Command::new("git")
+        .args(["diff", &format!("{base_commit}...HEAD")])
+        .current_dir(&workspace_dir)
+        .output()
+        .await
+        .context("Failed to run `git diff` for .pr_diff.txt")?;
+
+    let pr_diff_path = workspace_dir.join(".pr_diff.txt");
+    if pr_diff_output.status.success() {
+        tokio::fs::write(&pr_diff_path, &pr_diff_output.stdout)
+            .await
+            .context("Failed to write .pr_diff.txt")?;
+    } else {
+        let stderr = String::from_utf8_lossy(&pr_diff_output.stderr);
+        tracing::warn!(
+            pr = pr_number,
+            error = %stderr,
+            "Failed to generate .pr_diff.txt; writing an empty diff artifact"
+        );
+        tokio::fs::write(&pr_diff_path, b"")
+            .await
+            .context("Failed to write empty .pr_diff.txt")?;
+    }
+
+    // 5. Create safe_diff.sh helper script to handle large diffs
     let safe_diff_script = r#"#!/usr/bin/env bash
 FILE=$1
 PAGE=${2:-1}
@@ -177,7 +203,7 @@ fi
 BASE_BRANCH="${BASE_BRANCH:-main}"
 
 # Generate the full diff
-FULL_DIFF=$(git diff $BASE_BRANCH..HEAD -- "$FILE")
+FULL_DIFF=$(git diff $BASE_BRANCH...HEAD -- "$FILE")
 TOTAL_LINES=$(echo "$FULL_DIFF" | wc -l)
 
 if [ "$TOTAL_LINES" -eq 0 ]; then
@@ -218,7 +244,7 @@ fi
         bail!("chmod +x safe_diff.sh failed: {stderr}");
     }
 
-    // 5. Get the commit hash
+    // 6. Get the commit hash
     let rev_parse_output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&workspace_dir)
