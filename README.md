@@ -18,6 +18,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 - **Skip PRs:** Ability to skip specific PRs by number or `repo#number` format.
 - **Author Allowlist:** Restrict daemon reviews to trusted GitHub author associations before executing any reviewer workspace.
 - **Worker Limit:** Run multiple PR reviews concurrently with an optional cap for resource-constrained hosts.
+- **Verifier Pass:** Re-check actionable findings against the complete PR diff before any disclosure mode runs.
 - **State Tracking:** Uses a lightweight, embedded Rust database (`redb`) to remember which commit hashes have already been reviewed, preventing redundant LLM calls.
 - **Workspace Isolation:** Clones the repository and checks out the PR branch into a temporary directory *before* giving control to the AI agent, saving valuable context window and turns.
 - **Per-Review Sandbox Logs:** Sandboxed reviews write `nspawn.log` next to their report artifacts for easier debugging.
@@ -157,6 +158,8 @@ severity: high
 
 If `notify: true` is present, or if `findings_count > 0`, `fiach` will trigger the configured disclosure mode. If no issues are found, the agent should output `notify: false`, and `fiach` will remain silent (unless you pass `--notify-on-empty`).
 
+When `verify_findings` is enabled, reports that would notify humans are sent through a second verifier pass before disclosure. The verifier must either leave the report actionable with verifier notes or rewrite it as a no-notify report.
+
 *See `personas/security-persona.md` for a complete example of an aggressive, CTF-style vulnerability hunting prompt.*
 
 ---
@@ -189,6 +192,7 @@ In your `flake.nix` or `configuration.nix`:
             prStates = [ "open" "merged" ];
             prLimit = 1000;
             maxWorkers = 1;
+            verifyFindings = true;
             provider = "openrouter";
             
             # The persona to use (defaults to builtin:security if omitted)
@@ -246,6 +250,7 @@ The following options are available under `services.fiach`:
 | `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`) | `"local"` | Mode for reporting findings. |
 | `syncRepo` | string or null | `null` | GitHub repository to sync reports to. Required if `reportMode` is `"sync-pr"`. |
 | `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no vulnerabilities were found. |
+| `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
 | `dataDir` | string | `"/var/lib/fiach"` | Directory to store state database and reports. |
 | `contextGroups` | attrset | `{}` | Context groups mapped by target repo (contains `repos` list). |
 | `sandbox.enable` | boolean | `false` | Enable Sandboxed PR reviews via systemd-nspawn. |

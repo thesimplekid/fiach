@@ -31,6 +31,7 @@ pub struct DaemonParams {
     pub retry_delay_secs: u64,
     pub out_dir: Option<PathBuf>,
     pub disclose_config: DiscloseConfig,
+    pub verify_findings: bool,
     pub context_groups: std::collections::HashMap<String, crate::config::ContextGroup>,
     pub pr_states: Vec<String>,
     pub skip_prs: Vec<String>,
@@ -410,6 +411,7 @@ async fn process_daemon_pr(
                 max_retries: params.max_retries,
                 retry_delay_secs: params.retry_delay_secs,
                 disclose_config: params.disclose_config.clone(),
+                verify_findings: params.verify_findings,
                 context_groups: params.context_groups.clone(),
                 max_cost_usd: params.max_cost_usd,
                 input_price_per_m: params.input_price_per_m,
@@ -585,6 +587,7 @@ async fn trigger_manual_review(
         max_retries: params.max_retries,
         retry_delay_secs: params.retry_delay_secs,
         disclose_config: params.disclose_config.clone(),
+        verify_findings: params.verify_findings,
         context_groups: params.context_groups.clone(),
         max_cost_usd: params.max_cost_usd,
         input_price_per_m: params.input_price_per_m,
@@ -827,6 +830,8 @@ async fn run_sandboxed_review(
         .arg(review_params.retry_delay_secs.to_string());
     cmd.arg("--report-mode")
         .arg(review_params.disclose_config.mode.to_string());
+    cmd.arg("--verify-findings")
+        .arg(review_params.verify_findings.to_string());
 
     if let Some(sync) = &review_params.disclose_config.sync_repo {
         cmd.arg("--sync-repo").arg(sync);

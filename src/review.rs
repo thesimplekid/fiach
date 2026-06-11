@@ -101,6 +101,8 @@ pub struct ReviewParams {
     pub retry_delay_secs: u64,
     /// Configuration for disclosing the report
     pub disclose_config: disclose::DiscloseConfig,
+    /// Run a second verifier pass before disclosure when findings would notify.
+    pub verify_findings: bool,
     pub context_groups: std::collections::HashMap<String, crate::config::ContextGroup>,
     /// Maximum budget in USD for this review
     pub max_cost_usd: Option<f64>,
@@ -827,7 +829,7 @@ pub async fn run_review(
             }
         }
     };
-    let turn_count =
+    let mut turn_count =
         match timeout(Duration::from_secs(params.timeout_mins * 60), review_future).await {
             Ok(result) => result?,
             Err(_) => {
@@ -871,12 +873,46 @@ pub async fn run_review(
 
     // 10. Check if the report was written and parse its frontmatter for summary
     let report_file = std::path::Path::new(&report_path);
-    let limit_reached = turn_count >= params.max_turns;
 
     if report_file.exists() {
-        let report_content = std::fs::read_to_string(report_file)
+        let mut report_content = std::fs::read_to_string(report_file)
             .context("Report file exists but could not be read")?;
 
+        if params.verify_findings && report_would_notify(&report_content) {
+            tracing::info!(
+                path = %report_path,
+                "Running verifier pass before disclosure"
+            );
+
+            let verifier_turns = run_verification_pass(
+                &agent,
+                session_config.clone(),
+                &report_path,
+                &params.repo,
+                params.pr_number,
+                &diff_base,
+                params.max_retries,
+                params.retry_delay_secs,
+                params.timeout_mins,
+                cancel_token.clone(),
+            )
+            .await?;
+            turn_count += verifier_turns;
+
+            if !report_file.exists() {
+                write_rejected_verification_report(
+                    report_file,
+                    &params.repo,
+                    params.pr_number,
+                    "The verifier removed the report instead of leaving a confirmed finding.",
+                )?;
+            }
+
+            report_content = std::fs::read_to_string(report_file)
+                .context("Report file could not be read after verifier pass")?;
+        }
+
+        let limit_reached = turn_count >= params.max_turns;
         let findings_count = parse_frontmatter_field(&report_content, "findings_count")
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
@@ -1003,6 +1039,7 @@ pub async fn run_review(
 
         return Ok(Some(completed));
     } else {
+        let limit_reached = turn_count >= params.max_turns;
         // The agent was explicitly instructed to always write a report, so a
         // missing report means something went wrong.
         if limit_reached {
@@ -1027,6 +1064,160 @@ pub async fn run_review(
     }
 
     Ok(None)
+}
+
+fn report_would_notify(content: &str) -> bool {
+    let notify = parse_frontmatter_field(content, "notify")
+        .unwrap_or_else(|| "false".to_string())
+        .eq_ignore_ascii_case("true");
+    let findings_count = parse_frontmatter_field(content, "findings_count")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let status = parse_frontmatter_field(content, "status").unwrap_or_default();
+
+    notify || (findings_count > 0 && status != "none")
+}
+
+async fn run_verification_pass(
+    agent: &Agent,
+    session_config: SessionConfig,
+    report_path: &str,
+    repo: &str,
+    pr_number: u64,
+    diff_base: &str,
+    max_retries: u32,
+    retry_delay_secs: u64,
+    timeout_mins: u64,
+    cancel_token: CancellationToken,
+) -> Result<u32> {
+    let verifier_prompt = format!(
+        "VERIFIER PHASE for PR #{pr_number} in {repo}.\n\
+         Read the existing report at `{report_path}` and the complete patch in `.pr_diff.txt`.\n\
+         The current diff base for shell checks is `{diff_base}`.\n\
+         Independently verify every finding, including any proof-of-concept and the claim that the root cause is in `.pr_diff.txt`.\n\
+         If the finding is confirmed and PR-introduced, leave the report actionable and append a `## Verifier Notes` section explaining the verification evidence.\n\
+         If the finding is not confirmed, is theoretical-only, or is pre-existing outside this PR diff, rewrite `{report_path}` with frontmatter:\n\
+         `title: \"No verified findings\"`, `notify: false`, `status: none`, `severity: none`, `target: {repo}`, `pr: none`, `skills_used: [\"verifier\"]`, `findings_count: 0`, followed by a summary of why the report was rejected.\n\
+         Do not open PRs, post comments, or perform disclosure side effects. Only update `{report_path}`.",
+    );
+
+    let verifier_future = async {
+        let mut retries = 0;
+        let mut delay = retry_delay_secs;
+        let mut turns = 0;
+        let mut stream = loop {
+            match agent
+                .reply(
+                    Message::user().with_text(&verifier_prompt),
+                    session_config.clone(),
+                    None,
+                )
+                .await
+            {
+                Ok(stream) => break stream,
+                Err(e) => {
+                    if is_fatal_error(&e) {
+                        return Err(e).context("Fatal provider error during verifier pass");
+                    }
+                    if retries >= max_retries {
+                        return Err(anyhow::anyhow!(
+                            "Failed to start verifier pass after {} retries: {}",
+                            retries,
+                            e
+                        ));
+                    }
+                    tracing::info!(
+                        "Failed to start verifier pass (attempt {}/{}): {}. Retrying in {}s...",
+                        retries + 1,
+                        max_retries,
+                        e,
+                        delay
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    retries += 1;
+                    delay *= 2;
+                }
+            }
+        };
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    bail!("Verifier pass cancelled by user");
+                }
+                event = stream.next() => {
+                    match event {
+                        Some(Ok(AgentEvent::Message(message))) => {
+                            if message.role == Role::Assistant {
+                                turns += 1;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            if is_fatal_error(&e) {
+                                return Err(e).context("Fatal provider error during verifier stream");
+                            }
+                            if retries >= max_retries {
+                                return Err(anyhow::anyhow!(
+                                    "Verifier stream failed after {} retries: {}",
+                                    retries,
+                                    e
+                                ));
+                            }
+                            let retry_prompt = format!(
+                                "The verifier stream was interrupted due to this error: {e}. Continue verification and ensure `{report_path}` is updated before stopping."
+                            );
+                            retries += 1;
+                            tokio::time::sleep(Duration::from_secs(delay)).await;
+                            delay *= 2;
+                            stream = agent
+                                .reply(
+                                    Message::user().with_text(&retry_prompt),
+                                    session_config.clone(),
+                                    None,
+                                )
+                                .await
+                                .context("Failed to restart verifier stream")?;
+                        }
+                        None => return Ok(turns),
+                    }
+                }
+            }
+        }
+    };
+
+    timeout(Duration::from_secs(timeout_mins * 60), verifier_future)
+        .await
+        .context("Verifier pass timed out")?
+}
+
+fn write_rejected_verification_report(
+    report_file: &std::path::Path,
+    repo: &str,
+    pr_number: u64,
+    reason: &str,
+) -> Result<()> {
+    let content = format!(
+        r#"---
+title: "No verified findings"
+notify: false
+status: none
+severity: none
+target: {repo}
+pr: none
+skills_used: ["verifier"]
+findings_count: 0
+---
+
+## Summary
+The verifier rejected the discovery report for PR #{pr_number}: {reason}
+
+## Verifier Notes
+No finding from the discovery report was allowed to proceed to disclosure.
+"#
+    );
+
+    fs::write(report_file, content).context("Failed to write rejected verifier report")
 }
 
 /// Extract a value from the YAML frontmatter of a report.
@@ -1214,6 +1405,36 @@ Reviewed the PR and found no vulnerabilities.
         let status =
             parse_frontmatter_field(SAMPLE_REPORT_NO_FINDINGS, "status").unwrap_or_default();
         assert!(!(notify_str.to_lowercase() == "true" || (count > 0 && status != "none")));
+    }
+
+    #[test]
+    fn test_report_would_notify_for_findings() {
+        assert!(report_would_notify(SAMPLE_REPORT_WITH_FINDINGS));
+    }
+
+    #[test]
+    fn test_report_would_notify_for_explicit_notify() {
+        let report = r#"---
+title: "No vulnerabilities found"
+notify: true
+status: none
+severity: none
+target: owner/repo
+pr: none
+skills_used: ["none"]
+findings_count: 0
+---
+
+## Summary
+Reviewed the PR and found no vulnerabilities.
+"#;
+
+        assert!(report_would_notify(report));
+    }
+
+    #[test]
+    fn test_report_would_notify_false_for_empty_report() {
+        assert!(!report_would_notify(SAMPLE_REPORT_NO_FINDINGS));
     }
 
     #[test]

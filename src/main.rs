@@ -99,6 +99,10 @@ enum Commands {
         #[arg(long)]
         notify_on_empty: Option<bool>,
 
+        /// Run a verifier pass before disclosure when findings are present
+        #[arg(long)]
+        verify_findings: Option<bool>,
+
         /// Maximum budget in USD for this review
         #[arg(long)]
         max_cost: Option<f64>,
@@ -180,6 +184,10 @@ enum Commands {
         /// Notify even if no vulnerabilities are found
         #[arg(long)]
         notify_on_empty: Option<bool>,
+
+        /// Run a verifier pass before disclosure when findings are present
+        #[arg(long)]
+        verify_findings: Option<bool>,
 
         /// Maximum budget in USD for each review
         #[arg(long)]
@@ -304,6 +312,7 @@ async fn main() -> Result<()> {
             report_mode,
             sync_repo,
             notify_on_empty,
+            verify_findings,
             max_cost,
             input_price,
             output_price,
@@ -359,6 +368,7 @@ async fn main() -> Result<()> {
                     sync_repo: sync_repo.or(rev_cfg.sync_repo),
                     notify_on_empty: notify_on_empty.or(rev_cfg.notify_on_empty).unwrap_or(false),
                 },
+                verify_findings: verify_findings.or(rev_cfg.verify_findings).unwrap_or(true),
                 context_groups: config.context_groups,
                 max_cost_usd: max_cost.or(rev_cfg.max_cost_usd),
                 input_price_per_m: input_price.or(rev_cfg.input_price_per_m),
@@ -390,6 +400,7 @@ async fn main() -> Result<()> {
             report_mode,
             sync_repo,
             notify_on_empty,
+            verify_findings,
             max_cost,
             pr_state,
             skip_prs,
@@ -505,6 +516,9 @@ async fn main() -> Result<()> {
                         .or(daemon_cfg.notify_on_empty)
                         .unwrap_or(false),
                 },
+                verify_findings: verify_findings
+                    .or(daemon_cfg.verify_findings)
+                    .unwrap_or(true),
                 context_groups: config.context_groups,
                 pr_states,
                 skip_prs: skip_prs_list,

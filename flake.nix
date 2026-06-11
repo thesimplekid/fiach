@@ -253,6 +253,12 @@
             description = "Whether to create PRs or comments even if no vulnerabilities were found.";
           };
 
+          verifyFindings = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = "Run a verifier pass before disclosure when findings are present.";
+          };
+
           dataDir = lib.mkOption {
             type = lib.types.str;
             default = "/var/lib/fiach";
@@ -414,6 +420,7 @@
                   db_path = "${cfg.dataDir}/fiach.redb";
                   out_dir = "${cfg.dataDir}/reports";
                   report_mode = cfg.reportMode;
+                  verify_findings = cfg.verifyFindings;
                   max_turns = cfg.maxTurns;
                 } // lib.optionalAttrs (cfg.syncRepo != null) {
                   sync_repo = cfg.syncRepo;
