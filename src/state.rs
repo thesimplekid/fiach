@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 
 const PR_STATE: TableDefinition<&str, &str> = TableDefinition::new("pr_state");
 const COMMIT_STATE: TableDefinition<&str, &str> = TableDefinition::new("commit_state");
+pub const DEFAULT_REVIEW_KIND: &str = "default";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReviewMetadata {
+    #[serde(default = "default_review_kind")]
+    pub review_kind: String,
     pub commit_hash: String,
     pub model: String,
     pub timestamp: i64, // Unix timestamp of when the review completed
@@ -36,12 +39,49 @@ pub struct ReviewMetadata {
     pub retry_count: u32,
 }
 
+fn default_review_kind() -> String {
+    DEFAULT_REVIEW_KIND.to_string()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReviewDecision {
     Skip,
     FirstReview,
     ReReview,
     RetryFailed,
+}
+
+fn pr_state_key(repo: &str, pr: u64, review_kind: &str) -> String {
+    if review_kind == DEFAULT_REVIEW_KIND {
+        format!("{}_{}", repo, pr)
+    } else {
+        format!("{repo}|{pr}|{review_kind}")
+    }
+}
+
+fn commit_state_key(repo: &str, commit_hash: &str, review_kind: &str) -> String {
+    if review_kind == DEFAULT_REVIEW_KIND {
+        format!("{}_{}", repo, commit_hash)
+    } else {
+        format!("{repo}|{commit_hash}|{review_kind}")
+    }
+}
+
+fn parse_pr_state_key(key: &str) -> Option<(String, u64)> {
+    if let Some((repo, rest)) = key.split_once('|')
+        && let Some((pr_str, _review_kind)) = rest.split_once('|')
+        && let Ok(pr) = pr_str.parse::<u64>()
+    {
+        return Some((repo.to_string(), pr));
+    }
+
+    if let Some((repo, pr_str)) = key.rsplit_once('_')
+        && let Ok(pr) = pr_str.parse::<u64>()
+    {
+        return Some((repo.to_string(), pr));
+    }
+
+    None
 }
 
 fn with_retries<T, F>(mut action: F) -> Result<T>
@@ -81,6 +121,7 @@ pub fn should_review(
     repo: &str,
     pr: u64,
     current_hash: &str,
+    review_kind: &str,
     force: bool,
     timeout_mins: u64,
 ) -> Result<ReviewDecision> {
@@ -109,7 +150,7 @@ pub fn should_review(
             }
         };
 
-        let key = format!("{}_{}", repo, pr);
+        let key = pr_state_key(repo, pr, review_kind);
         if let Some(value) = table.get(key.as_str())? {
             let json_str = value.value();
             match serde_json::from_str::<ReviewMetadata>(json_str) {
@@ -182,13 +223,13 @@ pub fn mark_reviewed(db_path: &Path, repo: &str, pr: u64, metadata: &ReviewMetad
         let write_txn = db.begin_write()?;
         {
             let mut pr_table = write_txn.open_table(PR_STATE)?;
-            let pr_key = format!("{}_{}", repo, pr);
+            let pr_key = pr_state_key(repo, pr, &metadata.review_kind);
             let json_str =
                 serde_json::to_string(metadata).context("Failed to serialize ReviewMetadata")?;
             pr_table.insert(pr_key.as_str(), json_str.as_str())?;
 
             let mut commit_table = write_txn.open_table(COMMIT_STATE)?;
-            let commit_key = format!("{}_{}", repo, metadata.commit_hash);
+            let commit_key = commit_state_key(repo, &metadata.commit_hash, &metadata.review_kind);
             commit_table.insert(commit_key.as_str(), json_str.as_str())?;
         }
         write_txn.commit()?;
@@ -205,6 +246,7 @@ pub fn lock_for_review(
     repo: &str,
     pr: u64,
     commit_hash: &str,
+    review_kind: &str,
     timeout_mins: u64,
 ) -> Result<bool> {
     if !db_path.exists() {
@@ -217,7 +259,7 @@ pub fn lock_for_review(
 
         {
             let mut pr_table = write_txn.open_table(PR_STATE)?;
-            let key = format!("{}_{}", repo, pr);
+            let key = pr_state_key(repo, pr, review_kind);
 
             if let Some(value) = pr_table.get(key.as_str())? {
                 let json_str = value.value();
@@ -244,6 +286,7 @@ pub fn lock_for_review(
             }
 
             let metadata = ReviewMetadata {
+                review_kind: review_kind.to_string(),
                 commit_hash: commit_hash.to_string(),
                 model: "daemon".to_string(),
                 timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -295,7 +338,12 @@ pub fn lock_for_review(
 }
 
 /// Retrieves review metadata for a specific commit hash.
-pub fn get_pr_review(db_path: &Path, repo: &str, pr: u64) -> Result<Option<ReviewMetadata>> {
+pub fn get_pr_review(
+    db_path: &Path,
+    repo: &str,
+    pr: u64,
+    review_kind: &str,
+) -> Result<Option<ReviewMetadata>> {
     if !db_path.exists() {
         return Ok(None);
     }
@@ -309,7 +357,7 @@ pub fn get_pr_review(db_path: &Path, repo: &str, pr: u64) -> Result<Option<Revie
             Err(_) => return Ok(None),
         };
 
-        let key = format!("{}_{}", repo, pr);
+        let key = pr_state_key(repo, pr, review_kind);
         if let Some(value) = table.get(key.as_str())? {
             let json_str = value.value();
             let metadata: ReviewMetadata = serde_json::from_str(json_str)?;
@@ -324,6 +372,7 @@ pub fn get_commit_review(
     db_path: &Path,
     repo: &str,
     commit_hash: &str,
+    review_kind: &str,
 ) -> Result<Option<ReviewMetadata>> {
     if !db_path.exists() {
         return Ok(None);
@@ -338,7 +387,7 @@ pub fn get_commit_review(
             Err(_) => return Ok(None),
         };
 
-        let key = format!("{}_{}", repo, commit_hash);
+        let key = commit_state_key(repo, commit_hash, review_kind);
         if let Some(value) = table.get(key.as_str())? {
             let json_str = value.value();
             let metadata: ReviewMetadata = serde_json::from_str(json_str)?;
@@ -369,14 +418,10 @@ pub fn list_reviews(db_path: &Path) -> Result<Vec<(String, u64, ReviewMetadata)>
             let (key_guard, value_guard) = item?;
             let key = key_guard.value();
 
-            // Key format is "{repo}_{pr}"
-            #[allow(clippy::collapsible_if)]
-            if let Some((repo, pr_str)) = key.rsplit_once('_') {
-                if let Ok(pr) = pr_str.parse::<u64>() {
-                    let json_str = value_guard.value();
-                    if let Ok(metadata) = serde_json::from_str::<ReviewMetadata>(json_str) {
-                        reviews.push((repo.to_string(), pr, metadata));
-                    }
+            if let Some((repo, pr)) = parse_pr_state_key(key) {
+                let json_str = value_guard.value();
+                if let Ok(metadata) = serde_json::from_str::<ReviewMetadata>(json_str) {
+                    reviews.push((repo, pr, metadata));
                 }
             }
         }
@@ -386,4 +431,45 @@ pub fn list_reviews(db_path: &Path) -> Result<Vec<(String, u64, ReviewMetadata)>
 
         Ok(reviews)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_review_kind_uses_legacy_keys() {
+        assert_eq!(
+            pr_state_key("owner/repo", 42, DEFAULT_REVIEW_KIND),
+            "owner/repo_42"
+        );
+        assert_eq!(
+            commit_state_key("owner/repo", "abcdef", DEFAULT_REVIEW_KIND),
+            "owner/repo_abcdef"
+        );
+    }
+
+    #[test]
+    fn persona_review_kind_uses_scoped_keys() {
+        assert_eq!(
+            pr_state_key("owner/repo", 42, "security"),
+            "owner/repo|42|security"
+        );
+        assert_eq!(
+            commit_state_key("owner/repo", "abcdef", "security"),
+            "owner/repo|abcdef|security"
+        );
+    }
+
+    #[test]
+    fn list_key_parser_reads_legacy_and_scoped_pr_keys() {
+        assert_eq!(
+            parse_pr_state_key("owner/repo_42"),
+            Some(("owner/repo".to_string(), 42))
+        );
+        assert_eq!(
+            parse_pr_state_key("owner/repo|42|security"),
+            Some(("owner/repo".to_string(), 42))
+        );
+    }
 }

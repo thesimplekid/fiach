@@ -14,7 +14,11 @@ use crate::disclose::DiscloseConfig;
 use crate::review::{CompletedReview, ReviewExecution, ReviewParams, run_review};
 
 pub enum DaemonMessage {
-    TriggerReview { repo: String, pr_number: u64 },
+    TriggerReview {
+        repo: String,
+        pr_number: u64,
+        persona: Option<String>,
+    },
 }
 
 pub struct DaemonParams {
@@ -25,7 +29,7 @@ pub struct DaemonParams {
     pub verifier_provider: Option<String>,
     pub verifier_model: Option<String>,
     pub skill: Option<String>,
-    pub persona: crate::persona::PersonaSource,
+    pub personas: Vec<crate::persona::PersonaSource>,
     pub max_turns: u32,
     pub timeout_mins: u64,
     pub db_path: PathBuf,
@@ -44,13 +48,14 @@ pub struct DaemonParams {
     pub input_price_per_m: Option<f64>,
     pub output_price_per_m: Option<f64>,
     pub updated_within_days: u32,
+    pub filter_by_updated: bool,
     pub pr_limit: u32,
     pub sandbox_rootfs: Option<PathBuf>,
     pub sandbox_network: Option<String>,
     pub sandbox_extra_args: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct PullRequest {
     number: u64,
     #[serde(rename = "headRefOid")]
@@ -60,6 +65,13 @@ struct PullRequest {
     #[serde(rename = "authorAssociation")]
     author_association: String,
     title: String,
+}
+
+#[derive(Clone)]
+struct ReviewJob {
+    pr: PullRequest,
+    persona: crate::persona::PersonaSource,
+    review_kind: String,
 }
 
 fn is_allowed_author_association(association: &str, allowed: &[String]) -> bool {
@@ -76,6 +88,69 @@ fn worker_concurrency(max_workers: usize, job_count: usize) -> usize {
     } else {
         max_workers.min(job_count)
     }
+}
+
+fn review_jobs(
+    personas: &[crate::persona::PersonaSource],
+    prs: &[PullRequest],
+    use_persona_kind: bool,
+) -> Vec<ReviewJob> {
+    prs.iter()
+        .flat_map(|pr| {
+            personas.iter().map(move |persona| ReviewJob {
+                pr: pr.clone(),
+                persona: persona.clone(),
+                review_kind: if use_persona_kind {
+                    persona.review_kind()
+                } else {
+                    crate::state::DEFAULT_REVIEW_KIND.to_string()
+                },
+            })
+        })
+        .collect()
+}
+
+fn output_path_for_review(
+    out_dir: Option<&Path>,
+    repo: &str,
+    pr_number: u64,
+    commit_hash: &str,
+    review_kind: &str,
+) -> Option<PathBuf> {
+    let safe_repo = repo.replace('/', "_");
+    let hash = &commit_hash[..commit_hash.len().min(7)];
+    let out_file_name = if review_kind == crate::state::DEFAULT_REVIEW_KIND {
+        format!("{}_PR{}_{}_report.md", safe_repo, pr_number, hash)
+    } else {
+        format!(
+            "{}_PR{}_{}_{}_report.md",
+            safe_repo, pr_number, hash, review_kind
+        )
+    };
+
+    out_dir.map(|dir| dir.join(out_file_name))
+}
+
+fn pr_search_query(
+    state: &str,
+    filter_by_updated: bool,
+    updated_within_days: u32,
+    drafts: Option<bool>,
+) -> String {
+    let mut search_query = format!("state:{state}");
+
+    if filter_by_updated {
+        let time_ago = OffsetDateTime::now_utc() - time::Duration::days(updated_within_days.into());
+        let format = format_description::parse("[year]-[month]-[day]").unwrap();
+        let search_date = time_ago.format(&format).unwrap();
+        search_query.push_str(&format!(" updated:>={search_date}"));
+    }
+
+    if let Some(drafts) = drafts {
+        search_query.push_str(&format!(" draft:{drafts}"));
+    }
+
+    search_query
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,21 +203,17 @@ pub async fn run_daemon(
 
             tracing::debug!(repo = %repo, "Checking for open PRs");
 
-            // Look for PRs updated in the last N days
-            let time_ago =
-                OffsetDateTime::now_utc() - time::Duration::days(params.updated_within_days.into());
-            let format = format_description::parse("[year]-[month]-[day]").unwrap();
-            let search_date = time_ago.format(&format).unwrap();
-
             for state in &params.pr_states {
                 if cancel_token.is_cancelled() {
                     break;
                 }
 
-                let mut search_query = format!("state:{} updated:>={}", state, search_date);
-                if let Some(drafts) = params.drafts {
-                    search_query.push_str(&format!(" draft:{}", drafts));
-                }
+                let search_query = pr_search_query(
+                    state,
+                    params.filter_by_updated,
+                    params.updated_within_days,
+                    params.drafts,
+                );
 
                 let output = Command::new("gh")
                     .args([
@@ -181,17 +252,19 @@ pub async fn run_daemon(
                         let mut skipped = 0;
                         let mut failed = 0;
 
-                        let concurrency = worker_concurrency(params.max_workers, prs.len());
+                        let jobs = review_jobs(&params.personas, &prs, params.personas.len() > 1);
+                        let concurrency = worker_concurrency(params.max_workers, jobs.len());
                         tracing::info!(
                             repo = %repo,
                             state = %state,
                             max_workers = params.max_workers,
                             concurrency = concurrency,
-                            "Processing PRs with worker limit"
+                            personas = params.personas.len(),
+                            "Processing review jobs with worker limit"
                         );
 
-                        let mut outcomes = stream::iter(prs.iter())
-                            .map(|pr| process_daemon_pr(&params, repo, pr, cancel_token.clone()))
+                        let mut outcomes = stream::iter(jobs.iter())
+                            .map(|job| process_daemon_job(&params, repo, job, cancel_token.clone()))
                             .buffer_unordered(concurrency);
 
                         while let Some(outcome) = outcomes.next().await {
@@ -209,11 +282,11 @@ pub async fn run_daemon(
                         tracing::info!(
                             repo = %repo,
                             state = %state,
-                            total = prs.len(),
+                            total = jobs.len(),
                             reviewed = reviewed,
                             skipped = skipped,
                             failed = failed,
-                            "Finished {} PR processing for {}",
+                            "Finished {} review job processing for {}",
                             state,
                             repo
                         );
@@ -246,9 +319,15 @@ pub async fn run_daemon(
             _ = tokio::time::sleep(sleep_duration) => {}
             Some(msg) = rx.recv() => {
                 match msg {
-                    DaemonMessage::TriggerReview { repo, pr_number } => {
+                    DaemonMessage::TriggerReview {
+                        repo,
+                        pr_number,
+                        persona,
+                    } => {
                         tracing::info!("Received trigger to review {}/{}", repo, pr_number);
-                        if let Err(e) = trigger_manual_review(&params, repo, pr_number, cancel_token.clone()).await {
+                        if let Err(e) =
+                            trigger_manual_review(&params, repo, pr_number, persona, cancel_token.clone()).await
+                        {
                             tracing::error!("Failed to manually trigger review: {}", e);
                         }
                     }
@@ -263,19 +342,21 @@ pub async fn run_daemon(
     Ok(())
 }
 
-fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, pr: &PullRequest) {
+fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
     #[allow(clippy::collapsible_if)]
     if let Ok(decision) = crate::state::should_review(
         &params.db_path,
         repo,
-        pr.number,
-        &pr.head_ref_oid,
+        job.pr.number,
+        &job.pr.head_ref_oid,
+        &job.review_kind,
         false,
         params.timeout_mins,
     ) {
         if decision != crate::state::ReviewDecision::Skip {
             let meta = crate::state::ReviewMetadata {
-                commit_hash: pr.head_ref_oid.clone(),
+                review_kind: job.review_kind.clone(),
+                commit_hash: job.pr.head_ref_oid.clone(),
                 model: "daemon".to_string(),
                 timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
                 findings_count: 0,
@@ -296,29 +377,35 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, pr: &PullRequest) {
                 ),
                 retry_count: 0,
             };
-            let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);
+            let _ = crate::state::mark_reviewed(&params.db_path, repo, job.pr.number, &meta);
         }
     }
 }
 
-async fn process_daemon_pr(
+async fn process_daemon_job(
     params: &DaemonParams,
     repo: &str,
-    pr: &PullRequest,
+    job: &ReviewJob,
     cancel_token: CancellationToken,
 ) -> Result<PrProcessStatus> {
     if cancel_token.is_cancelled() {
         return Ok(PrProcessStatus::Skipped);
     }
 
+    let pr = &job.pr;
     let skip = params
         .skip_prs
         .iter()
         .any(|s| s == &pr.number.to_string() || s == &format!("{}#{}", repo, pr.number));
 
     if skip {
-        tracing::info!(repo = %repo, pr = pr.number, "Skipping PR as requested");
-        mark_skipped_if_needed(params, repo, pr);
+        tracing::info!(
+            repo = %repo,
+            pr = pr.number,
+            review_kind = %job.review_kind,
+            "Skipping PR as requested"
+        );
+        mark_skipped_if_needed(params, repo, job);
         return Ok(PrProcessStatus::Skipped);
     }
 
@@ -334,8 +421,13 @@ async fn process_daemon_pr(
     }
 
     if pr.head_ref_name.starts_with("backport-") || pr.title.starts_with("[Backport") {
-        tracing::info!(repo = %repo, pr = pr.number, "Skipping backport PR");
-        mark_skipped_if_needed(params, repo, pr);
+        tracing::info!(
+            repo = %repo,
+            pr = pr.number,
+            review_kind = %job.review_kind,
+            "Skipping backport PR"
+        );
+        mark_skipped_if_needed(params, repo, job);
         return Ok(PrProcessStatus::Skipped);
     }
 
@@ -344,6 +436,7 @@ async fn process_daemon_pr(
         repo,
         pr.number,
         &pr.head_ref_oid,
+        &job.review_kind,
         false,
         params.timeout_mins,
     ) {
@@ -355,6 +448,7 @@ async fn process_daemon_pr(
                 repo,
                 pr.number,
                 &pr.head_ref_oid,
+                &job.review_kind,
                 false,
                 params.timeout_mins,
             )?;
@@ -365,13 +459,24 @@ async fn process_daemon_pr(
                 repo,
                 pr.number,
                 &pr.head_ref_oid,
+                &job.review_kind,
                 params.timeout_mins,
             ) {
                 Ok(true) => {
-                    tracing::debug!(repo = %repo, pr = pr.number, "Successfully locked PR for review");
+                    tracing::debug!(
+                        repo = %repo,
+                        pr = pr.number,
+                        review_kind = %job.review_kind,
+                        "Successfully locked PR for review"
+                    );
                 }
                 Ok(false) => {
-                    tracing::info!(repo = %repo, pr = pr.number, "PR is currently locked by another process, skipping");
+                    tracing::info!(
+                        repo = %repo,
+                        pr = pr.number,
+                        review_kind = %job.review_kind,
+                        "PR review is currently locked by another process, skipping"
+                    );
                     return Ok(PrProcessStatus::Skipped);
                 }
                 Err(e) => {
@@ -382,21 +487,32 @@ async fn process_daemon_pr(
 
             match decision {
                 crate::state::ReviewDecision::RetryFailed => {
-                    tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "Retrying previously failed PR review");
+                    tracing::info!(
+                        repo = %repo,
+                        pr = pr.number,
+                        commit = %pr.head_ref_oid,
+                        review_kind = %job.review_kind,
+                        "Retrying previously failed PR review"
+                    );
                 }
                 _ => {
-                    tracing::info!(repo = %repo, pr = pr.number, commit = %pr.head_ref_oid, "New PR or commit needs review");
+                    tracing::info!(
+                        repo = %repo,
+                        pr = pr.number,
+                        commit = %pr.head_ref_oid,
+                        review_kind = %job.review_kind,
+                        "New PR or commit needs review"
+                    );
                 }
             }
 
-            let safe_repo = repo.replace('/', "_");
-            let out_file_name = format!(
-                "{}_PR{}_{}_report.md",
-                safe_repo,
+            let output_path = output_path_for_review(
+                params.out_dir.as_deref(),
+                repo,
                 pr.number,
-                &pr.head_ref_oid[..7]
+                &pr.head_ref_oid,
+                &job.review_kind,
             );
-            let output_path = params.out_dir.as_ref().map(|dir| dir.join(out_file_name));
 
             let review_params = ReviewParams {
                 repo: repo.to_string(),
@@ -407,10 +523,11 @@ async fn process_daemon_pr(
                 verifier_model: params.verifier_model.clone(),
                 output: output_path,
                 skill: params.skill.clone(),
-                persona: params.persona.clone(),
+                persona: job.persona.clone(),
                 max_turns: params.max_turns,
                 timeout_mins: params.timeout_mins,
                 db_path: params.db_path.clone(),
+                review_kind: job.review_kind.clone(),
                 force: false,
                 max_retries: params.max_retries,
                 retry_delay_secs: params.retry_delay_secs,
@@ -437,13 +554,15 @@ async fn process_daemon_pr(
             };
 
             if let Err(e) = review_result {
-                let retry_count = crate::state::get_pr_review(&params.db_path, repo, pr.number)
-                    .ok()
-                    .flatten()
-                    .map(|m| m.retry_count)
-                    .unwrap_or(0);
+                let retry_count =
+                    crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
+                        .ok()
+                        .flatten()
+                        .map(|m| m.retry_count)
+                        .unwrap_or(0);
 
                 let meta = crate::state::ReviewMetadata {
+                    review_kind: job.review_kind.clone(),
                     commit_hash: pr.head_ref_oid.clone(),
                     model: "daemon".to_string(),
                     timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -497,6 +616,7 @@ async fn trigger_manual_review(
     params: &DaemonParams,
     repo: String,
     pr_number: u64,
+    persona_filter: Option<String>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     tracing::info!(repo = %repo, pr = pr_number, "Fetching manual PR details");
@@ -528,11 +648,62 @@ async fn trigger_manual_review(
     let pr_details: PrDetails =
         serde_json::from_slice(&output.stdout).context("Failed to parse PR details")?;
 
+    let selected_personas = if let Some(filter) = persona_filter {
+        let requested = filter.trim();
+        let personas: Vec<_> = params
+            .personas
+            .iter()
+            .filter(|persona| {
+                persona.review_kind() == requested || persona.to_string() == requested
+            })
+            .cloned()
+            .collect();
+
+        if personas.is_empty() {
+            anyhow::bail!("No configured persona matches '{}'", requested);
+        }
+        personas
+    } else {
+        params.personas.clone()
+    };
+
+    let jobs = review_jobs(
+        &selected_personas,
+        &[PullRequest {
+            number: pr_number,
+            head_ref_oid: pr_details.head_ref_oid.clone(),
+            head_ref_name: String::new(),
+            author_association: String::new(),
+            title: String::new(),
+        }],
+        params.personas.len() > 1,
+    );
+
+    let concurrency = worker_concurrency(params.max_workers, jobs.len());
+    let mut outcomes = stream::iter(jobs.iter())
+        .map(|job| run_manual_review_job(params, &repo, job, cancel_token.clone()))
+        .buffer_unordered(concurrency);
+
+    while let Some(outcome) = outcomes.next().await {
+        outcome?;
+    }
+
+    Ok(())
+}
+
+async fn run_manual_review_job(
+    params: &DaemonParams,
+    repo: &str,
+    job: &ReviewJob,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    let pr = &job.pr;
     let decision = crate::state::should_review(
         &params.db_path,
-        &repo,
-        pr_number,
-        &pr_details.head_ref_oid,
+        repo,
+        pr.number,
+        &pr.head_ref_oid,
+        &job.review_kind,
         false,
         params.timeout_mins,
     )?;
@@ -540,55 +711,78 @@ async fn trigger_manual_review(
 
     match crate::state::lock_for_review(
         &params.db_path,
-        &repo,
-        pr_number,
-        &pr_details.head_ref_oid,
+        repo,
+        pr.number,
+        &pr.head_ref_oid,
+        &job.review_kind,
         params.timeout_mins,
     ) {
         Ok(true) => {
-            tracing::debug!(repo = %repo, pr = pr_number, "Successfully locked PR for review");
+            tracing::debug!(
+                repo = %repo,
+                pr = pr.number,
+                review_kind = %job.review_kind,
+                "Successfully locked PR for review"
+            );
         }
         Ok(false) => {
-            tracing::info!(repo = %repo, pr = pr_number, "PR is currently locked by another process, skipping");
+            tracing::info!(
+                repo = %repo,
+                pr = pr.number,
+                review_kind = %job.review_kind,
+                "PR review is currently locked by another process, skipping"
+            );
             return Ok(());
         }
         Err(e) => {
-            tracing::error!("Failed to lock PR {} in {}: {}", pr_number, repo, e);
+            tracing::error!("Failed to lock PR {} in {}: {}", pr.number, repo, e);
             return Err(e);
         }
     }
 
     match decision {
         crate::state::ReviewDecision::RetryFailed => {
-            tracing::info!(repo = %repo, pr = pr_number, commit = %pr_details.head_ref_oid, "Retrying previously failed manual PR review");
+            tracing::info!(
+                repo = %repo,
+                pr = pr.number,
+                commit = %pr.head_ref_oid,
+                review_kind = %job.review_kind,
+                "Retrying previously failed manual PR review"
+            );
         }
         _ => {
-            tracing::info!(repo = %repo, pr = pr_number, commit = %pr_details.head_ref_oid, "Starting manual PR review");
+            tracing::info!(
+                repo = %repo,
+                pr = pr.number,
+                commit = %pr.head_ref_oid,
+                review_kind = %job.review_kind,
+                "Starting manual PR review"
+            );
         }
     }
 
-    let safe_repo = repo.replace('/', "_");
-    let out_file_name = format!(
-        "{}_PR{}_{}_report.md",
-        safe_repo,
-        pr_number,
-        &pr_details.head_ref_oid[..7]
+    let output_path = output_path_for_review(
+        params.out_dir.as_deref(),
+        repo,
+        pr.number,
+        &pr.head_ref_oid,
+        &job.review_kind,
     );
-    let output_path = params.out_dir.as_ref().map(|dir| dir.join(out_file_name));
 
     let review_params = ReviewParams {
-        repo: repo.clone(),
-        pr_number,
+        repo: repo.to_string(),
+        pr_number: pr.number,
         provider: params.provider.clone(),
         model: params.model.clone(),
         verifier_provider: params.verifier_provider.clone(),
         verifier_model: params.verifier_model.clone(),
         output: output_path,
         skill: params.skill.clone(),
-        persona: params.persona.clone(),
+        persona: job.persona.clone(),
         max_turns: params.max_turns,
         timeout_mins: params.timeout_mins,
         db_path: params.db_path.clone(),
+        review_kind: job.review_kind.clone(),
         force: false,
         max_retries: params.max_retries,
         retry_delay_secs: params.retry_delay_secs,
@@ -615,14 +809,16 @@ async fn trigger_manual_review(
     };
 
     if let Err(e) = review_result {
-        let retry_count = crate::state::get_pr_review(&params.db_path, &repo, pr_number)
-            .ok()
-            .flatten()
-            .map(|m| m.retry_count)
-            .unwrap_or(0);
+        let retry_count =
+            crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
+                .ok()
+                .flatten()
+                .map(|m| m.retry_count)
+                .unwrap_or(0);
 
         let meta = crate::state::ReviewMetadata {
-            commit_hash: pr_details.head_ref_oid.clone(),
+            review_kind: job.review_kind.clone(),
+            commit_hash: pr.head_ref_oid.clone(),
             model: "daemon".to_string(),
             timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
             findings_count: 0,
@@ -643,14 +839,14 @@ async fn trigger_manual_review(
             ),
             retry_count,
         };
-        let _ = crate::state::mark_reviewed(&params.db_path, &repo, pr_number, &meta);
+        let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);
 
         if cancel_token.is_cancelled() {
             return Err(e);
         }
         tracing::error!(
             "Failed to manually review PR {} in {}: {}",
-            pr_number,
+            pr.number,
             repo,
             e
         );
@@ -691,6 +887,7 @@ async fn run_sandboxed_review(
         params.out_dir.as_deref(),
         &review_params.repo,
         review_params.pr_number,
+        &review_params.review_kind,
     )?;
     std::fs::create_dir_all(&run_dir).with_context(|| {
         format!(
@@ -824,6 +1021,7 @@ async fn run_sandboxed_review(
         cmd.arg("--with-skill").arg(skill);
     }
     cmd.arg("--persona").arg(review_params.persona.to_string());
+    cmd.arg("--review-kind").arg(&review_params.review_kind);
     cmd.arg("--max-turns")
         .arg(review_params.max_turns.to_string());
     cmd.arg("--timeout-mins")
@@ -1047,7 +1245,12 @@ async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<
     Ok(runtime_rootfs)
 }
 
-fn sandbox_run_dir(base_out_dir: Option<&Path>, repo: &str, pr_number: u64) -> Result<PathBuf> {
+fn sandbox_run_dir(
+    base_out_dir: Option<&Path>,
+    repo: &str,
+    pr_number: u64,
+    review_kind: &str,
+) -> Result<PathBuf> {
     let base_dir = match base_out_dir {
         Some(dir) => dir.to_path_buf(),
         None => std::env::current_dir()
@@ -1055,9 +1258,12 @@ fn sandbox_run_dir(base_out_dir: Option<&Path>, repo: &str, pr_number: u64) -> R
             .join("reports"),
     };
     let safe_repo = repo.replace('/', "_");
-    Ok(base_dir
-        .join("runs")
-        .join(format!("{}_PR{}", safe_repo, pr_number)))
+    let run_name = if review_kind == crate::state::DEFAULT_REVIEW_KIND {
+        format!("{}_PR{}", safe_repo, pr_number)
+    } else {
+        format!("{}_PR{}_{}", safe_repo, pr_number, review_kind)
+    };
+    Ok(base_dir.join("runs").join(run_name))
 }
 
 fn read_completed_review(path: &Path) -> Result<CompletedReview> {
@@ -1092,5 +1298,22 @@ mod tests {
         assert_eq!(worker_concurrency(20, 10), 10);
         assert_eq!(worker_concurrency(0, 10), 10);
         assert_eq!(worker_concurrency(0, 0), 1);
+    }
+
+    #[test]
+    fn pr_search_query_can_omit_updated_filter() {
+        assert_eq!(pr_search_query("open", false, 120, None), "state:open");
+        assert_eq!(
+            pr_search_query("open", false, 120, Some(false)),
+            "state:open draft:false"
+        );
+    }
+
+    #[test]
+    fn pr_search_query_includes_updated_filter_when_configured() {
+        let query = pr_search_query("open", true, 120, Some(false));
+
+        assert!(query.starts_with("state:open updated:>="));
+        assert!(query.ends_with(" draft:false"));
     }
 }

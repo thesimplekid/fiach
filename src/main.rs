@@ -16,8 +16,61 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use self::config::FiachConfig;
+use self::config::{FiachConfig, MultiString};
 use self::disclose::ReportMode;
+
+fn parse_persona_sources(values: Vec<String>) -> Vec<persona::PersonaSource> {
+    values
+        .into_iter()
+        .map(|value| persona::PersonaSource::from_str(&value).unwrap())
+        .collect()
+}
+
+fn resolve_personas(
+    cli_persona: Option<String>,
+    cfg_persona: Option<MultiString>,
+    cfg_personas: Option<MultiString>,
+) -> Vec<persona::PersonaSource> {
+    let values = cli_persona
+        .map(MultiString::Single)
+        .or(cfg_personas)
+        .or(cfg_persona)
+        .map(|personas| personas.to_vec())
+        .unwrap_or_else(|| vec!["builtin:security".to_string()]);
+
+    parse_persona_sources(values)
+}
+
+fn review_kind_for(persona: &persona::PersonaSource, use_persona_kind: bool) -> String {
+    if use_persona_kind {
+        persona.review_kind()
+    } else {
+        state::DEFAULT_REVIEW_KIND.to_string()
+    }
+}
+
+fn output_for_persona(
+    output: Option<PathBuf>,
+    persona: &persona::PersonaSource,
+    use_persona_kind: bool,
+) -> Option<PathBuf> {
+    if !use_persona_kind {
+        return output;
+    }
+
+    let path = output?;
+    let review_kind = persona.review_kind();
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("md");
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("report");
+    let file_name = format!("{stem}.{review_kind}.{extension}");
+    Some(path.with_file_name(file_name))
+}
 
 /// Fiach — Autonomous AI-powered PR reviewer using goose.
 #[derive(Parser, Debug)]
@@ -68,7 +121,7 @@ enum Commands {
         #[arg(long)]
         with_skill: Option<String>,
 
-        /// Path to the persona prompt file (e.g. ./custom.md) or a builtin (builtin:security, builtin:pr-review, builtin:code-quality).
+        /// Path to the persona prompt file or builtin. Can be comma-separated.
         #[arg(long)]
         persona: Option<String>,
 
@@ -139,6 +192,10 @@ enum Commands {
         /// Internal: write structured sandbox review result to JSON
         #[arg(long, hide = true)]
         result_json: Option<PathBuf>,
+
+        /// Internal: persona-scoped state/report identity for sandbox child reviews
+        #[arg(long, hide = true)]
+        review_kind: Option<String>,
     },
     /// Run as a daemon that polls for open PRs
     Daemon {
@@ -170,7 +227,7 @@ enum Commands {
         #[arg(long)]
         with_skill: Option<String>,
 
-        /// Path to the persona prompt file (e.g. ./custom.md) or a builtin (builtin:security, builtin:pr-review, builtin:code-quality).
+        /// Path to the persona prompt file or builtin. Can be comma-separated.
         #[arg(long)]
         persona: Option<String>,
 
@@ -257,6 +314,10 @@ enum Commands {
         /// Number of days to look back for updated PRs
         #[arg(long)]
         updated_within_days: Option<u32>,
+
+        /// Whether to add an updated:>= filter to PR discovery
+        #[arg(long)]
+        filter_by_updated: Option<bool>,
 
         /// Maximum number of PRs to fetch from GitHub
         #[arg(long)]
@@ -355,6 +416,7 @@ async fn main() -> Result<()> {
             output_price,
             sandbox_child,
             result_json,
+            review_kind,
         } => {
             let rev_cfg = config.review.unwrap_or_default();
 
@@ -366,67 +428,83 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| "openrouter".to_string());
             let verifier_model = verifier_model.or(rev_cfg.verifier_model);
             let verifier_provider = verifier_provider.or(rev_cfg.verifier_provider);
-            let persona_str = persona
-                .or(rev_cfg.persona)
-                .unwrap_or_else(|| "builtin:security".to_string());
-            let persona = persona::PersonaSource::from_str(&persona_str).unwrap();
+            let personas = resolve_personas(persona, rev_cfg.persona, rev_cfg.personas);
+            let use_persona_kind = personas.len() > 1;
             let report_mode_str = report_mode
                 .or(rev_cfg.report_mode)
                 .unwrap_or_else(|| "local".to_string());
             let report_mode = ReportMode::from_str(&report_mode_str).unwrap_or_default();
+            let output = output.or(rev_cfg.output);
+            let skill = with_skill.or(rev_cfg.with_skill);
+            let db_path = db_path
+                .or(rev_cfg.db_path)
+                .unwrap_or_else(|| PathBuf::from("fiach.redb"));
 
             tracing::info!(
                 repo = %repo,
                 pr = pr,
                 provider = %provider,
                 model = %model,
-                output = ?output.clone().or_else(|| rev_cfg.output.clone()),
-                with_skill = ?with_skill.clone().or_else(|| rev_cfg.with_skill.clone()),
-                persona = ?persona,
+                output = ?output,
+                with_skill = ?skill,
+                personas = ?personas,
                 "Starting single PR review"
             );
 
-            let params = review::ReviewParams {
-                repo,
-                pr_number: pr,
-                model,
-                provider,
-                verifier_model,
-                verifier_provider,
-                output: output.or(rev_cfg.output),
-                skill: with_skill.or(rev_cfg.with_skill),
-                persona,
-                max_turns: max_turns.or(rev_cfg.max_turns).unwrap_or(60),
-                timeout_mins: timeout_mins.or(rev_cfg.timeout_mins).unwrap_or(30),
-                db_path: db_path
-                    .or(rev_cfg.db_path)
-                    .unwrap_or_else(|| PathBuf::from("fiach.redb")),
-                force: force || rev_cfg.force.unwrap_or(false),
-                max_retries: max_retries.or(rev_cfg.max_retries).unwrap_or(3),
-                retry_delay_secs: retry_delay_secs.or(rev_cfg.retry_delay_secs).unwrap_or(10),
-                disclose_config: disclose::DiscloseConfig {
-                    mode: report_mode,
-                    sync_repo: sync_repo.or(rev_cfg.sync_repo),
-                    notify_on_empty: notify_on_empty.or(rev_cfg.notify_on_empty).unwrap_or(false),
-                    reactions: disclose::ReactionConfig::with_defaults(
-                        review_start_reaction.or(rev_cfg.review_start_reaction),
-                        no_findings_reaction.or(rev_cfg.no_findings_reaction),
-                    ),
-                },
-                verify_findings: verify_findings.or(rev_cfg.verify_findings).unwrap_or(true),
-                context_groups: config.context_groups,
-                max_cost_usd: max_cost.or(rev_cfg.max_cost_usd),
-                input_price_per_m: input_price.or(rev_cfg.input_price_per_m),
-                output_price_per_m: output_price.or(rev_cfg.output_price_per_m),
-                is_rereview: false, // In direct CLI review, we usually don't track is_rereview exactly like daemon
-                execution: review::ReviewExecution {
-                    skip_state_check: sandbox_child,
-                    persist_side_effects: !sandbox_child,
-                    result_json,
-                },
-            };
+            for persona in personas {
+                let params = review::ReviewParams {
+                    repo: repo.clone(),
+                    pr_number: pr,
+                    model: model.clone(),
+                    provider: provider.clone(),
+                    verifier_model: verifier_model.clone(),
+                    verifier_provider: verifier_provider.clone(),
+                    output: output_for_persona(output.clone(), &persona, use_persona_kind),
+                    skill: skill.clone(),
+                    persona: persona.clone(),
+                    max_turns: max_turns.or(rev_cfg.max_turns).unwrap_or(60),
+                    timeout_mins: timeout_mins.or(rev_cfg.timeout_mins).unwrap_or(30),
+                    db_path: db_path.clone(),
+                    review_kind: review_kind
+                        .clone()
+                        .unwrap_or_else(|| review_kind_for(&persona, use_persona_kind)),
+                    force: force || rev_cfg.force.unwrap_or(false),
+                    max_retries: max_retries.or(rev_cfg.max_retries).unwrap_or(3),
+                    retry_delay_secs: retry_delay_secs.or(rev_cfg.retry_delay_secs).unwrap_or(10),
+                    disclose_config: disclose::DiscloseConfig {
+                        mode: report_mode.clone(),
+                        sync_repo: sync_repo.clone().or(rev_cfg.sync_repo.clone()),
+                        notify_on_empty: notify_on_empty
+                            .or(rev_cfg.notify_on_empty)
+                            .unwrap_or(false),
+                        reactions: disclose::ReactionConfig::with_defaults(
+                            review_start_reaction
+                                .clone()
+                                .or(rev_cfg.review_start_reaction.clone()),
+                            no_findings_reaction
+                                .clone()
+                                .or(rev_cfg.no_findings_reaction.clone()),
+                        ),
+                    },
+                    verify_findings: verify_findings.or(rev_cfg.verify_findings).unwrap_or(true),
+                    context_groups: config.context_groups.clone(),
+                    max_cost_usd: max_cost.or(rev_cfg.max_cost_usd),
+                    input_price_per_m: input_price.or(rev_cfg.input_price_per_m),
+                    output_price_per_m: output_price.or(rev_cfg.output_price_per_m),
+                    is_rereview: false,
+                    execution: review::ReviewExecution {
+                        skip_state_check: sandbox_child,
+                        persist_side_effects: !sandbox_child,
+                        result_json: output_for_persona(
+                            result_json.clone(),
+                            &persona,
+                            use_persona_kind,
+                        ),
+                    },
+                };
 
-            let _ = review::run_review(params, cancel_token).await?;
+                let _ = review::run_review(params, cancel_token.clone()).await?;
+            }
             Ok(())
         }
         Commands::Daemon {
@@ -459,6 +537,7 @@ async fn main() -> Result<()> {
             input_price,
             output_price,
             updated_within_days,
+            filter_by_updated,
             pr_limit,
             sandbox_rootfs,
             sandbox_network,
@@ -484,10 +563,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| "openrouter".to_string());
             let verifier_model = verifier_model.or(daemon_cfg.verifier_model);
             let verifier_provider = verifier_provider.or(daemon_cfg.verifier_provider);
-            let persona_str = persona
-                .or(daemon_cfg.persona)
-                .unwrap_or_else(|| "builtin:security".to_string());
-            let persona = persona::PersonaSource::from_str(&persona_str).unwrap();
+            let personas = resolve_personas(persona, daemon_cfg.persona, daemon_cfg.personas);
             let report_mode_str = report_mode
                 .or(daemon_cfg.report_mode)
                 .unwrap_or_else(|| "local".to_string());
@@ -532,7 +608,7 @@ async fn main() -> Result<()> {
                 interval_secs = interval_secs,
                 provider = %provider,
                 model = %model,
-                persona = ?persona,
+                personas = ?personas,
                 pr_states = ?pr_states,
                 skip_prs = ?skip_prs_list,
                 allowed_author_associations = ?allowed_author_associations,
@@ -548,7 +624,7 @@ async fn main() -> Result<()> {
                 verifier_provider,
                 verifier_model,
                 skill: with_skill.or(daemon_cfg.with_skill),
-                persona,
+                personas,
                 max_turns: max_turns.or(daemon_cfg.max_turns).unwrap_or(60),
                 timeout_mins: timeout_mins.or(daemon_cfg.timeout_mins).unwrap_or(30),
                 db_path: db_path
@@ -588,6 +664,9 @@ async fn main() -> Result<()> {
                 updated_within_days: updated_within_days
                     .or(daemon_cfg.updated_within_days)
                     .unwrap_or(120),
+                filter_by_updated: filter_by_updated
+                    .or(daemon_cfg.filter_by_updated)
+                    .unwrap_or(true),
                 pr_limit: pr_limit.or(daemon_cfg.pr_limit).unwrap_or(1000),
                 sandbox_rootfs: sandbox_rootfs.or(daemon_cfg.sandbox_rootfs),
                 sandbox_network: sandbox_network.or(daemon_cfg.sandbox_network),

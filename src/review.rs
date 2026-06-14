@@ -100,6 +100,8 @@ pub struct ReviewParams {
     pub timeout_mins: u64,
     /// Path to the redb database
     pub db_path: PathBuf,
+    /// Persona-specific review identity used for report paths and state keys.
+    pub review_kind: String,
     /// Force a review even if it was already done
     pub force: bool,
     /// Maximum number of retries for LLM provider failures
@@ -184,6 +186,7 @@ pub async fn run_review(
             &params.repo,
             params.pr_number,
             &workspace.commit_hash,
+            &params.review_kind,
             params.force,
             params.timeout_mins,
         )?;
@@ -214,8 +217,13 @@ pub async fn run_review(
             let reports_dir = std::env::current_dir()
                 .context("Failed to get current working directory")?
                 .join("reports");
+            let file_name = if params.review_kind == state::DEFAULT_REVIEW_KIND {
+                format!("PR{}_{}.md", params.pr_number, hash)
+            } else {
+                format!("PR{}_{}_{}.md", params.pr_number, hash, params.review_kind)
+            };
             reports_dir
-                .join(format!("PR{}_{}.md", params.pr_number, hash))
+                .join(file_name)
                 .to_str()
                 .context("Output path must be valid UTF-8")?
                 .to_string()
@@ -464,9 +472,12 @@ pub async fn run_review(
 
             // Iterate backwards to find the most recent reviewed commit
             for commit in commits.iter().rev() {
-                if let Ok(Some(metadata)) =
-                    state::get_commit_review(&params.db_path, &params.repo, commit)
-                {
+                if let Ok(Some(metadata)) = state::get_commit_review(
+                    &params.db_path,
+                    &params.repo,
+                    commit,
+                    &params.review_kind,
+                ) {
                     tracing::info!(
                         commit = commit,
                         "Found previously reviewed commit in PR history"
@@ -1044,6 +1055,7 @@ pub async fn run_review(
 
         let mut completed = CompletedReview {
             metadata: state::ReviewMetadata {
+                review_kind: params.review_kind.clone(),
                 commit_hash: workspace.commit_hash.clone(),
                 model: params.model.clone(),
                 timestamp: std::time::SystemTime::now()
@@ -1066,11 +1078,16 @@ pub async fn run_review(
                         .format(&time::format_description::well_known::Rfc3339)
                         .unwrap_or_default(),
                 ),
-                retry_count: state::get_pr_review(&params.db_path, &params.repo, params.pr_number)
-                    .ok()
-                    .flatten()
-                    .map(|m| m.retry_count)
-                    .unwrap_or(0),
+                retry_count: state::get_pr_review(
+                    &params.db_path,
+                    &params.repo,
+                    params.pr_number,
+                    &params.review_kind,
+                )
+                .ok()
+                .flatten()
+                .map(|m| m.retry_count)
+                .unwrap_or(0),
             },
             should_notify,
             report_path: report_file.to_path_buf(),

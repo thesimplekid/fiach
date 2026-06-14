@@ -149,6 +149,16 @@ Fiach is entirely prompt-driven. You can configure the daemon to use different p
 
 If omitted, it defaults to `--persona builtin:security`. You can also pass `--persona builtin:pr-review`, `--persona builtin:code-quality`, or an absolute path to a custom Markdown file.
 
+To run multiple independent passes for each PR, configure `personas`:
+
+```toml
+[daemon]
+personas = ["builtin:pr-review", "builtin:security"]
+max_workers = 2
+```
+
+Each persona gets its own state key and report path, so a successful PR review pass does not suppress the security pass for the same PR/commit. `max_workers` applies to the expanded review-job queue: two personas across ten PRs creates twenty review jobs.
+
 A custom persona file can contain these placeholders which are filled at runtime:
 - `{repo}` — The target repository.
 - `{pr_number}` — The PR being reviewed.
@@ -217,6 +227,7 @@ In your `flake.nix` or `configuration.nix`:
             
             # Polling settings
             interval = 300;
+            filterByUpdated = true;
             updatedWithinDays = 120;
             prStates = [ "open" "merged" ];
             prLimit = 1000;
@@ -273,17 +284,19 @@ The following options are available under `services.fiach`:
 | `enable` | boolean | `false` | Enable the Fiach Daemon. |
 | `repos` | list of string | *none* | List of repositories to monitor (e.g., `["org/repo"]`). |
 | `interval` | integer | `300` | Polling interval in seconds. |
-| `updatedWithinDays` | integer | `120` | Number of days to look back for updated PRs. |
+| `updatedWithinDays` | integer | `120` | Number of days to look back for updated PRs when `filterByUpdated` is enabled. |
+| `filterByUpdated` | boolean | `true` | Whether to include the `updated:>=` GitHub search filter when discovering PRs. Set to `false` to query only by PR state and draft setting. |
 | `prStates` | list of string | `["open"]` | List of PR states to poll (e.g., `["open"]`, `["open", "merged"]`). |
 | `prLimit` | integer | `1000` | Maximum number of PRs to fetch from GitHub per polling cycle. |
 | `allowedAuthorAssociations` | list of string | `["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]` | GitHub PR author associations allowed to trigger daemon reviews. |
-| `maxWorkers` | integer | `1` | Maximum number of PR reviews to run concurrently per polling query. `0` means unlimited. |
+| `maxWorkers` | integer | `1` | Maximum number of review jobs to run concurrently per polling query. `0` means unlimited. With multiple personas, each PR/persona pair is a review job. |
 | `provider` | string | `"openrouter"` | Goose provider to use, such as `"openrouter"`, `"anthropic"`, `"openai"`, or `"google"`. |
 | `model` | string | `"google/gemini-3.1-pro-preview"` | Model to use with the selected provider. |
 | `verifierProvider` | string or null | `null` | Provider to use for the verifier pass. Defaults to `provider` when unset. |
 | `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
 | `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and the selected provider API key. |
-| `persona` | string | `"builtin:security"` | Persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
+| `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
+| `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |
 | `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`) | `"local"` | Mode for reporting findings. |
 | `syncRepo` | string or null | `null` | GitHub repository to sync reports to. Required if `reportMode` is `"sync-pr"`. |
 | `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no findings were found. |

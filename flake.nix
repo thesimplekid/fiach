@@ -181,7 +181,13 @@
             updatedWithinDays = lib.mkOption {
               type = lib.types.int;
               default = 120;
-              description = "Number of days to look back for updated PRs";
+              description = "Number of days to look back for updated PRs when services.fiach.filterByUpdated is enabled.";
+            };
+
+            filterByUpdated = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Whether to include the updated:>= GitHub search filter when discovering PRs.";
             };
 
             prStates = lib.mkOption {
@@ -240,7 +246,13 @@
             persona = lib.mkOption {
               type = lib.types.str;
               default = "builtin:security";
-              description = "Persona source to use (e.g., 'builtin:security', 'builtin:pr-review', 'builtin:code-quality', or an absolute path)";
+              description = "Single persona source to use when services.fiach.personas is unset";
+            };
+
+            personas = lib.mkOption {
+              type = lib.types.nullOr (lib.types.listOf lib.types.str);
+              default = null;
+              description = "Persona sources to run independently for each PR. When set, this takes precedence over services.fiach.persona.";
             };
 
             reportMode = lib.mkOption {
@@ -437,24 +449,30 @@
                   };
 
                   tomlFormat = pkgs.formats.toml { };
+                  personaConfig =
+                    if cfg.personas != null then {
+                      personas = cfg.personas;
+                    } else {
+                      persona = cfg.persona;
+                    };
                   configFile = tomlFormat.generate "fiach.toml" {
                     daemon = {
                       repos = cfg.repos;
                       interval = cfg.interval;
                       updated_within_days = cfg.updatedWithinDays;
+                      filter_by_updated = cfg.filterByUpdated;
                       pr_state = cfg.prStates;
                       pr_limit = cfg.prLimit;
                       allowed_author_associations = cfg.allowedAuthorAssociations;
                       max_workers = cfg.maxWorkers;
                       provider = cfg.provider;
                       model = cfg.model;
-                      persona = cfg.persona;
                       db_path = "${cfg.dataDir}/fiach.redb";
                       out_dir = "${cfg.dataDir}/reports";
                       report_mode = cfg.reportMode;
                       verify_findings = cfg.verifyFindings;
                       max_turns = cfg.maxTurns;
-                    } // lib.optionalAttrs (cfg.verifierProvider != null) {
+                    } // personaConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
                       verifier_provider = cfg.verifierProvider;
                     } // lib.optionalAttrs (cfg.verifierModel != null) {
                       verifier_model = cfg.verifierModel;

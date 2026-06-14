@@ -89,6 +89,40 @@ impl PersonaSource {
             PersonaSource::BuiltinPrReview | PersonaSource::Custom(_) => "pr-review",
         }
     }
+
+    pub fn review_kind(&self) -> String {
+        match self {
+            PersonaSource::BuiltinSecurity => "security".to_string(),
+            PersonaSource::BuiltinCodeQuality => "code-quality".to_string(),
+            PersonaSource::BuiltinPrReview => "pr-review".to_string(),
+            PersonaSource::Custom(path) => {
+                let raw = path.to_string_lossy();
+                let slug = slugify(&raw);
+                if slug.is_empty() {
+                    "custom".to_string()
+                } else {
+                    format!("custom-{slug}")
+                }
+            }
+        }
+    }
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_separator = false;
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            slug.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    slug.trim_matches('-').to_string()
 }
 
 #[cfg(test)]
@@ -99,6 +133,7 @@ mod tests {
     fn parses_pr_review_builtin_and_alias() {
         let persona = PersonaSource::from_str("builtin:pr-review").unwrap();
         assert_eq!(persona.to_string(), "builtin:pr-review");
+        assert_eq!(persona.review_kind(), "pr-review");
         assert_eq!(
             persona.review_target(),
             "actionable PR issues introduced by this PR"
@@ -106,5 +141,11 @@ mod tests {
 
         let alias = PersonaSource::from_str("builtin:general-review").unwrap();
         assert_eq!(alias.to_string(), "builtin:pr-review");
+    }
+
+    #[test]
+    fn custom_persona_review_kind_is_path_based_slug() {
+        let persona = PersonaSource::from_str("/tmp/My Persona.md").unwrap();
+        assert_eq!(persona.review_kind(), "custom-tmp-my-persona-md");
     }
 }

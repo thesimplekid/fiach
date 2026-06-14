@@ -26,6 +26,7 @@ pub struct ReviewQuery {
     pub owner: String,
     pub repo: String,
     pub pr: u64,
+    pub persona: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -33,6 +34,15 @@ pub struct TriggerReviewRequest {
     pub owner: String,
     pub repo: String,
     pub pr: u64,
+    pub persona: Option<String>,
+}
+
+fn review_kind_from_query(persona: Option<&str>) -> String {
+    persona
+        .map(str::trim)
+        .filter(|persona| !persona.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| crate::state::DEFAULT_REVIEW_KIND.to_string())
 }
 
 pub async fn start_server(port: u16, state: AppState) -> Result<()> {
@@ -75,7 +85,8 @@ async fn get_review(
     Query(query): Query<ReviewQuery>,
 ) -> impl IntoResponse {
     let repo_full = format!("{}/{}", query.owner, query.repo);
-    match get_pr_review(&state.db_path, &repo_full, query.pr) {
+    let review_kind = review_kind_from_query(query.persona.as_deref());
+    match get_pr_review(&state.db_path, &repo_full, query.pr, &review_kind) {
         Ok(Some(metadata)) => (StatusCode::OK, Json(metadata)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Review not found").into_response(),
         Err(e) => {
@@ -94,7 +105,8 @@ async fn get_review_content(
     Query(query): Query<ReviewQuery>,
 ) -> impl IntoResponse {
     let repo_full = format!("{}/{}", query.owner, query.repo);
-    let metadata = match get_pr_review(&state.db_path, &repo_full, query.pr) {
+    let review_kind = review_kind_from_query(query.persona.as_deref());
+    let metadata = match get_pr_review(&state.db_path, &repo_full, query.pr, &review_kind) {
         Ok(Some(m)) => m,
         Ok(None) => return (StatusCode::NOT_FOUND, "Review not found").into_response(),
         Err(e) => {
@@ -114,7 +126,14 @@ async fn get_review_content(
         &metadata.commit_hash
     };
 
-    let file_name = format!("{}_PR{}_{}_report.md", safe_repo, query.pr, hash_short);
+    let file_name = if metadata.review_kind == crate::state::DEFAULT_REVIEW_KIND {
+        format!("{}_PR{}_{}_report.md", safe_repo, query.pr, hash_short)
+    } else {
+        format!(
+            "{}_PR{}_{}_{}_report.md",
+            safe_repo, query.pr, hash_short, metadata.review_kind
+        )
+    };
     let file_path = state.out_dir.join(file_name);
 
     match tokio::fs::read_to_string(&file_path).await {
@@ -139,6 +158,7 @@ async fn trigger_review(
     let msg = crate::daemon::DaemonMessage::TriggerReview {
         repo: repo_full.clone(),
         pr_number: payload.pr,
+        persona: payload.persona.clone(),
     };
 
     match state.daemon_tx.send(msg).await {
