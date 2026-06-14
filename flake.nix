@@ -240,7 +240,7 @@
             persona = lib.mkOption {
               type = lib.types.str;
               default = "builtin:security";
-              description = "Persona source to use (e.g., 'builtin:security' or an absolute path)";
+              description = "Persona source to use (e.g., 'builtin:security', 'builtin:pr-review', 'builtin:code-quality', or an absolute path)";
             };
 
             reportMode = lib.mkOption {
@@ -264,7 +264,7 @@
             notifyOnEmpty = lib.mkOption {
               type = lib.types.bool;
               default = false;
-              description = "Whether to create PRs or comments even if no vulnerabilities were found.";
+              description = "Whether to create PRs or comments even if no findings were found.";
             };
 
             verifyFindings = lib.mkOption {

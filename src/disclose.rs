@@ -58,7 +58,7 @@ pub async fn handle_disclosure(
     repo: &str,
     pr_number: u64,
     commit_hash: &str,
-    vulnerabilities_found: bool,
+    findings_found: bool,
     config: &DiscloseConfig,
 ) -> Result<Option<String>> {
     match config.mode {
@@ -67,9 +67,9 @@ pub async fn handle_disclosure(
             Ok(Some(report_path.to_string_lossy().to_string()))
         }
         ReportMode::PrComment => {
-            if !vulnerabilities_found && !config.notify_on_empty {
+            if !findings_found && !config.notify_on_empty {
                 tracing::info!(
-                    "No vulnerabilities found and notify_on_empty is false. Skipping PR comment."
+                    "No findings found and notify_on_empty is false. Skipping PR comment."
                 );
                 return Ok(None);
             }
@@ -78,10 +78,8 @@ pub async fn handle_disclosure(
                 .map(Some)
         }
         ReportMode::SyncPr => {
-            if !vulnerabilities_found && !config.notify_on_empty {
-                tracing::info!(
-                    "No vulnerabilities found and notify_on_empty is false. Skipping Sync PR."
-                );
+            if !findings_found && !config.notify_on_empty {
+                tracing::info!("No findings found and notify_on_empty is false. Skipping Sync PR.");
                 return Ok(None);
             }
 
@@ -106,7 +104,7 @@ pub async fn handle_structured_disclosure(
     config: &DiscloseConfig,
 ) -> Result<Option<String>> {
     let accepted = artifact.accepted_findings(policy);
-    let vulnerabilities_found = !accepted.is_empty() && !artifact.verifier_failed;
+    let findings_found = !accepted.is_empty() && !artifact.verifier_failed;
 
     match config.mode {
         ReportMode::Local => {
@@ -114,7 +112,7 @@ pub async fn handle_structured_disclosure(
             Ok(Some(report_path.to_string_lossy().to_string()))
         }
         ReportMode::PrComment => {
-            if !vulnerabilities_found && !config.notify_on_empty {
+            if !findings_found && !config.notify_on_empty {
                 tracing::info!("No verified findings approved for disclosure; skipping PR review");
                 return Ok(None);
             }
@@ -137,7 +135,7 @@ pub async fn handle_structured_disclosure(
                 .map(Some)
         }
         ReportMode::SyncPr => {
-            if !vulnerabilities_found && !config.notify_on_empty {
+            if !findings_found && !config.notify_on_empty {
                 tracing::info!("No verified findings approved for disclosure; skipping Sync PR");
                 return Ok(None);
             }
@@ -433,7 +431,7 @@ async fn create_sync_pr(
 
     // gh pr create
     let pr_body = format!(
-        "Automated vulnerability report for {}#{} at commit {}",
+        "Automated review report for {}#{} at commit {}",
         repo, pr_number, commit_hash
     );
     let display_title = format!("{}#{} ({}): {}", repo, pr_number, short_hash, title);

@@ -129,7 +129,7 @@ type SharedReportingArtifact = Arc<Mutex<ReportingArtifact>>;
 /// 1. Prepares a workspace (clone repo, checkout PR) — no agent turns wasted on setup
 /// 2. Creates an OpenRouter LLM provider
 /// 3. Initializes a goose Agent with a hidden session rooted in the workspace
-/// 4. Appends the CTF security persona to the system prompt (extras mode)
+/// 4. Appends the selected persona to the system prompt (extras mode)
 /// 5. Loads the `developer` Platform extension (in-process, no subprocess)
 /// 6. Sends the review request and streams the agent's response to stdout
 pub async fn run_review(
@@ -251,7 +251,7 @@ pub async fn run_review(
         .session_manager
         .create_session(
             workspace.path.clone(),
-            "security-review".to_string(),
+            params.persona.session_name().to_string(),
             SessionType::Hidden,
             GooseMode::Auto,
         )
@@ -375,10 +375,10 @@ pub async fn run_review(
         Some(name) => format!(
             "You have been instructed to use the `{name}` domain skill for this review. \
              Make sure to load it, apply its domain knowledge, and list it in the \
-             `skills_used` frontmatter field of your report."
+             `skills_used` field when calling `submit_finding` or `submit_no_findings`."
         ),
-        None => "No domain skill was specified for this review. Record `skills_used: [\"none\"]` \
-                 in your report frontmatter unless you independently loaded a skill."
+        None => "No domain skill was specified for this review. Use `skills_used: [\"none\"]` \
+                 when calling `submit_finding` or `submit_no_findings` unless you independently loaded a skill."
             .to_string(),
     };
 
@@ -477,34 +477,43 @@ pub async fn run_review(
     }
 
     // 7. Construct the user message — agent is already in the checked-out PR workspace
-    let user_message_text = match &params.skill {
+    let review_target = params.persona.review_target();
+    let candidate_kind = params.persona.candidate_kind();
+    let methodology_hint = params.persona.methodology_hint();
+    let user_message_text = match &actual_skill {
         Some(skill_name) => format!(
-            "Review PR #{pr_number} in {repo} for security vulnerabilities introduced by this PR. \
+            "Review PR #{pr_number} in {repo} for {review_target}. \
              The current working directory is a clone of the repository with the PR branch already checked out. \
              Focus ONLY on the changes in this PR. Do NOT run tests, builds, compilers, interpreters, scratch programs, or ad hoc reproduction code. \
              Start by reading `.pr_diff.txt`, which contains the complete patch for this review scope. \
              Verify that any finding's root cause is in `.pr_diff.txt`. For large per-file inspection, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
-             follow the CTF methodology in your instructions, \
-             and submit each candidate finding with `submit_finding`. If you find no candidate vulnerability, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}\n\n\
+             {methodology_hint}, \
+             and submit each candidate finding with `submit_finding`. If you find no {candidate_kind}, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}\n\n\
              IMPORTANT: Use the `{skill_name}` skill to complete this review. Use the load tool to load it if you haven't already.",
             pr_number = params.pr_number,
             repo = params.repo,
+            review_target = review_target,
             diff_base = diff_base,
+            methodology_hint = methodology_hint,
+            candidate_kind = candidate_kind,
             report_path = report_path,
             prev_review_context = prev_review_context,
             skill_name = skill_name,
         ),
         None => format!(
-            "Review PR #{pr_number} in {repo} for security vulnerabilities introduced by this PR. \
+            "Review PR #{pr_number} in {repo} for {review_target}. \
              The current working directory is a clone of the repository with the PR branch already checked out. \
              Focus ONLY on the changes in this PR. Do NOT run tests, builds, compilers, interpreters, scratch programs, or ad hoc reproduction code. \
              Start by reading `.pr_diff.txt`, which contains the complete patch for this review scope. \
              Verify that any finding's root cause is in `.pr_diff.txt`. For large per-file inspection, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
-             follow the CTF methodology in your instructions, \
-             and submit each candidate finding with `submit_finding`. If you find no candidate vulnerability, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}",
+             {methodology_hint}, \
+             and submit each candidate finding with `submit_finding`. If you find no {candidate_kind}, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}",
             pr_number = params.pr_number,
             repo = params.repo,
+            review_target = review_target,
             diff_base = diff_base,
+            methodology_hint = methodology_hint,
+            candidate_kind = candidate_kind,
             report_path = report_path,
             prev_review_context = prev_review_context,
         ),
@@ -719,7 +728,7 @@ pub async fn run_review(
 
                             let follow_up_text = match last_assistant_text.as_deref() {
                                 Some(text) if !text.trim().is_empty() => format!(
-                                    "The connection was interrupted due to an error: {e}. Continue from where you left off. If you are done reviewing, use the `write` tool now to create the report file at {report_path}. Your last visible message was:
+                                    "The connection was interrupted due to an error: {e}. Continue from where you left off. If you are done reviewing, call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using a reporting tool. The host will write the final report to {report_path}. Your last visible message was:
 
 {text}"
                                 ),
@@ -1344,7 +1353,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         .session_manager
         .create_session(
             params.workspace_path.to_path_buf(),
-            "security-verifier".to_string(),
+            "review-verifier".to_string(),
             SessionType::Hidden,
             GooseMode::Auto,
         )
@@ -1377,7 +1386,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
          PR context:\n{pr_context}\n\n\
          The current diff base for shell checks is `{diff_base}`. The complete patch is in `.pr_diff.txt`.\n\
          You may run bounded reproduction commands through the developer shell when needed. For every finding that you mark as discloseable, include command transcript evidence comparing the PR branch against base and/or default branch context.\n\
-         Mark `confirmed` true only for a real, reproducible issue. Mark `introduced_by_pr` true only when the PR diff introduced the root cause. Use `disclosure_decision: \"disclose\"` only when the finding is confirmed, PR-introduced, and supported by command transcript evidence.\n\
+         Mark `confirmed` true only for a real issue, not a subjective nit. Mark `introduced_by_pr` true only when the PR diff introduced the root cause. Use `disclosure_decision: \"disclose\"` only when the finding is confirmed, PR-introduced, actionable for PR review, and supported by command transcript evidence.\n\
          Do not post comments, create PRs, or modify files. Only submit structured verdicts.",
         pr_number = params.pr_number,
         repo = params.repo,

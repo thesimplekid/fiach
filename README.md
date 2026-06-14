@@ -8,7 +8,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 
 ## 🚀 Features
 
-- **Custom Personas:** Define exactly what the agent should look for using a Markdown file. Use different personas for Security CTF-style audits, Code Quality checks, or Architecture reviews.
+- **Custom Personas:** Define exactly what the agent should look for using a Markdown file. Use different personas for security audits, general PR code review, code quality checks, or architecture reviews.
 - **Reporting Modes:**
   - `local` (Default): Saves the generated report to disk.
   - `pr-comment`: Posts the report directly as a comment on the target PR.
@@ -64,7 +64,7 @@ cp .env.example .env
 
 This is the primary use case. Run `fiach` as a background daemon that monitors multiple repositories. Out of the box, the daemon searches for **any open PR updated in the last 4 months**. 
 
-When it finds an actionable vulnerability, it will push a disclosure PR to a centralized repository (`my-org/security-audits`).
+When it finds an actionable, verifier-approved finding, it will push a report PR to a centralized repository (`my-org/security-audits`).
 
 ```bash
 cargo run -- daemon \
@@ -90,7 +90,19 @@ cargo run -- review \
   --report-mode pr-comment
 ```
 
-### 3. Local Only (Testing a New Persona)
+### 3. General PR Code Review
+
+For a non-security review focused on correctness, regressions, API compatibility, and maintainability:
+
+```bash
+cargo run -- review \
+  --repo "org/repo" \
+  --pr 1835 \
+  --persona "builtin:pr-review" \
+  --report-mode pr-comment
+```
+
+### 4. Local Only (Testing a New Persona)
 
 Testing a new code-quality persona and just want to see the markdown output saved to your current directory:
 
@@ -102,7 +114,7 @@ cargo run -- review \
   --report-mode local
 ```
 
-### 4. Interacting with the Daemon Web Server
+### 5. Interacting with the Daemon Web Server
 
 When running the daemon, an interactive web server starts automatically on port `3000` (configurable via `--port`). This allows you to inspect the daemon's history and trigger reviews on demand.
 
@@ -133,9 +145,9 @@ When running the daemon, an interactive web server starts automatically on port 
 
 ## 📝 Crafting a Persona
 
-Fiach is entirely prompt-driven. You can configure the daemon to use different personas via the `--persona` flag. 
+Fiach is entirely prompt-driven. You can configure the daemon to use different personas via the `--persona` flag.
 
-If omitted, it defaults to `--persona builtin:security`. You can also pass `--persona builtin:code-quality` or an absolute path to a custom Markdown file.
+If omitted, it defaults to `--persona builtin:security`. You can also pass `--persona builtin:pr-review`, `--persona builtin:code-quality`, or an absolute path to a custom Markdown file.
 
 A custom persona file can contain these placeholders which are filled at runtime:
 - `{repo}` — The target repository.
@@ -146,7 +158,7 @@ A custom persona file can contain these placeholders which are filled at runtime
 
 ### Structured Reporting and Verification
 
-Fiach uses structured reporting as the default review path. The finder agent does not directly post to GitHub and does not decide disclosure from Markdown frontmatter. Instead, it submits candidates through in-process reporting tools:
+Fiach uses structured reporting as the default review path for all personas. The finder agent does not directly post to GitHub and does not decide disclosure from Markdown frontmatter. Instead, it submits candidates through in-process reporting tools:
 
 - `submit_finding` records one candidate finding.
 - `submit_no_findings` records that the finder found no candidates.
@@ -175,7 +187,7 @@ For `report_mode = "pr-comment"`, Fiach posts a GitHub PR review only when all h
 - command transcript evidence is present,
 - the comment anchor is valid in the PR diff.
 
-Invalid inline anchors are downgraded into the review summary. Merged or closed PRs never receive PR comments. `report_mode = "sync-pr"` can still publish the local rendered report to the configured sync repository.
+This is the same flow for `builtin:security`, `builtin:pr-review`, and `builtin:code-quality`: persona changes what the finder looks for, while the host-side reporting and disclosure policy stays deterministic. Invalid inline anchors are downgraded into the review summary. Merged or closed PRs never receive PR comments. `report_mode = "sync-pr"` can still publish the local rendered report to the configured sync repository.
 
 *See `personas/security-persona.md` for a complete example of an aggressive, CTF-style vulnerability hunting prompt.*
 
@@ -213,6 +225,7 @@ In your `flake.nix` or `configuration.nix`:
             provider = "openrouter";
             
             # The persona to use (defaults to builtin:security if omitted)
+            # Use builtin:pr-review for general non-security PR review.
             persona = "builtin:security";
             
             # Model to use
@@ -270,10 +283,10 @@ The following options are available under `services.fiach`:
 | `verifierProvider` | string or null | `null` | Provider to use for the verifier pass. Defaults to `provider` when unset. |
 | `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
 | `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and the selected provider API key. |
-| `persona` | string | `"builtin:security"` | Persona source to use (e.g., `"builtin:security"` or an absolute path). |
+| `persona` | string | `"builtin:security"` | Persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`) | `"local"` | Mode for reporting findings. |
 | `syncRepo` | string or null | `null` | GitHub repository to sync reports to. Required if `reportMode` is `"sync-pr"`. |
-| `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no vulnerabilities were found. |
+| `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no findings were found. |
 | `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
 | `dataDir` | string | `"/var/lib/fiach"` | Directory to store state database and reports. |
 | `contextGroups` | attrset | `{}` | Context groups mapped by target repo (contains `repos` list). |

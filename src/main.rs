@@ -33,7 +33,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run a security review for a single PR
+    /// Run a review for a single PR
     Review {
         /// GitHub repository to review (e.g., "org/repo")
         #[arg(long)]
@@ -59,7 +59,7 @@ enum Commands {
         #[arg(long)]
         verifier_provider: Option<String>,
 
-        /// Path to write the security report. If not provided, defaults to
+        /// Path to write the review report. If not provided, defaults to
         /// "./reports/PR{pr_number}_{commit_hash}.md" in the current working directory.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -68,7 +68,7 @@ enum Commands {
         #[arg(long)]
         with_skill: Option<String>,
 
-        /// Path to the persona prompt file (e.g. ./custom.md) or a builtin (builtin:security, builtin:code-quality).
+        /// Path to the persona prompt file (e.g. ./custom.md) or a builtin (builtin:security, builtin:pr-review, builtin:code-quality).
         #[arg(long)]
         persona: Option<String>,
 
@@ -104,7 +104,7 @@ enum Commands {
         #[arg(long)]
         sync_repo: Option<String>,
 
-        /// Notify even if no vulnerabilities are found
+        /// Notify even if no findings are found
         #[arg(long)]
         notify_on_empty: Option<bool>,
 
@@ -162,7 +162,7 @@ enum Commands {
         #[arg(long)]
         with_skill: Option<String>,
 
-        /// Path to the persona prompt file (e.g. ./custom.md) or a builtin (builtin:security, builtin:code-quality).
+        /// Path to the persona prompt file (e.g. ./custom.md) or a builtin (builtin:security, builtin:pr-review, builtin:code-quality).
         #[arg(long)]
         persona: Option<String>,
 
@@ -198,7 +198,7 @@ enum Commands {
         #[arg(long)]
         sync_repo: Option<String>,
 
-        /// Notify even if no vulnerabilities are found
+        /// Notify even if no findings are found
         #[arg(long)]
         notify_on_empty: Option<bool>,
 
