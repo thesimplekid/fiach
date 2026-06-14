@@ -215,6 +215,7 @@ In your `flake.nix` or `configuration.nix`:
               
               # Network Mode:
               # - "host" (default): Most reliable service-mode option today. Shares the host network stack.
+              # - "bridge": Attach each sandbox to an existing br-nspawn bridge.
               # - "veth": Better namespace isolation. Allows outbound internet but blocks access to
               #   host-local services. This is namespace isolation, not egress filtering, and it does
               #   NOT restrict the sandbox to GitHub/OpenRouter only.
@@ -254,14 +255,41 @@ The following options are available under `services.fiach`:
 | `dataDir` | string | `"/var/lib/fiach"` | Directory to store state database and reports. |
 | `contextGroups` | attrset | `{}` | Context groups mapped by target repo (contains `repos` list). |
 | `sandbox.enable` | boolean | `false` | Enable Sandboxed PR reviews via systemd-nspawn. |
-| `sandbox.networkMode`| enum (`"host"`, `"private"`, `"veth"`) | `"host"` | Network mode for the sandbox. |
+| `sandbox.networkMode`| enum (`"host"`, `"bridge"`, `"private"`, `"veth"`) | `"host"` | Network mode for the sandbox. |
 | `sandbox.extraArgs` | list of string | `[]` | Extra arguments to pass to `systemd-nspawn`. |
+
+### NixOS Sandbox Network Examples
+
+Default host networking:
+
+```nix
+services.fiach = {
+  sandbox = {
+    enable = true;
+    networkMode = "host";
+  };
+};
+```
+
+Bridge networking for hosts that already provide a `br-nspawn` bridge:
+
+```nix
+services.fiach = {
+  sandbox = {
+    enable = true;
+    networkMode = "bridge";
+  };
+};
+```
+
+When using `bridge`, the host must create and maintain `br-nspawn`, addressing, DHCP or static addressing, forwarding, and NAT. Fiach passes `--network-bridge=br-nspawn` to `systemd-nspawn`; it does not create the bridge from the NixOS module.
 
 ### Sandbox Networking Limits
 
 `systemd-nspawn` can isolate the sandbox from the host network namespace, but it does not provide destination allowlisting such as "only GitHub and OpenRouter".
 
 - `sandbox.networkMode = "host"` is the current default because it is the most reliable option for service deployments.
+- `sandbox.networkMode = "bridge"` attaches each sandbox to an existing `br-nspawn` bridge.
 - `sandbox.networkMode = "veth"` blocks access to host-local services but still allows outbound internet access.
 - `sandbox.networkMode = "private"` disables all network access, which also prevents GitHub and OpenRouter access.
 - Restricting outbound traffic to specific destinations requires host-side enforcement such as `nftables`/`iptables` rules on the `ve-*` interfaces, or a proxy-based egress policy.

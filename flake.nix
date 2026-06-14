@@ -281,10 +281,15 @@
           sandbox = {
             enable = lib.mkEnableOption "Sandboxed PR reviews via systemd-nspawn";
             networkMode = lib.mkOption {
-              type = lib.types.enum [ "host" "private" "veth" ];
+              type = lib.types.enum [ "host" "bridge" "private" "veth" ];
               default = "host";
               description = ''
                 Network mode for the sandbox.
+
+                "bridge" attaches each sandbox to an existing br-nspawn bridge
+                using systemd-nspawn's --network-bridge=br-nspawn. Use this
+                when the host already provisions bridge addressing, DHCP, NAT,
+                and forwarding.
 
                 "veth" gives the container an isolated network
                 namespace and routes outbound traffic via NAT. The module
