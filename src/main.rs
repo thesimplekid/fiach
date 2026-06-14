@@ -108,6 +108,14 @@ enum Commands {
         #[arg(long)]
         notify_on_empty: Option<bool>,
 
+        /// GitHub reaction to add when review starts (e.g. eyes, rocket)
+        #[arg(long)]
+        review_start_reaction: Option<String>,
+
+        /// GitHub reaction to add when review completes with no findings
+        #[arg(long)]
+        no_findings_reaction: Option<String>,
+
         /// Run a verifier pass before disclosure when findings are present
         #[arg(long)]
         verify_findings: Option<bool>,
@@ -201,6 +209,14 @@ enum Commands {
         /// Notify even if no findings are found
         #[arg(long)]
         notify_on_empty: Option<bool>,
+
+        /// GitHub reaction to add when review starts (e.g. eyes, rocket)
+        #[arg(long)]
+        review_start_reaction: Option<String>,
+
+        /// GitHub reaction to add when review completes with no findings
+        #[arg(long)]
+        no_findings_reaction: Option<String>,
 
         /// Run a verifier pass before disclosure when findings are present
         #[arg(long)]
@@ -331,6 +347,8 @@ async fn main() -> Result<()> {
             report_mode,
             sync_repo,
             notify_on_empty,
+            review_start_reaction,
+            no_findings_reaction,
             verify_findings,
             max_cost,
             input_price,
@@ -390,6 +408,10 @@ async fn main() -> Result<()> {
                     mode: report_mode,
                     sync_repo: sync_repo.or(rev_cfg.sync_repo),
                     notify_on_empty: notify_on_empty.or(rev_cfg.notify_on_empty).unwrap_or(false),
+                    reactions: disclose::ReactionConfig::with_defaults(
+                        review_start_reaction.or(rev_cfg.review_start_reaction),
+                        no_findings_reaction.or(rev_cfg.no_findings_reaction),
+                    ),
                 },
                 verify_findings: verify_findings.or(rev_cfg.verify_findings).unwrap_or(true),
                 context_groups: config.context_groups,
@@ -425,6 +447,8 @@ async fn main() -> Result<()> {
             report_mode,
             sync_repo,
             notify_on_empty,
+            review_start_reaction,
+            no_findings_reaction,
             verify_findings,
             max_cost,
             pr_state,
@@ -544,6 +568,10 @@ async fn main() -> Result<()> {
                     notify_on_empty: notify_on_empty
                         .or(daemon_cfg.notify_on_empty)
                         .unwrap_or(false),
+                    reactions: disclose::ReactionConfig::with_defaults(
+                        review_start_reaction.or(daemon_cfg.review_start_reaction),
+                        no_findings_reaction.or(daemon_cfg.no_findings_reaction),
+                    ),
                 },
                 verify_findings: verify_findings
                     .or(daemon_cfg.verify_findings)

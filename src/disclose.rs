@@ -43,6 +43,32 @@ pub struct DiscloseConfig {
     pub mode: ReportMode,
     pub sync_repo: Option<String>,
     pub notify_on_empty: bool,
+    pub reactions: ReactionConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReactionConfig {
+    pub review_start: Option<String>,
+    pub no_findings: Option<String>,
+}
+
+impl ReactionConfig {
+    pub fn with_defaults(review_start: Option<String>, no_findings: Option<String>) -> Self {
+        let defaults = Self::default();
+        Self {
+            review_start: review_start.or(defaults.review_start),
+            no_findings: no_findings.or(defaults.no_findings),
+        }
+    }
+}
+
+impl Default for ReactionConfig {
+    fn default() -> Self {
+        Self {
+            review_start: Some("eyes".to_string()),
+            no_findings: Some("+1".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -219,6 +245,57 @@ async fn post_pr_review(
         .to_string();
     tracing::info!("Successfully posted structured PR review: {}", url);
     Ok(url)
+}
+
+pub async fn post_pr_reaction(repo: &str, pr_number: u64, reaction: &str) -> Result<()> {
+    let content = normalize_reaction_content(reaction)?;
+    tracing::info!(
+        repo = %repo,
+        pr = pr_number,
+        reaction = content,
+        "Posting PR reaction"
+    );
+
+    let endpoint = format!("repos/{repo}/issues/{pr_number}/reactions");
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &endpoint,
+            "--method",
+            "POST",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-f",
+        ])
+        .arg(format!("content={content}"))
+        .output()
+        .await
+        .context("Failed to run `gh api` for PR reaction")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("gh api PR reaction failed: {stderr}");
+    }
+
+    Ok(())
+}
+
+fn normalize_reaction_content(reaction: &str) -> Result<&'static str> {
+    let trimmed = reaction.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "+1" | "thumbs_up" | "thumbsup" | ":+1:" | ":thumbsup:" | "👍" => Ok("+1"),
+        "-1" | "thumbs_down" | "thumbsdown" | ":-1:" | ":thumbsdown:" | "👎" => Ok("-1"),
+        "laugh" | "laughing" | "smile" | ":laugh:" | ":smile:" | "😄" => Ok("laugh"),
+        "confused" | ":confused:" | "😕" => Ok("confused"),
+        "heart" | ":heart:" | "❤️" | "❤" => Ok("heart"),
+        "hooray" | "tada" | ":hooray:" | ":tada:" | "🎉" => Ok("hooray"),
+        "rocket" | ":rocket:" | "🚀" => Ok("rocket"),
+        "eyes" | ":eyes:" | "👀" => Ok("eyes"),
+        _ => bail!(
+            "unsupported GitHub reaction {trimmed:?}; supported reactions are +1, -1, laugh, confused, heart, hooray, rocket, and eyes"
+        ),
+    }
 }
 
 async fn post_pr_comment(report_path: &Path, repo: &str, pr_number: u64) -> Result<String> {
@@ -701,5 +778,28 @@ mod tests {
         let result = parse_open_sync_prs(b"not json");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_reaction_content_accepts_names_and_emoji_aliases() {
+        assert_eq!(normalize_reaction_content("eyes").unwrap(), "eyes");
+        assert_eq!(normalize_reaction_content(":rocket:").unwrap(), "rocket");
+        assert_eq!(normalize_reaction_content("🎉").unwrap(), "hooray");
+        assert_eq!(normalize_reaction_content("thumbs_up").unwrap(), "+1");
+    }
+
+    #[test]
+    fn normalize_reaction_content_rejects_unsupported_reactions() {
+        let result = normalize_reaction_content("wave");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reaction_config_defaults_to_eyes_and_thumbs_up() {
+        let config = ReactionConfig::with_defaults(None, None);
+
+        assert_eq!(config.review_start.as_deref(), Some("eyes"));
+        assert_eq!(config.no_findings.as_deref(), Some("+1"));
     }
 }

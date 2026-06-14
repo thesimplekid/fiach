@@ -238,6 +238,19 @@ pub async fn run_review(
         "Starting review"
     );
 
+    if params.execution.persist_side_effects
+        && let Some(reaction) = params.disclose_config.reactions.review_start.as_deref()
+        && let Err(error) =
+            disclose::post_pr_reaction(&params.repo, params.pr_number, reaction).await
+    {
+        tracing::warn!(
+            repo = %params.repo,
+            pr = params.pr_number,
+            error = %error,
+            "Failed to post review start reaction"
+        );
+    }
+
     // 2. Create the configured LLM provider
     let provider = create_with_named_model(&params.provider, &params.model, Vec::new())
         .await
@@ -1087,6 +1100,19 @@ pub async fn run_review(
                 .await?
             };
             completed.metadata.report_url = report_url;
+
+            if completed.metadata.status == "none"
+                && let Some(reaction) = params.disclose_config.reactions.no_findings.as_deref()
+                && let Err(error) =
+                    disclose::post_pr_reaction(&params.repo, params.pr_number, reaction).await
+            {
+                tracing::warn!(
+                    repo = %params.repo,
+                    pr = params.pr_number,
+                    error = %error,
+                    "Failed to post no-findings reaction"
+                );
+            }
 
             if let Err(e) = state::mark_reviewed(
                 &params.db_path,

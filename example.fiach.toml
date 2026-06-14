@@ -15,6 +15,8 @@ out_dir = "reports" # Local directory to store reports
 report_mode = "sync-pr" # Options: local, pr-comment, sync-pr
 sync_repo = "thesimplekid/cdk-reviews" # GitHub repo to sync to if report_mode = "sync-pr"
 notify_on_empty = false
+# review_start_reaction = "eyes" # Default GitHub PR reaction when review starts
+# no_findings_reaction = "+1" # Default GitHub PR reaction when review completes with no findings
 verify_findings = true # Run a verifier pass before disclosure when findings are present
 max_turns = 300
 # persona = "builtin:pr-review" # General non-security PR review; default is builtin:security
@@ -33,6 +35,8 @@ timeout_mins = 30
 report_mode = "sync-pr"
 sync_repo = "thesimplekid/cdk-reviews"
 notify_on_empty = false
+# review_start_reaction = "eyes"
+# no_findings_reaction = "+1"
 verify_findings = true
 # persona = "builtin:pr-review" # General non-security PR review; default is builtin:security
 # max_cost_usd = 5.0

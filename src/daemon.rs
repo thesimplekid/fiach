@@ -870,6 +870,26 @@ async fn run_sandboxed_review(
         "Launching sandboxed review"
     );
 
+    if let Some(reaction) = review_params
+        .disclose_config
+        .reactions
+        .review_start
+        .as_deref()
+        && let Err(error) = crate::disclose::post_pr_reaction(
+            &review_params.repo,
+            review_params.pr_number,
+            reaction,
+        )
+        .await
+    {
+        tracing::warn!(
+            repo = %review_params.repo,
+            pr = review_params.pr_number,
+            error = %error,
+            "Failed to post review start reaction"
+        );
+    }
+
     let log_file = std::fs::File::create(&nspawn_log)
         .with_context(|| format!("Failed to create sandbox log at {}", nspawn_log.display()))?;
     cmd.stdout(Stdio::from(
@@ -951,6 +971,26 @@ async fn run_sandboxed_review(
 
     let mut metadata = completed.metadata;
     metadata.report_url = report_url;
+    if metadata.status == "none"
+        && let Some(reaction) = review_params
+            .disclose_config
+            .reactions
+            .no_findings
+            .as_deref()
+        && let Err(error) = crate::disclose::post_pr_reaction(
+            &review_params.repo,
+            review_params.pr_number,
+            reaction,
+        )
+        .await
+    {
+        tracing::warn!(
+            repo = %review_params.repo,
+            pr = review_params.pr_number,
+            error = %error,
+            "Failed to post no-findings reaction"
+        );
+    }
     crate::state::mark_reviewed(
         &params.db_path,
         &review_params.repo,

@@ -267,6 +267,18 @@
               description = "Whether to create PRs or comments even if no findings were found.";
             };
 
+            reviewStartReaction = lib.mkOption {
+              type = lib.types.str;
+              default = "eyes";
+              description = "GitHub reaction to add to a PR when Fiach starts reviewing it. Supports +1, -1, laugh, confused, heart, hooray, rocket, and eyes.";
+            };
+
+            noFindingsReaction = lib.mkOption {
+              type = lib.types.str;
+              default = "+1";
+              description = "GitHub reaction to add to a PR when Fiach completes a review with no findings. Supports +1, -1, laugh, confused, heart, hooray, rocket, and eyes.";
+            };
+
             verifyFindings = lib.mkOption {
               type = lib.types.bool;
               default = true;
@@ -450,6 +462,9 @@
                       sync_repo = cfg.syncRepo;
                     } // lib.optionalAttrs cfg.notifyOnEmpty {
                       notify_on_empty = cfg.notifyOnEmpty;
+                    } // {
+                      review_start_reaction = cfg.reviewStartReaction;
+                      no_findings_reaction = cfg.noFindingsReaction;
                     } // lib.optionalAttrs cfg.sandbox.enable {
                       sandbox_rootfs = "${sandboxRootfs}";
                       sandbox_network = cfg.sandbox.networkMode;
