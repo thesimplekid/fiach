@@ -3,6 +3,9 @@ repos = ["owner/repo"]
 interval = 100
 provider = "openrouter" # Options: openrouter, anthropic, openai, google
 model = "google/gemini-3.1-pro-preview"
+# Optional: defaults to provider/model above when unset
+# verifier_provider = "openrouter"
+# verifier_model = "anthropic/claude-sonnet-4"
 pr_state = ["open", "merged"] # Options: "open", "merged", "closed", "all" (can also be a comma-separated string)
 skip_prs = ["1870"] # Skip specific PR numbers globally or per repo
 allowed_author_associations = ["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]
@@ -21,6 +24,9 @@ max_turns = 300
 [review]
 provider = "openrouter"
 model = "google/gemini-3.1-pro-preview"
+# Optional: defaults to provider/model above when unset
+# verifier_provider = "openrouter"
+# verifier_model = "anthropic/claude-sonnet-4"
 max_turns = 60
 timeout_mins = 30
 report_mode = "sync-pr"

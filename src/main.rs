@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod disclose;
 mod persona;
+mod reporting;
 mod review;
 mod server;
 mod state;
@@ -49,6 +50,14 @@ enum Commands {
         /// Goose provider to use (openrouter, anthropic, openai, google)
         #[arg(long)]
         provider: Option<String>,
+
+        /// Model to use for the verifier pass. Defaults to --model.
+        #[arg(long)]
+        verifier_model: Option<String>,
+
+        /// Provider to use for the verifier pass. Defaults to --provider.
+        #[arg(long)]
+        verifier_provider: Option<String>,
 
         /// Path to write the security report. If not provided, defaults to
         /// "./reports/PR{pr_number}_{commit_hash}.md" in the current working directory.
@@ -140,6 +149,14 @@ enum Commands {
         /// Goose provider to use (openrouter, anthropic, openai, google)
         #[arg(long)]
         provider: Option<String>,
+
+        /// Model to use for the verifier pass. Defaults to --model.
+        #[arg(long)]
+        verifier_model: Option<String>,
+
+        /// Provider to use for the verifier pass. Defaults to --provider.
+        #[arg(long)]
+        verifier_provider: Option<String>,
 
         /// Explicitly instruct the agent to use a specific skill.
         #[arg(long)]
@@ -300,6 +317,8 @@ async fn main() -> Result<()> {
             pr,
             model,
             provider,
+            verifier_model,
+            verifier_provider,
             output,
             with_skill,
             persona,
@@ -327,6 +346,8 @@ async fn main() -> Result<()> {
             let provider = provider
                 .or(rev_cfg.provider)
                 .unwrap_or_else(|| "openrouter".to_string());
+            let verifier_model = verifier_model.or(rev_cfg.verifier_model);
+            let verifier_provider = verifier_provider.or(rev_cfg.verifier_provider);
             let persona_str = persona
                 .or(rev_cfg.persona)
                 .unwrap_or_else(|| "builtin:security".to_string());
@@ -352,6 +373,8 @@ async fn main() -> Result<()> {
                 pr_number: pr,
                 model,
                 provider,
+                verifier_model,
+                verifier_provider,
                 output: output.or(rev_cfg.output),
                 skill: with_skill.or(rev_cfg.with_skill),
                 persona,
@@ -389,6 +412,8 @@ async fn main() -> Result<()> {
             interval,
             model,
             provider,
+            verifier_model,
+            verifier_provider,
             with_skill,
             persona,
             max_turns,
@@ -433,6 +458,8 @@ async fn main() -> Result<()> {
             let provider = provider
                 .or(daemon_cfg.provider)
                 .unwrap_or_else(|| "openrouter".to_string());
+            let verifier_model = verifier_model.or(daemon_cfg.verifier_model);
+            let verifier_provider = verifier_provider.or(daemon_cfg.verifier_provider);
             let persona_str = persona
                 .or(daemon_cfg.persona)
                 .unwrap_or_else(|| "builtin:security".to_string());
@@ -494,6 +521,8 @@ async fn main() -> Result<()> {
                 interval: interval_secs,
                 provider,
                 model,
+                verifier_provider,
+                verifier_model,
                 skill: with_skill.or(daemon_cfg.with_skill),
                 persona,
                 max_turns: max_turns.or(daemon_cfg.max_turns).unwrap_or(60),

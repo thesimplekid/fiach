@@ -141,24 +141,41 @@ A custom persona file can contain these placeholders which are filled at runtime
 - `{repo}` — The target repository.
 - `{pr_number}` — The PR being reviewed.
 - `{base_branch}` — The base branch the PR is merging into.
-- `{report_path}` — The absolute path where the agent MUST write its final report.
+- `{report_path}` — The absolute path where Fiach writes the final rendered Markdown report.
 - `{skill_hint}` — Instructions for loading optional domain skills.
 
-### The Notification Trigger
-The reporting engine (for `pr-comment` and `sync-pr`) decides whether to notify humans by parsing the YAML frontmatter of the generated report. Instruct your agent to output:
+### Structured Reporting and Verification
 
-```yaml
----
-title: "SQL Injection in User Auth"
-notify: true
-status: confirmed
-severity: high
----
+Fiach uses structured reporting as the default review path. The finder agent does not directly post to GitHub and does not decide disclosure from Markdown frontmatter. Instead, it submits candidates through in-process reporting tools:
+
+- `submit_finding` records one candidate finding.
+- `submit_no_findings` records that the finder found no candidates.
+
+When candidate findings exist and `verify_findings = true`, Fiach runs a separate verifier session. The verifier may use the same provider/model as the finder, or a separate model configured with:
+
+```toml
+[daemon]
+provider = "openrouter"
+model = "google/gemini-3.1-pro-preview"
+verifier_provider = "openrouter" # optional
+verifier_model = "anthropic/claude-sonnet-4" # optional
 ```
 
-If `notify: true` is present, or if `findings_count > 0`, `fiach` will trigger the configured disclosure mode. If no issues are found, the agent should output `notify: false`, and `fiach` will remain silent (unless you pass `--notify-on-empty`).
+The verifier reviews all candidates in one pass and submits one `submit_verdict` per finding. Structured verdicts are authoritative for metadata and disclosure. Markdown reports are still written for humans, alongside JSON artifacts:
 
-When `verify_findings` is enabled, reports that would notify humans are sent through a second verifier pass before disclosure. The verifier must either leave the report actionable with verifier notes or rewrite it as a no-notify report.
+- `report.md`
+- `report.structured.json`
+- `report.policy.json`
+
+For `report_mode = "pr-comment"`, Fiach posts a GitHub PR review only when all host-side policy checks pass:
+
+- the PR is still open,
+- the verifier confirmed the finding,
+- the verifier marked it as introduced by the PR,
+- command transcript evidence is present,
+- the comment anchor is valid in the PR diff.
+
+Invalid inline anchors are downgraded into the review summary. Merged or closed PRs never receive PR comments. `report_mode = "sync-pr"` can still publish the local rendered report to the configured sync repository.
 
 *See `personas/security-persona.md` for a complete example of an aggressive, CTF-style vulnerability hunting prompt.*
 
@@ -200,6 +217,10 @@ In your `flake.nix` or `configuration.nix`:
             
             # Model to use
             model = "openrouter/anthropic/claude-3-7-sonnet";
+
+            # Optional verifier override. Defaults to provider/model above when unset.
+            verifierProvider = "openrouter";
+            verifierModel = "anthropic/claude-sonnet-4";
             
             # Disclosure Configuration
             reportMode = "sync-pr";
@@ -246,6 +267,8 @@ The following options are available under `services.fiach`:
 | `maxWorkers` | integer | `1` | Maximum number of PR reviews to run concurrently per polling query. `0` means unlimited. |
 | `provider` | string | `"openrouter"` | Goose provider to use, such as `"openrouter"`, `"anthropic"`, `"openai"`, or `"google"`. |
 | `model` | string | `"google/gemini-3.1-pro-preview"` | Model to use with the selected provider. |
+| `verifierProvider` | string or null | `null` | Provider to use for the verifier pass. Defaults to `provider` when unset. |
+| `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
 | `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and the selected provider API key. |
 | `persona` | string | `"builtin:security"` | Persona source to use (e.g., `"builtin:security"` or an absolute path). |
 | `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`) | `"local"` | Mode for reporting findings. |

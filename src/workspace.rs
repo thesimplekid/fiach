@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use tokio::process::Command;
 
 /// A prepared workspace with the PR branch checked out, ready for the agent.
@@ -22,6 +23,29 @@ pub struct PreparedWorkspace {
     pub commit_hash: String,
     /// The base commit hash the PR was branched from.
     pub base_commit: String,
+    pub pr_context: crate::reporting::PrContext,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestContext {
+    #[serde(rename = "baseRefOid")]
+    base_ref_oid: String,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+    state: String,
+    #[serde(default)]
+    merged: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryContext {
+    #[serde(rename = "defaultBranchRef")]
+    default_branch_ref: Option<DefaultBranchRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultBranchRef {
+    name: String,
 }
 
 impl Drop for PreparedWorkspace {
@@ -136,31 +160,51 @@ pub async fn prepare(
         bail!("gh pr checkout failed: {stderr}");
     }
 
-    // 3. Get the base commit hash (baseRefOid)
-    tracing::debug!(pr = pr_number, "Getting base commit hash");
-    let base_branch_output = Command::new("gh")
+    // 3. Get PR lifecycle and base context used by host disclosure policy.
+    tracing::debug!(pr = pr_number, "Getting PR context");
+    let pr_context_output = Command::new("gh")
         .args([
             "pr",
             "view",
             &pr_number.to_string(),
             "--json",
-            "baseRefOid",
-            "--jq",
-            ".baseRefOid",
+            "baseRefOid,baseRefName,state,merged",
         ])
         .current_dir(&workspace_dir)
         .output()
         .await
         .context("Failed to run `gh pr view`")?;
 
-    if !base_branch_output.status.success() {
-        let stderr = String::from_utf8_lossy(&base_branch_output.stderr);
+    if !pr_context_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pr_context_output.stderr);
         bail!("gh pr view failed: {stderr}");
     }
 
-    let base_commit = String::from_utf8_lossy(&base_branch_output.stdout)
-        .trim()
-        .to_string();
+    let pr_context: PullRequestContext =
+        serde_json::from_slice(&pr_context_output.stdout).context("Failed to parse PR context")?;
+    let base_commit = pr_context.base_ref_oid.clone();
+
+    let repo_context_output = Command::new("gh")
+        .args(["repo", "view", repo, "--json", "defaultBranchRef"])
+        .current_dir(&workspace_dir)
+        .output()
+        .await
+        .context("Failed to run `gh repo view`")?;
+
+    let default_branch = if repo_context_output.status.success() {
+        serde_json::from_slice::<RepositoryContext>(&repo_context_output.stdout)
+            .ok()
+            .and_then(|ctx| ctx.default_branch_ref.map(|branch| branch.name))
+            .unwrap_or_else(|| pr_context.base_ref_name.clone())
+    } else {
+        let stderr = String::from_utf8_lossy(&repo_context_output.stderr);
+        tracing::warn!(
+            repo = %repo,
+            error = %stderr,
+            "Failed to fetch repository default branch; using PR base branch"
+        );
+        pr_context.base_ref_name.clone()
+    };
 
     // 4. Materialize the complete PR diff for prompts that need a single
     // source of truth for changed lines.
@@ -267,7 +311,15 @@ fi
         path: workspace_dir,
         parent_dir,
         is_temp: true,
-        commit_hash,
+        commit_hash: commit_hash.clone(),
         base_commit,
+        pr_context: crate::reporting::PrContext {
+            state: pr_context.state,
+            merged: pr_context.merged,
+            base_ref_name: pr_context.base_ref_name,
+            default_branch,
+            base_commit: pr_context.base_ref_oid,
+            head_commit: commit_hash,
+        },
     })
 }

@@ -41,6 +41,8 @@ pub struct DaemonConfig {
     pub interval: Option<u64>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub verifier_provider: Option<String>,
+    pub verifier_model: Option<String>,
     pub with_skill: Option<String>,
     pub persona: Option<String>,
     pub max_turns: Option<u32>,
@@ -73,6 +75,8 @@ pub struct DaemonConfig {
 pub struct ReviewConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub verifier_provider: Option<String>,
+    pub verifier_model: Option<String>,
     pub output: Option<PathBuf>,
     pub with_skill: Option<String>,
     pub persona: Option<String>,

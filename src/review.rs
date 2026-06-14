@@ -1,20 +1,23 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use goose::agents::{Agent, AgentEvent, ExtensionConfig, SessionConfig};
 use goose::config::GooseMode;
-use goose::conversation::message::Message;
+use goose::conversation::message::{Message, MessageContent};
 use goose::providers::canonical::maybe_get_canonical_model;
 use goose::providers::create_with_named_model;
 use goose::session::session_manager::SessionType;
-use rmcp::model::Role;
+use rmcp::model::{CallToolResult, Content, Role};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::disclose;
+use crate::reporting::{self, ReportingArtifact, ReviewPhase};
 use crate::state;
 use crate::workspace;
 
@@ -79,6 +82,10 @@ pub struct ReviewParams {
     pub model: String,
     /// Goose provider name (e.g., openrouter, anthropic, openai, google).
     pub provider: String,
+    /// Optional model override for the verifier pass.
+    pub verifier_model: Option<String>,
+    /// Optional provider override for the verifier pass.
+    pub verifier_provider: Option<String>,
     /// Optional path to write the final report. If None, it will be generated
     /// in the current working directory as "PR{pr}_{hash}.md" after the
     /// workspace is prepared.
@@ -114,6 +121,8 @@ pub struct ReviewParams {
     pub execution: ReviewExecution,
 }
 
+type SharedReportingArtifact = Arc<Mutex<ReportingArtifact>>;
+
 /// Run a review of a GitHub PR using the goose agent.
 ///
 /// This function:
@@ -132,6 +141,7 @@ pub async fn run_review(
     let mut total_output_tokens = 0u64;
     let mut total_processed_tokens = 0u64; // For informational logging
     let skills_dir = resolve_skills_dir()?;
+    let reporting_artifact = Arc::new(Mutex::new(ReportingArtifact::default()));
 
     if let Some(skill_name) = &params.skill {
         let skill_path = skills_dir
@@ -403,6 +413,12 @@ pub async fn run_review(
 
     tracing::debug!("Developer extension loaded (in-process)");
 
+    add_reporting_extension(&agent, &session.id)
+        .await
+        .context("Failed to load fiach-reporting extension")?;
+
+    tracing::debug!("fiach-reporting extension loaded (frontend in-process)");
+
     // Log available extensions
     for ext in agent.list_extensions().await {
         tracing::debug!(extension = %ext, "Extension available");
@@ -469,7 +485,7 @@ pub async fn run_review(
              Start by reading `.pr_diff.txt`, which contains the complete patch for this review scope. \
              Verify that any finding's root cause is in `.pr_diff.txt`. For large per-file inspection, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
              follow the CTF methodology in your instructions, \
-             and write findings to {report_path}.{prev_review_context}\n\n\
+             and submit each candidate finding with `submit_finding`. If you find no candidate vulnerability, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}\n\n\
              IMPORTANT: Use the `{skill_name}` skill to complete this review. Use the load tool to load it if you haven't already.",
             pr_number = params.pr_number,
             repo = params.repo,
@@ -485,7 +501,7 @@ pub async fn run_review(
              Start by reading `.pr_diff.txt`, which contains the complete patch for this review scope. \
              Verify that any finding's root cause is in `.pr_diff.txt`. For large per-file inspection, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
              follow the CTF methodology in your instructions, \
-             and write findings to {report_path}.{prev_review_context}",
+             and submit each candidate finding with `submit_finding`. If you find no candidate vulnerability, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}",
             pr_number = params.pr_number,
             repo = params.repo,
             diff_base = diff_base,
@@ -560,6 +576,14 @@ pub async fn run_review(
                 event_opt = stream.next() => {
                     match event_opt {
                         Some(Ok(AgentEvent::Message(message))) => {
+                            handle_reporting_tool_requests(
+                                &agent,
+                                &message,
+                                ReviewPhase::Finder,
+                                reporting_artifact.clone(),
+                            )
+                            .await?;
+
                             // Log each message to trace for debugging
                             if let Ok(json) = serde_json::to_string_pretty(&message) {
                                 tracing::trace!(message = %json, "Agent message");
@@ -617,7 +641,7 @@ pub async fn run_review(
                                              );
                                              budget_exceeded = true;
 
-                                             let budget_nudge = format!("BUDGET EXCEEDED! Stop analyzing and write your final report to {} NOW. Use the `write` tool immediately. Do not do anything else.", report_path);
+                                             let budget_nudge = "BUDGET EXCEEDED! Stop analyzing and submit your current result now. Use `submit_finding` for each candidate, or `submit_no_findings` if there are no candidates. Do not do anything else.".to_string();
                                              let follow_up_message = Message::user().with_text(&budget_nudge);
 
                                              tracing::info!("Nudging agent to finalize report due to budget...");
@@ -747,8 +771,7 @@ pub async fn run_review(
                             }
                         }
                         None => {
-                            let report_file = std::path::Path::new(&report_path);
-                            if report_file.exists() {
+                            if reporting_artifact.lock().await.finder_complete() {
                                 return Ok(accumulated_turn_count); // Stream finished successfully
                             }
 
@@ -765,17 +788,15 @@ pub async fn run_review(
                             }
 
                             let follow_up_text = if budget_exceeded {
-                                format!("BUDGET EXCEEDED! Stop analyzing and write your final report to {} NOW. Use the `write` tool immediately. Do not do anything else.", report_path)
+                                "BUDGET EXCEEDED! Stop analyzing and submit your current result now. Use `submit_finding` for each candidate, or `submit_no_findings` if there are no candidates. Do not do anything else.".to_string()
                             } else {
                                 match last_assistant_text.as_deref() {
                                     Some(text) if !text.trim().is_empty() => format!(
-                                        "You stopped before writing the required report file at {report_path}.                                          Continue from where you left off. If you are done reviewing, use the `write` tool now to create the report file.                                          Do not stop without writing it. Your last visible message was:
+                                        "You stopped before submitting a structured review result. Continue from where you left off. If you are done reviewing, call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using a reporting tool. Your last visible message was:
 
 {text}"
                                     ),
-                                    _ => format!(
-                                        "You stopped before writing the required report file at {report_path}.                                          Continue the review and use the `write` tool to create the report file now.                                          Do not stop without writing it."
-                                    ),
+                                    _ => "You stopped before submitting a structured review result. Continue the review and call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using a reporting tool.".to_string(),
                                 }
                             };
 
@@ -783,8 +804,7 @@ pub async fn run_review(
                                 turns = accumulated_turn_count,
                                 attempt = retries + 1,
                                 max_retries = params.max_retries,
-                                path = %report_path,
-                                "Agent stream ended before report was written; retrying with a follow-up prompt"
+                                "Agent stream ended before structured findings were submitted; retrying with a follow-up prompt"
                             );
 
                             let follow_up_message = Message::user().with_text(&follow_up_text);
@@ -861,77 +881,126 @@ pub async fn run_review(
     }
 
     let duration_secs = start_time.elapsed().as_secs();
-    let total_tokens = total_processed_tokens;
-    let cost_usd = estimate_cost(
-        &params.provider,
-        &params.model,
-        peak_input_tokens,
-        total_output_tokens,
-        params.input_price_per_m,
-        params.output_price_per_m,
-    );
-
-    // 10. Check if the report was written and parse its frontmatter for summary
+    // 10. Build structured artifact, verify candidates, and render Markdown.
     let report_file = std::path::Path::new(&report_path);
+    let mut artifact = reporting_artifact.lock().await.clone();
 
-    if report_file.exists() {
-        let mut report_content = std::fs::read_to_string(report_file)
-            .context("Report file exists but could not be read")?;
+    if !artifact.finder_complete() && report_file.exists() {
+        tracing::warn!(
+            path = %report_path,
+            "Agent produced Markdown without structured findings; allowing local artifact only"
+        );
+        artifact.markdown_only_fallback = true;
+    }
 
-        if params.verify_findings && report_would_notify(&report_content) {
+    if artifact.finder_complete() || artifact.markdown_only_fallback {
+        if params.verify_findings && !artifact.findings.is_empty() {
             tracing::info!(
-                path = %report_path,
-                "Running verifier pass before disclosure"
+                findings = artifact.findings.len(),
+                "Running structured verifier pass before disclosure"
             );
 
-            let verifier_turns = run_verification_pass(
-                &agent,
-                session_config.clone(),
-                &report_path,
-                &params.repo,
-                params.pr_number,
-                &diff_base,
-                params.max_retries,
-                params.retry_delay_secs,
-                params.timeout_mins,
-                cancel_token.clone(),
-            )
+            let verifier_result = run_verification_pass(VerificationParams {
+                artifact: reporting_artifact.clone(),
+                workspace_path: &workspace.path,
+                repo: &params.repo,
+                pr_number: params.pr_number,
+                pr_context: &workspace.pr_context,
+                diff_base: &diff_base,
+                provider_name: params
+                    .verifier_provider
+                    .as_deref()
+                    .unwrap_or(&params.provider),
+                model: params.verifier_model.as_deref().unwrap_or(&params.model),
+                max_retries: params.max_retries,
+                retry_delay_secs: params.retry_delay_secs,
+                timeout_mins: params.timeout_mins,
+                max_turns: params.max_turns,
+                cancel_token: cancel_token.clone(),
+            })
             .await?;
-            turn_count += verifier_turns;
+            turn_count += verifier_result.turns;
+            peak_input_tokens = peak_input_tokens.max(verifier_result.peak_input_tokens);
+            total_output_tokens += verifier_result.output_tokens;
+            total_processed_tokens += verifier_result.total_tokens;
+            artifact = reporting_artifact.lock().await.clone();
 
-            if !report_file.exists() {
-                write_rejected_verification_report(
-                    report_file,
-                    &params.repo,
-                    params.pr_number,
-                    "The verifier removed the report instead of leaving a confirmed finding.",
-                )?;
+            if !artifact.verifier_complete() {
+                tracing::warn!(
+                    "Verifier did not submit verdicts for all findings; disclosure disabled"
+                );
+                artifact.verifier_failed = true;
             }
-
-            report_content = std::fs::read_to_string(report_file)
-                .context("Report file could not be read after verifier pass")?;
+        } else if !artifact.findings.is_empty() {
+            tracing::warn!("Verifier pass disabled; structured findings will not be disclosed");
+            artifact.verifier_failed = true;
         }
 
-        let limit_reached = turn_count >= params.max_turns;
-        let findings_count = parse_frontmatter_field(&report_content, "findings_count")
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
-        let status = parse_frontmatter_field(&report_content, "status")
-            .unwrap_or_else(|| "unknown".to_string());
-        let severity = parse_frontmatter_field(&report_content, "severity")
-            .unwrap_or_else(|| "unknown".to_string());
-        let notify_str = parse_frontmatter_field(&report_content, "notify")
-            .unwrap_or_else(|| "false".to_string());
-        let skills_used = parse_frontmatter_field(&report_content, "skills_used")
-            .unwrap_or_else(|| "unknown".to_string());
-        let pr_classification =
-            parse_frontmatter_field(&report_content, "pr").unwrap_or_else(|| "unknown".to_string());
+        let total_tokens = total_processed_tokens;
+        let cost_usd = estimate_cost(
+            &params.provider,
+            &params.model,
+            peak_input_tokens,
+            total_output_tokens,
+            params.input_price_per_m,
+            params.output_price_per_m,
+        );
 
-        let should_notify =
-            notify_str.to_lowercase() == "true" || (findings_count > 0 && status != "none");
+        reporting::validate_artifact(&mut artifact)?;
+        *reporting_artifact.lock().await = artifact.clone();
+
+        let diff_content = std::fs::read_to_string(workspace.path.join(".pr_diff.txt"))
+            .unwrap_or_else(|_| String::new());
+        let policy = reporting::DisclosurePolicy {
+            pr_context: workspace.pr_context.clone(),
+            diff_anchors: reporting::parse_diff_anchors(&diff_content),
+        };
+
+        let report_content =
+            reporting::render_markdown(&params.repo, params.pr_number, &artifact, Some(&policy));
+        fs::write(report_file, report_content).context("Failed to write rendered report")?;
+
+        let structured_path = structured_artifact_path(report_file);
+        fs::write(&structured_path, serde_json::to_vec_pretty(&artifact)?)
+            .context("Failed to write structured review artifact")?;
+        let policy_path = disclosure_policy_path(report_file);
+        fs::write(&policy_path, serde_json::to_vec_pretty(&policy)?)
+            .context("Failed to write disclosure policy artifact")?;
+
+        let limit_reached = turn_count >= params.max_turns;
+        let accepted_findings = if artifact.markdown_only_fallback {
+            Vec::new()
+        } else {
+            artifact.accepted_findings(&policy)
+        };
+        let findings_count = accepted_findings.len() as u32;
+        let should_notify = findings_count > 0 && !artifact.verifier_failed;
+        let status = if artifact.markdown_only_fallback {
+            "markdown-only".to_string()
+        } else if artifact.verifier_failed {
+            "unverified".to_string()
+        } else if findings_count > 0 {
+            "confirmed".to_string()
+        } else if artifact.no_findings.is_some() {
+            "none".to_string()
+        } else {
+            "rejected".to_string()
+        };
+        let severity = accepted_findings
+            .iter()
+            .map(|finding| finding.severity.clone())
+            .next()
+            .unwrap_or_else(|| "none".to_string());
+        let pr_classification = if findings_count > 0 {
+            params.pr_number.to_string()
+        } else {
+            "none".to_string()
+        };
 
         tracing::info!(
             path = %report_path,
+            structured = %structured_path.display(),
+            policy = %policy_path.display(),
             turns = turn_count,
             limit_reached = limit_reached,
             should_notify = should_notify,
@@ -939,26 +1008,15 @@ pub async fn run_review(
             status = %status,
             severity = %severity,
             pr = %pr_classification,
-            skills_used = %skills_used,
             duration = %format!("{}s", duration_secs),
             tokens = %format!("in:{} peak:{} out:{} total:{}", total_processed_tokens, peak_input_tokens, total_output_tokens, total_tokens),
             cost = %cost_usd.map(|c| format!("${:.4}", c)).unwrap_or_else(|| "unknown".to_string()),
-            "Review complete — report written"
+            "Review complete"
         );
 
         if !should_notify {
             tracing::info!(
                 "No actionable findings that require notification were found in this PR"
-            );
-        }
-
-        if let Some(requested_skill) = &params.skill
-            && !skills_used.contains(requested_skill)
-        {
-            tracing::warn!(
-                requested = %requested_skill,
-                reported = %skills_used,
-                "Agent was instructed to use a skill, but the report frontmatter does not list it."
             );
         }
 
@@ -997,15 +1055,28 @@ pub async fn run_review(
         };
 
         if params.execution.persist_side_effects {
-            let report_url = crate::disclose::handle_disclosure(
-                report_file,
-                &params.repo,
-                params.pr_number,
-                workspace.commit_hash.as_str(),
-                should_notify,
-                &params.disclose_config,
-            )
-            .await?;
+            let report_url = if artifact.markdown_only_fallback {
+                crate::disclose::handle_disclosure(
+                    report_file,
+                    &params.repo,
+                    params.pr_number,
+                    workspace.commit_hash.as_str(),
+                    false,
+                    &params.disclose_config,
+                )
+                .await?
+            } else {
+                crate::disclose::handle_structured_disclosure(
+                    report_file,
+                    &params.repo,
+                    params.pr_number,
+                    workspace.commit_hash.as_str(),
+                    &artifact,
+                    &policy,
+                    &params.disclose_config,
+                )
+                .await?
+            };
             completed.metadata.report_url = report_url;
 
             if let Err(e) = state::mark_reviewed(
@@ -1040,18 +1111,16 @@ pub async fn run_review(
         return Ok(Some(completed));
     } else {
         let limit_reached = turn_count >= params.max_turns;
-        // The agent was explicitly instructed to always write a report, so a
-        // missing report means something went wrong.
         if limit_reached {
             tracing::warn!(
                 turns = turn_count,
                 max_turns = params.max_turns,
-                "Agent reached the turn limit WITHOUT writing a report"
+                "Agent reached the turn limit without submitting structured findings"
             );
         } else {
             tracing::warn!(
                 turns = turn_count,
-                "Agent finished but FAILED to write a report — it was instructed to always produce one"
+                "Agent finished without submitting structured findings"
             );
         }
     }
@@ -1066,6 +1135,7 @@ pub async fn run_review(
     Ok(None)
 }
 
+#[cfg(test)]
 fn report_would_notify(content: &str) -> bool {
     let notify = parse_frontmatter_field(content, "notify")
         .unwrap_or_else(|| "false".to_string())
@@ -1078,32 +1148,259 @@ fn report_would_notify(content: &str) -> bool {
     notify || (findings_count > 0 && status != "none")
 }
 
-async fn run_verification_pass(
+async fn add_reporting_extension(agent: &Agent, session_id: &str) -> Result<()> {
+    let reporting_ext = ExtensionConfig::Frontend {
+        name: "fiach-reporting".to_string(),
+        description: "Structured Fiach review reporting tools".to_string(),
+        tools: reporting::reporting_tools(),
+        instructions: Some(
+            "Use these tools to submit structured review results to Fiach. Finder passes call `submit_finding` once per candidate or `submit_no_findings`. Verifier passes call `submit_verdict` once per candidate finding. These tools do not post to GitHub."
+                .to_string(),
+        ),
+        bundled: Some(true),
+        available_tools: Vec::new(),
+    };
+
+    agent
+        .add_extension(reporting_ext, session_id)
+        .await
+        .context("Failed to add frontend reporting extension")?;
+    Ok(())
+}
+
+async fn handle_reporting_tool_requests(
     agent: &Agent,
-    session_config: SessionConfig,
-    report_path: &str,
-    repo: &str,
+    message: &Message,
+    phase: ReviewPhase,
+    artifact: SharedReportingArtifact,
+) -> Result<()> {
+    for content in &message.content {
+        let MessageContent::FrontendToolRequest(request) = content else {
+            continue;
+        };
+        let Ok(tool_call) = &request.tool_call else {
+            continue;
+        };
+
+        let result = match tool_call.name.as_ref() {
+            "submit_finding" if phase == ReviewPhase::Finder => {
+                match parse_tool_arguments::<reporting::FindingInput>(tool_call.arguments.clone()) {
+                    Ok(input) => {
+                        let mut guard = artifact.lock().await;
+                        if guard.no_findings.is_some() {
+                            CallToolResult::error(vec![Content::text(
+                                "cannot submit findings after submit_no_findings",
+                            )])
+                        } else {
+                            match reporting::Finding::from_input(guard.findings.len(), input) {
+                                Ok(finding) => {
+                                    let id = finding.id.clone();
+                                    guard.findings.push(finding);
+                                    CallToolResult::success(vec![Content::text(format!(
+                                        "accepted finding {id}"
+                                    ))])
+                                }
+                                Err(error) => {
+                                    CallToolResult::error(vec![Content::text(error.to_string())])
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+                }
+            }
+            "submit_no_findings" if phase == ReviewPhase::Finder => {
+                match parse_tool_arguments::<reporting::NoFindings>(tool_call.arguments.clone()) {
+                    Ok(mut no_findings) => {
+                        if let Err(error) = no_findings.validate() {
+                            CallToolResult::error(vec![Content::text(error.to_string())])
+                        } else {
+                            let mut guard = artifact.lock().await;
+                            if !guard.findings.is_empty() {
+                                CallToolResult::error(vec![Content::text(
+                                    "cannot submit no-findings after submit_finding",
+                                )])
+                            } else {
+                                guard.no_findings = Some(no_findings);
+                                CallToolResult::success(vec![Content::text(
+                                    "accepted no-findings result",
+                                )])
+                            }
+                        }
+                    }
+                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+                }
+            }
+            "submit_verdict" if phase == ReviewPhase::Verifier => {
+                match parse_tool_arguments::<reporting::Verdict>(tool_call.arguments.clone()) {
+                    Ok(mut verdict) => {
+                        let mut guard = artifact.lock().await;
+                        let ids = guard
+                            .findings
+                            .iter()
+                            .map(|finding| finding.id.clone())
+                            .collect();
+                        match verdict.validate(&ids) {
+                            Ok(()) => {
+                                guard
+                                    .verdicts
+                                    .retain(|existing| existing.finding_id != verdict.finding_id);
+                                let id = verdict.finding_id.clone();
+                                guard.verdicts.push(verdict);
+                                CallToolResult::success(vec![Content::text(format!(
+                                    "accepted verdict for {id}"
+                                ))])
+                            }
+                            Err(error) => {
+                                CallToolResult::error(vec![Content::text(error.to_string())])
+                            }
+                        }
+                    }
+                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+                }
+            }
+            "submit_finding" | "submit_no_findings" | "submit_verdict" => {
+                CallToolResult::error(vec![Content::text(format!(
+                    "tool `{}` is not valid during the {:?} phase",
+                    tool_call.name, phase
+                ))])
+            }
+            _ => continue,
+        };
+
+        agent
+            .handle_tool_result(request.id.clone(), Ok(result))
+            .await;
+    }
+
+    Ok(())
+}
+
+fn parse_tool_arguments<T: serde::de::DeserializeOwned>(
+    arguments: Option<rmcp::model::JsonObject>,
+) -> Result<T> {
+    let value = arguments
+        .map(serde_json::Value::Object)
+        .context("missing tool arguments")?;
+    serde_json::from_value(value).context("invalid tool arguments")
+}
+
+fn structured_artifact_path(report_file: &std::path::Path) -> PathBuf {
+    let mut path = report_file.to_path_buf();
+    path.set_extension("structured.json");
+    path
+}
+
+pub fn structured_artifact_path_for_report(report_file: &std::path::Path) -> PathBuf {
+    structured_artifact_path(report_file)
+}
+
+fn disclosure_policy_path(report_file: &std::path::Path) -> PathBuf {
+    let mut path = report_file.to_path_buf();
+    path.set_extension("policy.json");
+    path
+}
+
+pub fn disclosure_policy_path_for_report(report_file: &std::path::Path) -> PathBuf {
+    disclosure_policy_path(report_file)
+}
+
+#[derive(Debug, Default)]
+struct VerificationStats {
+    turns: u32,
+    peak_input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+struct VerificationParams<'a> {
+    artifact: SharedReportingArtifact,
+    workspace_path: &'a std::path::Path,
+    repo: &'a str,
     pr_number: u64,
-    diff_base: &str,
+    pr_context: &'a reporting::PrContext,
+    diff_base: &'a str,
+    provider_name: &'a str,
+    model: &'a str,
     max_retries: u32,
     retry_delay_secs: u64,
     timeout_mins: u64,
+    max_turns: u32,
     cancel_token: CancellationToken,
-) -> Result<u32> {
+}
+
+async fn run_verification_pass(params: VerificationParams<'_>) -> Result<VerificationStats> {
+    let provider = create_with_named_model(params.provider_name, params.model, Vec::new())
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create verifier {} provider",
+                params.provider_name
+            )
+        })?;
+    let agent = Agent::new();
+    let session = agent
+        .config
+        .session_manager
+        .create_session(
+            params.workspace_path.to_path_buf(),
+            "security-verifier".to_string(),
+            SessionType::Hidden,
+            GooseMode::Auto,
+        )
+        .await
+        .context("Failed to create verifier session")?;
+    agent
+        .update_provider(provider, &session.id)
+        .await
+        .context("Failed to update verifier provider")?;
+
+    let developer_ext = ExtensionConfig::Platform {
+        name: "developer".to_string(),
+        description: "Write and edit files, and execute shell commands".to_string(),
+        display_name: Some("Developer".to_string()),
+        bundled: None,
+        available_tools: Vec::new(),
+    };
+    agent
+        .add_extension(developer_ext, &session.id)
+        .await
+        .context("Failed to load developer extension for verifier")?;
+    add_reporting_extension(&agent, &session.id).await?;
+
+    let candidates = serde_json::to_string_pretty(&params.artifact.lock().await.findings)?;
+    let pr_context = serde_json::to_string_pretty(params.pr_context)?;
     let verifier_prompt = format!(
         "VERIFIER PHASE for PR #{pr_number} in {repo}.\n\
-         Read the existing report at `{report_path}` and the complete patch in `.pr_diff.txt`.\n\
-         The current diff base for shell checks is `{diff_base}`.\n\
-         Independently verify every finding, including any proof-of-concept and the claim that the root cause is in `.pr_diff.txt`.\n\
-         If the finding is confirmed and PR-introduced, leave the report actionable and append a `## Verifier Notes` section explaining the verification evidence.\n\
-         If the finding is not confirmed, is theoretical-only, or is pre-existing outside this PR diff, rewrite `{report_path}` with frontmatter:\n\
-         `title: \"No verified findings\"`, `notify: false`, `status: none`, `severity: none`, `target: {repo}`, `pr: none`, `skills_used: [\"verifier\"]`, `findings_count: 0`, followed by a summary of why the report was rejected.\n\
-         Do not open PRs, post comments, or perform disclosure side effects. Only update `{report_path}`.",
+         Candidate findings are below as JSON. Review all candidates in one pass and call `submit_verdict` exactly once for each finding_id.\n\
+         Candidate findings:\n{candidates}\n\n\
+         PR context:\n{pr_context}\n\n\
+         The current diff base for shell checks is `{diff_base}`. The complete patch is in `.pr_diff.txt`.\n\
+         You may run bounded reproduction commands through the developer shell when needed. For every finding that you mark as discloseable, include command transcript evidence comparing the PR branch against base and/or default branch context.\n\
+         Mark `confirmed` true only for a real, reproducible issue. Mark `introduced_by_pr` true only when the PR diff introduced the root cause. Use `disclosure_decision: \"disclose\"` only when the finding is confirmed, PR-introduced, and supported by command transcript evidence.\n\
+         Do not post comments, create PRs, or modify files. Only submit structured verdicts.",
+        pr_number = params.pr_number,
+        repo = params.repo,
+        diff_base = params.diff_base,
     );
+
+    agent
+        .extend_system_prompt(
+            "verifier_policy".to_string(),
+            "You are a strict adjudicator. Suppress uncertain, theoretical, pre-existing, or unverified findings. Models never disclose directly; only the host may disclose after policy checks.".to_string(),
+        )
+        .await;
+
+    let session_config = SessionConfig {
+        id: session.id,
+        schedule_id: None,
+        max_turns: Some(params.max_turns),
+        retry_config: None,
+    };
 
     let verifier_future = async {
         let mut retries = 0;
-        let mut delay = retry_delay_secs;
+        let mut delay = params.retry_delay_secs;
         let mut turns = 0;
         let mut stream = loop {
             match agent
@@ -1119,7 +1416,7 @@ async fn run_verification_pass(
                     if is_fatal_error(&e) {
                         return Err(e).context("Fatal provider error during verifier pass");
                     }
-                    if retries >= max_retries {
+                    if retries >= params.max_retries {
                         return Err(anyhow::anyhow!(
                             "Failed to start verifier pass after {} retries: {}",
                             retries,
@@ -1129,7 +1426,7 @@ async fn run_verification_pass(
                     tracing::info!(
                         "Failed to start verifier pass (attempt {}/{}): {}. Retrying in {}s...",
                         retries + 1,
-                        max_retries,
+                        params.max_retries,
                         e,
                         delay
                     );
@@ -1142,12 +1439,20 @@ async fn run_verification_pass(
 
         loop {
             tokio::select! {
-                _ = cancel_token.cancelled() => {
+                _ = params.cancel_token.cancelled() => {
                     bail!("Verifier pass cancelled by user");
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(AgentEvent::Message(message))) => {
+                            handle_reporting_tool_requests(
+                                &agent,
+                                &message,
+                                ReviewPhase::Verifier,
+                                params.artifact.clone(),
+                            )
+                            .await?;
+
                             if message.role == Role::Assistant {
                                 turns += 1;
                             }
@@ -1157,7 +1462,7 @@ async fn run_verification_pass(
                             if is_fatal_error(&e) {
                                 return Err(e).context("Fatal provider error during verifier stream");
                             }
-                            if retries >= max_retries {
+                            if retries >= params.max_retries {
                                 return Err(anyhow::anyhow!(
                                     "Verifier stream failed after {} retries: {}",
                                     retries,
@@ -1165,7 +1470,7 @@ async fn run_verification_pass(
                                 ));
                             }
                             let retry_prompt = format!(
-                                "The verifier stream was interrupted due to this error: {e}. Continue verification and ensure `{report_path}` is updated before stopping."
+                                "The verifier stream was interrupted due to this error: {e}. Continue verification and call `submit_verdict` exactly once for every candidate before stopping."
                             );
                             retries += 1;
                             tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -1179,51 +1484,68 @@ async fn run_verification_pass(
                                 .await
                                 .context("Failed to restart verifier stream")?;
                         }
-                        None => return Ok(turns),
+                        None => {
+                            if params.artifact.lock().await.verifier_complete() {
+                                return Ok(turns);
+                            }
+                            if retries >= params.max_retries {
+                                return Ok(turns);
+                            }
+                            let retry_prompt = "You stopped before submitting verdicts for all candidate findings. Continue verification and call `submit_verdict` exactly once for every remaining candidate.".to_string();
+                            retries += 1;
+                            tokio::time::sleep(Duration::from_secs(delay)).await;
+                            delay *= 2;
+                            stream = agent
+                                .reply(
+                                    Message::user().with_text(&retry_prompt),
+                                    session_config.clone(),
+                                    None,
+                                )
+                                .await
+                                .context("Failed to restart verifier stream")?;
+                        }
                     }
                 }
             }
         }
     };
 
-    timeout(Duration::from_secs(timeout_mins * 60), verifier_future)
+    let turns = timeout(
+        Duration::from_secs(params.timeout_mins * 60),
+        verifier_future,
+    )
+    .await
+    .context("Verifier pass timed out")??;
+
+    let mut stats = VerificationStats {
+        turns,
+        ..Default::default()
+    };
+    if let Ok(session) = agent
+        .config
+        .session_manager
+        .get_session(&session_config.id, false)
         .await
-        .context("Verifier pass timed out")?
-}
+    {
+        let input = session.accumulated_input_tokens.unwrap_or(0).max(0) as u64;
+        let output = session.accumulated_output_tokens.unwrap_or(0).max(0) as u64;
+        stats.peak_input_tokens = if turns == 0 {
+            input
+        } else {
+            (2 * input) / (turns as u64 + 1)
+        };
+        stats.output_tokens = output;
+        stats.total_tokens = input + output;
+    }
 
-fn write_rejected_verification_report(
-    report_file: &std::path::Path,
-    repo: &str,
-    pr_number: u64,
-    reason: &str,
-) -> Result<()> {
-    let content = format!(
-        r#"---
-title: "No verified findings"
-notify: false
-status: none
-severity: none
-target: {repo}
-pr: none
-skills_used: ["verifier"]
-findings_count: 0
----
-
-## Summary
-The verifier rejected the discovery report for PR #{pr_number}: {reason}
-
-## Verifier Notes
-No finding from the discovery report was allowed to proceed to disclosure.
-"#
-    );
-
-    fs::write(report_file, content).context("Failed to write rejected verifier report")
+    Ok(stats)
 }
 
 /// Extract a value from the YAML frontmatter of a report.
 ///
 /// Looks for lines between `---` delimiters matching `key: value`.
 /// Returns the trimmed value string, or `None` if the key is not found.
+#[cfg(test)]
 fn parse_frontmatter_field(content: &str, key: &str) -> Option<String> {
     let mut in_frontmatter = false;
     for line in content.lines() {

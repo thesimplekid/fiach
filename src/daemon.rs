@@ -22,6 +22,8 @@ pub struct DaemonParams {
     pub interval: u64,
     pub provider: String,
     pub model: String,
+    pub verifier_provider: Option<String>,
+    pub verifier_model: Option<String>,
     pub skill: Option<String>,
     pub persona: crate::persona::PersonaSource,
     pub max_turns: u32,
@@ -401,6 +403,8 @@ async fn process_daemon_pr(
                 pr_number: pr.number,
                 provider: params.provider.clone(),
                 model: params.model.clone(),
+                verifier_provider: params.verifier_provider.clone(),
+                verifier_model: params.verifier_model.clone(),
                 output: output_path,
                 skill: params.skill.clone(),
                 persona: params.persona.clone(),
@@ -577,6 +581,8 @@ async fn trigger_manual_review(
         pr_number,
         provider: params.provider.clone(),
         model: params.model.clone(),
+        verifier_provider: params.verifier_provider.clone(),
+        verifier_model: params.verifier_model.clone(),
         output: output_path,
         skill: params.skill.clone(),
         persona: params.persona.clone(),
@@ -805,6 +811,12 @@ async fn run_sandboxed_review(
     cmd.arg("--pr").arg(review_params.pr_number.to_string());
     cmd.arg("--provider").arg(&review_params.provider);
     cmd.arg("--model").arg(&review_params.model);
+    if let Some(provider) = &review_params.verifier_provider {
+        cmd.arg("--verifier-provider").arg(provider);
+    }
+    if let Some(model) = &review_params.verifier_model {
+        cmd.arg("--verifier-model").arg(model);
+    }
 
     let _ = &review_params.output;
     cmd.arg("--output").arg("/sandbox-output/report.md");
@@ -902,15 +914,40 @@ async fn run_sandboxed_review(
     }
 
     let completed = read_completed_review(&result_json)?;
-    let report_url = crate::disclose::handle_disclosure(
-        &report_path,
-        &review_params.repo,
-        review_params.pr_number,
-        completed.metadata.commit_hash.as_str(),
-        completed.should_notify,
-        &review_params.disclose_config,
-    )
-    .await?;
+    let structured_path = crate::review::structured_artifact_path_for_report(&report_path);
+    let policy_path = crate::review::disclosure_policy_path_for_report(&report_path);
+    let report_url = match (
+        read_json_file::<crate::reporting::ReportingArtifact>(&structured_path),
+        read_json_file::<crate::reporting::DisclosurePolicy>(&policy_path),
+    ) {
+        (Ok(artifact), Ok(policy)) => {
+            crate::disclose::handle_structured_disclosure(
+                &report_path,
+                &review_params.repo,
+                review_params.pr_number,
+                completed.metadata.commit_hash.as_str(),
+                &artifact,
+                &policy,
+                &review_params.disclose_config,
+            )
+            .await?
+        }
+        _ => {
+            tracing::warn!(
+                report = %report_path.display(),
+                "Sandbox child did not emit structured disclosure artifacts; suppressing PR comments"
+            );
+            crate::disclose::handle_disclosure(
+                &report_path,
+                &review_params.repo,
+                review_params.pr_number,
+                completed.metadata.commit_hash.as_str(),
+                false,
+                &review_params.disclose_config,
+            )
+            .await?
+        }
+    };
 
     let mut metadata = completed.metadata;
     metadata.report_url = report_url;
@@ -987,6 +1024,12 @@ fn read_completed_review(path: &Path) -> Result<CompletedReview> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read sandbox result JSON at {}", path.display()))?;
     serde_json::from_slice(&bytes).context("Failed to parse sandbox result JSON")
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read JSON file at {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
 #[cfg(test)]

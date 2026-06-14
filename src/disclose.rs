@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use tokio::process::Command;
+
+use crate::reporting::{DisclosurePolicy, InlineComment, ReportingArtifact};
 
 #[derive(Debug, Clone, clap::ValueEnum, Default, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -91,6 +94,133 @@ pub async fn handle_disclosure(
                 .map(Some)
         }
     }
+}
+
+pub async fn handle_structured_disclosure(
+    report_path: &Path,
+    repo: &str,
+    pr_number: u64,
+    commit_hash: &str,
+    artifact: &ReportingArtifact,
+    policy: &DisclosurePolicy,
+    config: &DiscloseConfig,
+) -> Result<Option<String>> {
+    let accepted = artifact.accepted_findings(policy);
+    let vulnerabilities_found = !accepted.is_empty() && !artifact.verifier_failed;
+
+    match config.mode {
+        ReportMode::Local => {
+            tracing::info!("ReportMode is Local. Report saved to {:?}", report_path);
+            Ok(Some(report_path.to_string_lossy().to_string()))
+        }
+        ReportMode::PrComment => {
+            if !vulnerabilities_found && !config.notify_on_empty {
+                tracing::info!("No verified findings approved for disclosure; skipping PR review");
+                return Ok(None);
+            }
+            if !policy.pr_context.comments_allowed() {
+                tracing::info!(
+                    state = %policy.pr_context.state,
+                    merged = policy.pr_context.merged,
+                    "PR lifecycle state does not allow comments; skipping PR disclosure"
+                );
+                return Ok(None);
+            }
+
+            let comments = accepted
+                .iter()
+                .flat_map(|finding| finding.inline_comments.clone())
+                .collect::<Vec<_>>();
+            let body = crate::reporting::review_summary_body(&accepted);
+            post_pr_review(repo, pr_number, &body, comments)
+                .await
+                .map(Some)
+        }
+        ReportMode::SyncPr => {
+            if !vulnerabilities_found && !config.notify_on_empty {
+                tracing::info!("No verified findings approved for disclosure; skipping Sync PR");
+                return Ok(None);
+            }
+
+            let sync_repo = config
+                .sync_repo
+                .as_ref()
+                .context("sync_repo must be provided for SyncPr mode")?;
+            create_sync_pr(report_path, repo, pr_number, commit_hash, sync_repo)
+                .await
+                .map(Some)
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ReviewCommentPayload {
+    path: String,
+    line: u32,
+    side: &'static str,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct ReviewPayload {
+    event: &'static str,
+    body: String,
+    comments: Vec<ReviewCommentPayload>,
+}
+
+async fn post_pr_review(
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+    comments: Vec<InlineComment>,
+) -> Result<String> {
+    tracing::info!(
+        repo = %repo,
+        pr = pr_number,
+        comments = comments.len(),
+        "Posting structured PR review"
+    );
+
+    let payload = ReviewPayload {
+        event: "COMMENT",
+        body: body.to_string(),
+        comments: comments
+            .into_iter()
+            .map(|comment| ReviewCommentPayload {
+                path: comment.path,
+                line: comment.line,
+                side: "RIGHT",
+                body: comment.body,
+            })
+            .collect(),
+    };
+
+    let input = tempfile::NamedTempFile::new().context("Failed to create review payload file")?;
+    std::fs::write(input.path(), serde_json::to_vec(&payload)?)
+        .context("Failed to write review payload")?;
+
+    let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
+    let output = Command::new("gh")
+        .args(["api", &endpoint, "--method", "POST", "--input"])
+        .arg(input.path())
+        .output()
+        .await
+        .context("Failed to run `gh api` for PR review")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("gh api PR review failed: {stderr}");
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("Failed to parse PR review response")?;
+    let url = value
+        .get("html_url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    tracing::info!("Successfully posted structured PR review: {}", url);
+    Ok(url)
 }
 
 async fn post_pr_comment(report_path: &Path, repo: &str, pr_number: u64) -> Result<String> {
