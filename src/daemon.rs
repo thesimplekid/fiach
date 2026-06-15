@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use futures::{StreamExt, stream};
@@ -877,6 +878,12 @@ async fn run_sandboxed_review(
     }
 
     let mut cmd = Command::new("systemd-nspawn");
+    let machine_name = sandbox_machine_name_for_run(
+        &review_params.repo,
+        review_params.pr_number,
+        &review_params.review_kind,
+    );
+    cmd.arg(format!("--machine={machine_name}"));
     cmd.arg(format!("--directory={}", runtime_rootfs.display()));
     // --private-users=no: DynamicUser provides a transient UID without subuid/subgid
     // mappings, so nspawn's default --private-users=pick fails.
@@ -1020,6 +1027,7 @@ async fn run_sandboxed_review(
         repo = %review_params.repo,
         pr = %review_params.pr_number,
         rootfs = %runtime_rootfs.display(),
+        machine = %machine_name,
         log = %nspawn_log.display(),
         network = ?params.sandbox_network,
         "Launching sandboxed review"
@@ -1229,6 +1237,38 @@ fn sandbox_run_dir(
     Ok(base_dir.join("runs").join(run_name))
 }
 
+fn sandbox_machine_name_for_run(repo: &str, pr_number: u64, review_kind: &str) -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+        ^ u128::from(std::process::id());
+
+    sandbox_machine_name(repo, pr_number, review_kind, nonce)
+}
+
+fn sandbox_machine_name(repo: &str, pr_number: u64, review_kind: &str, nonce: u128) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    repo.hash(&mut hasher);
+    pr_number.hash(&mut hasher);
+    review_kind.hash(&mut hasher);
+    nonce.hash(&mut hasher);
+
+    format!("fiach-{}", base36_suffix(hasher.finish(), 6))
+}
+
+fn base36_suffix(mut value: u64, width: usize) -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut chars = vec!['0'; width];
+
+    for index in (0..width).rev() {
+        chars[index] = ALPHABET[(value % 36) as usize] as char;
+        value /= 36;
+    }
+
+    chars.into_iter().collect()
+}
+
 fn read_completed_review(path: &Path) -> Result<CompletedReview> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read sandbox result JSON at {}", path.display()))?;
@@ -1278,6 +1318,28 @@ mod tests {
         assert_eq!(worker_concurrency(20, 10), 10);
         assert_eq!(worker_concurrency(0, 10), 10);
         assert_eq!(worker_concurrency(0, 0), 1);
+    }
+
+    #[test]
+    fn sandbox_machine_name_is_short_and_veth_safe() {
+        let name = sandbox_machine_name("owner/repo", 42, "security", 123);
+        let host_interface_name = format!("ve-{name}");
+
+        assert!(name.starts_with("fiach-"));
+        assert_eq!(name.len(), 12);
+        assert_eq!(host_interface_name.len(), 15);
+        assert!(
+            name.chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        );
+    }
+
+    #[test]
+    fn sandbox_machine_name_varies_by_nonce() {
+        assert_ne!(
+            sandbox_machine_name("owner/repo", 42, "security", 123),
+            sandbox_machine_name("owner/repo", 42, "security", 124)
+        );
     }
 
     #[test]

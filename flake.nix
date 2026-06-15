@@ -657,7 +657,9 @@
             }
 
             # Host-side network configuration for the veth sandbox network mode.
-            # systemd-nspawn names the host end of the veth pair "vb-<container>".
+            # systemd-nspawn names the host end of a plain --network-veth pair
+            # "ve-<machine>". Fiach uses short machine names with the "fiach-"
+            # prefix so these interface names avoid kernel truncation.
             # We give it a fixed /30 address and NAT outbound traffic so the
             # container can reach the public internet via the host's default
             # route.  The container side picks up the matching static IP via the
@@ -670,7 +672,7 @@
 
               systemd.network.enable = true;
               systemd.network.networks."80-fiach-container" = {
-                matchConfig.Name = "vb-*";
+                matchConfig.Name = "ve-fiach-*";
                 networkConfig = {
                   Address = "10.64.0.1/30";
                   IPMasquerade = "both";
@@ -680,7 +682,7 @@
                 };
               };
 
-              networking.firewall.trustedInterfaces = [ "vb-+" ];
+              networking.firewall.trustedInterfaces = [ "ve-fiach-+" ];
             })
           ]);
         };
