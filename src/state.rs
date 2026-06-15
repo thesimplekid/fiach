@@ -214,7 +214,7 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                 Ok(metadata) => {
                     if metadata.status == "in_progress" {
                         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                        let age_secs = now - metadata.timestamp;
+                        let age_secs = now.saturating_sub(metadata.timestamp);
                         let timeout_secs = (timeout_mins + 10) * 60; // 10 min grace period
 
                         if age_secs as u64 > timeout_secs {
@@ -225,7 +225,10 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                                 timeout_secs,
                                 "Found stale in_progress lock, proceeding with review"
                             );
-                            // Fall through to commit hash check
+                            if metadata.commit_hash == current_hash {
+                                return Ok(ReviewDecision::RetryFailed);
+                            }
+                            // Fall through to commit hash check for newer commits.
                         } else {
                             tracing::debug!(repo, pr, "PR review is already in progress, skipping");
                             return Ok(ReviewDecision::Skip);
@@ -236,6 +239,24 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                             if let Some(max_failed_retries) = max_failed_retries
                                 && metadata.retry_count >= max_failed_retries
                             {
+                                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                                let age_secs = now.saturating_sub(metadata.timestamp);
+                                let retry_cooldown_secs = (timeout_mins + 10) * 60;
+
+                                if age_secs as u64 <= retry_cooldown_secs {
+                                    tracing::warn!(
+                                        repo = %repo,
+                                        pr = pr,
+                                        commit = %current_hash,
+                                        review_kind = %review_kind,
+                                        retries = metadata.retry_count,
+                                        max_retries = max_failed_retries,
+                                        retry_cooldown_secs = retry_cooldown_secs,
+                                        "Skipping previously failed review during retry cooldown"
+                                    );
+                                    return Ok(ReviewDecision::Skip);
+                                }
+
                                 tracing::warn!(
                                     repo = %repo,
                                     pr = pr,
@@ -243,9 +264,10 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                                     review_kind = %review_kind,
                                     retries = metadata.retry_count,
                                     max_retries = max_failed_retries,
-                                    "Skipping previously failed review after retry limit"
+                                    age_secs = age_secs,
+                                    retry_cooldown_secs = retry_cooldown_secs,
+                                    "Retrying previously failed review after retry cooldown"
                                 );
-                                return Ok(ReviewDecision::Skip);
                             }
                             tracing::info!(
                                 repo = %repo,
@@ -386,7 +408,9 @@ pub fn lock_for_review(
             let metadata = if let Some(value) = pr_table.get(key.as_str())? {
                 let json_str = value.value();
                 if let Ok(previous) = serde_json::from_str::<ReviewMetadata>(json_str) {
-                    if previous.commit_hash == commit_hash && previous.status == "failed" {
+                    if previous.commit_hash == commit_hash
+                        && (previous.status == "failed" || previous.status == "in_progress")
+                    {
                         ReviewMetadata {
                             retry_count: previous.retry_count.saturating_add(1),
                             ..metadata
@@ -512,11 +536,25 @@ mod tests {
     use super::*;
 
     fn metadata(commit_hash: &str, status: &str, retry_count: u32) -> ReviewMetadata {
+        metadata_with_timestamp(
+            commit_hash,
+            status,
+            retry_count,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+    }
+
+    fn metadata_with_timestamp(
+        commit_hash: &str,
+        status: &str,
+        retry_count: u32,
+        timestamp: i64,
+    ) -> ReviewMetadata {
         ReviewMetadata {
             review_kind: "security".to_string(),
             commit_hash: commit_hash.to_string(),
             model: "test".to_string(),
-            timestamp: 0,
+            timestamp,
             findings_count: 0,
             status: status.to_string(),
             severity: "none".to_string(),
@@ -591,6 +629,69 @@ mod tests {
     }
 
     #[test]
+    fn failed_review_retries_after_retry_limit_cooldown() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let repo = "owner/repo";
+        let pr = 42;
+        let commit = "abcdef";
+        let review_kind = "security";
+
+        mark_reviewed(
+            &db_path,
+            repo,
+            pr,
+            &metadata_with_timestamp(commit, "failed", 3, 0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
+            ReviewDecision::RetryFailed
+        );
+    }
+
+    #[test]
+    fn stale_in_progress_review_retries_same_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let repo = "owner/repo";
+        let pr = 42;
+        let commit = "abcdef";
+        let review_kind = "security";
+
+        mark_reviewed(
+            &db_path,
+            repo,
+            pr,
+            &metadata_with_timestamp(commit, "in_progress", 0, 0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
+            ReviewDecision::RetryFailed
+        );
+    }
+
+    #[test]
+    fn fresh_in_progress_review_skips_same_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let repo = "owner/repo";
+        let pr = 42;
+        let commit = "abcdef";
+        let review_kind = "security";
+
+        mark_reviewed(&db_path, repo, pr, &metadata(commit, "in_progress", 0)).unwrap();
+
+        assert_eq!(
+            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
+            ReviewDecision::Skip
+        );
+    }
+
+    #[test]
     fn retry_lock_increments_failed_review_retry_count() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("state.redb");
@@ -608,5 +709,31 @@ mod tests {
             .unwrap();
         assert_eq!(locked.status, "in_progress");
         assert_eq!(locked.retry_count, 1);
+    }
+
+    #[test]
+    fn retry_lock_increments_stale_in_progress_retry_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let repo = "owner/repo";
+        let pr = 42;
+        let commit = "abcdef";
+        let review_kind = "security";
+
+        mark_reviewed(
+            &db_path,
+            repo,
+            pr,
+            &metadata_with_timestamp(commit, "in_progress", 1, 0),
+        )
+        .unwrap();
+
+        assert!(lock_for_review(&db_path, repo, pr, commit, review_kind, 30).unwrap());
+
+        let locked = get_pr_review(&db_path, repo, pr, review_kind)
+            .unwrap()
+            .unwrap();
+        assert_eq!(locked.status, "in_progress");
+        assert_eq!(locked.retry_count, 2);
     }
 }
