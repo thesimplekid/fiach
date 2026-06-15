@@ -529,10 +529,6 @@
                       ${pkgs.coreutils}/bin/timeout 3 ${pkgs.bash}/bin/bash -c ":</dev/tcp/$1/$2" >/dev/null 2>&1
                     }
 
-                    resolve_host() {
-                      ${pkgs.coreutils}/bin/timeout 5 ${pkgs.glibc.bin}/bin/getent hosts "$1" >/dev/null 2>&1
-                    }
-
                     if [ "${cfg.sandbox.networkMode}" = "veth" ]; then
                       : "''${FIACH_SANDBOX_HOST_GATEWAY:?missing FIACH_SANDBOX_HOST_GATEWAY}"
                       : "''${FIACH_SANDBOX_GUEST_CIDR:?missing FIACH_SANDBOX_GUEST_CIDR}"
@@ -561,19 +557,12 @@
                     EOF
 
                     if [ "${cfg.sandbox.networkMode}" = "veth" ]; then
-                      # The host end of the veth is configured asynchronously by
-                      # systemd-networkd. Wait for outbound IP connectivity and
-                      # DNS-backed GitHub connectivity before starting the review.
-                      for _ in $(${pkgs.coreutils}/bin/seq 1 30); do
-                        if resolve_host api.github.com && check_tcp api.github.com 443; then
-                          break
-                        fi
-                        sleep 1
-                      done
-
-                      if ! resolve_host api.github.com || ! check_tcp api.github.com 443; then
-                        echo "sandbox veth network preflight failed" >&2
-                        echo "--- preflight probes ---" >&2
+                      # Do not fail early here: gh/git/provider calls produce
+                      # better errors than a generic sandbox preflight. Keep a
+                      # single best-effort probe for host-side diagnostics.
+                      if ! check_tcp api.github.com 443; then
+                        echo "sandbox veth network probe warning: api.github.com:443 was not reachable before review start" >&2
+                        echo "--- network probes ---" >&2
                         echo "dns_primary_tcp_53=$(
                           if check_tcp "$FIACH_SANDBOX_DNS_PRIMARY" 53; then
                             echo ok
@@ -588,13 +577,6 @@
                             echo failed
                           fi
                         )" >&2
-                        echo "resolve_api_github_com=$(
-                          if resolve_host api.github.com; then
-                            echo ok
-                          else
-                            echo failed
-                          fi
-                        )" >&2
                         echo "api_github_com_tcp_443=$(
                           if check_tcp api.github.com 443; then
                             echo ok
@@ -602,8 +584,6 @@
                             echo failed
                           fi
                         )" >&2
-                        echo "--- getent hosts api.github.com ---" >&2
-                        ${pkgs.glibc.bin}/bin/getent hosts api.github.com >&2 || true
                         echo "--- ip addr ---" >&2
                         ${pkgs.iproute2}/bin/ip addr show >&2 || true
                         echo "--- ip route ---" >&2
@@ -612,7 +592,6 @@
                         ${pkgs.iproute2}/bin/ip neigh show >&2 || true
                         echo "--- resolv.conf ---" >&2
                         cat /etc/resolv.conf >&2 || true
-                        exit 1
                       fi
                     fi
 
@@ -656,7 +635,6 @@
                       cacert
                       iana-etc
                       iproute2
-                      glibc.bin
                       python3
                       sandboxEntrypoint
                       sandboxSkills
