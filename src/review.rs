@@ -1659,9 +1659,7 @@ fn estimate_cost(
     Some(input_cost + output_cost)
 }
 
-/// Returns true if the error is a non-transient failure that should not be retried.
-pub fn is_fatal_error(e: &anyhow::Error) -> bool {
-    let msg = e.to_string().to_lowercase();
+fn fatal_error_message(msg: &str) -> bool {
     msg.contains("credits exhausted")
         || msg.contains("payment required")
         || msg.contains("402")
@@ -1672,6 +1670,25 @@ pub fn is_fatal_error(e: &anyhow::Error) -> bool {
         || msg.contains("401")
         || msg.contains("forbidden")
         || msg.contains("403")
+}
+
+/// Returns true for agent completion failures that should fail one review attempt,
+/// but should not stop the daemon.
+pub fn is_nonfatal_review_completion_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    if fatal_error_message(&msg) {
+        return false;
+    }
+
+    msg.contains("review finished without submitting a structured result")
+        || msg.contains("agent reached the turn limit without submitting structured findings")
+        || msg.contains("agent finished without submitting structured findings")
+}
+
+/// Returns true if the error is a non-transient failure that should not be retried.
+pub fn is_fatal_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    fatal_error_message(&msg)
 }
 
 #[cfg(test)]
@@ -1781,6 +1798,53 @@ Reviewed the PR and found no vulnerabilities.
         let status =
             parse_frontmatter_field(SAMPLE_REPORT_NO_FINDINGS, "status").unwrap_or_default();
         assert!(!(notify_str.to_lowercase() == "true" || (count > 0 && status != "none")));
+    }
+
+    #[test]
+    fn structured_result_missing_error_is_nonfatal_review_completion() {
+        let error = anyhow::anyhow!("Review finished without submitting a structured result");
+
+        assert!(is_nonfatal_review_completion_error(&error));
+        assert!(!is_fatal_error(&error));
+    }
+
+    #[test]
+    fn sandboxed_structured_result_missing_error_is_nonfatal_review_completion() {
+        let error = anyhow::anyhow!(
+            "Sandboxed review failed with status: exit status: 1; log: /var/lib/fiach/reports/runs/cashubtc_cdk_PR2104_pr-review/nspawn.log; recent output:\n\
+             2026-06-15T21:54:49.392437Z  WARN Agent reached the turn limit without submitting structured findings turns=300 max_turns=300\n\
+             Error: Review finished without submitting a structured result"
+        );
+
+        assert!(is_nonfatal_review_completion_error(&error));
+        assert!(!is_fatal_error(&error));
+    }
+
+    #[test]
+    fn fatal_provider_errors_are_not_nonfatal_review_completion() {
+        for message in [
+            "401 unauthorized",
+            "403 forbidden",
+            "quota exceeded",
+            "payment required: 402",
+        ] {
+            let error = anyhow::anyhow!(message);
+
+            assert!(!is_nonfatal_review_completion_error(&error));
+            assert!(is_fatal_error(&error));
+        }
+    }
+
+    #[test]
+    fn fatal_provider_marker_wins_over_structured_result_missing_text() {
+        let error = anyhow::anyhow!(
+            "Sandboxed review failed with status: exit status: 1; recent output:\n\
+             Error: Review finished without submitting a structured result\n\
+             provider response: quota exceeded"
+        );
+
+        assert!(!is_nonfatal_review_completion_error(&error));
+        assert!(is_fatal_error(&error));
     }
 
     #[test]

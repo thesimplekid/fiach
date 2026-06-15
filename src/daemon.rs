@@ -820,7 +820,9 @@ async fn process_daemon_job(
                     return Err(e);
                 }
                 tracing::error!("Failed to review PR {} in {}: {}", pr.number, repo, e);
-                if crate::review::is_fatal_error(&e) {
+                if !crate::review::is_nonfatal_review_completion_error(&e)
+                    && crate::review::is_fatal_error(&e)
+                {
                     tracing::error!("Fatal error encountered, stopping daemon");
                     return Err(e);
                 }
