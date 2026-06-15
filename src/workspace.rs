@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::process::Command;
 
+const PR_CONTEXT_JSON_FIELDS: &str = "baseRefOid,baseRefName,state,mergedAt";
+
 /// A prepared workspace with the PR branch checked out, ready for the agent.
 pub struct PreparedWorkspace {
     /// Path to the workspace directory (the agent's working directory).
@@ -26,15 +28,21 @@ pub struct PreparedWorkspace {
     pub pr_context: crate::reporting::PrContext,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PullRequestContext {
     #[serde(rename = "baseRefOid")]
     base_ref_oid: String,
     #[serde(rename = "baseRefName")]
     base_ref_name: String,
     state: String,
-    #[serde(default)]
-    merged: bool,
+    #[serde(default, rename = "mergedAt")]
+    merged_at: Option<String>,
+}
+
+impl PullRequestContext {
+    fn is_merged(&self) -> bool {
+        self.merged_at.is_some()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,7 +176,7 @@ pub async fn prepare(
             "view",
             &pr_number.to_string(),
             "--json",
-            "baseRefOid,baseRefName,state,merged",
+            PR_CONTEXT_JSON_FIELDS,
         ])
         .current_dir(&workspace_dir)
         .output()
@@ -183,6 +191,7 @@ pub async fn prepare(
     let pr_context: PullRequestContext =
         serde_json::from_slice(&pr_context_output.stdout).context("Failed to parse PR context")?;
     let base_commit = pr_context.base_ref_oid.clone();
+    let merged = pr_context.is_merged();
 
     let repo_context_output = Command::new("gh")
         .args(["repo", "view", repo, "--json", "defaultBranchRef"])
@@ -315,11 +324,47 @@ fi
         base_commit,
         pr_context: crate::reporting::PrContext {
             state: pr_context.state,
-            merged: pr_context.merged,
+            merged,
             base_ref_name: pr_context.base_ref_name,
             default_branch,
             base_commit: pr_context.base_ref_oid,
             head_commit: commit_hash,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_context_fields_use_gh_supported_merged_timestamp() {
+        assert!(
+            PR_CONTEXT_JSON_FIELDS
+                .split(',')
+                .any(|field| field == "mergedAt")
+        );
+        assert!(
+            !PR_CONTEXT_JSON_FIELDS
+                .split(',')
+                .any(|field| field == "merged")
+        );
+    }
+
+    #[test]
+    fn pull_request_context_derives_merged_from_merged_at() {
+        let unmerged = PullRequestContext {
+            base_ref_oid: "base".to_string(),
+            base_ref_name: "main".to_string(),
+            state: "CLOSED".to_string(),
+            merged_at: None,
+        };
+        let merged = PullRequestContext {
+            merged_at: Some("2026-06-15T17:09:12Z".to_string()),
+            ..unmerged.clone()
+        };
+
+        assert!(!unmerged.is_merged());
+        assert!(merged.is_merged());
+    }
 }

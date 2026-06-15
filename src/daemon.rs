@@ -22,6 +22,7 @@ const VETH_SUBNET_MIN_INDEX: u8 = 1;
 const VETH_SUBNET_MAX_INDEX: u8 = 254;
 const VETH_DNS_PRIMARY: &str = "1.1.1.1";
 const VETH_DNS_SECONDARY: &str = "9.9.9.9";
+const PR_LIST_JSON_FIELDS: &str = "number,headRefOid,headRefName,title";
 
 static ACTIVE_VETH_SUBNETS: OnceLock<Mutex<HashSet<u8>>> = OnceLock::new();
 
@@ -448,7 +449,7 @@ pub async fn run_daemon(
                     "--limit",
                     &params.pr_limit.to_string(),
                     "--json",
-                    "number,headRefOid,headRefName,title",
+                    PR_LIST_JSON_FIELDS,
                 ]);
 
                 let output = command.output().await;
@@ -1545,6 +1546,15 @@ mod tests {
         assert!(query.contains("repository(owner: $owner, name: $name)"));
         assert!(query.contains("pr1: pullRequest(number: 1) { authorAssociation }"));
         assert!(query.contains("pr42: pullRequest(number: 42) { authorAssociation }"));
+    }
+
+    #[test]
+    fn pr_list_json_fields_do_not_request_author_association() {
+        assert!(
+            !PR_LIST_JSON_FIELDS
+                .split(',')
+                .any(|field| field == "authorAssociation")
+        );
     }
 
     #[test]
