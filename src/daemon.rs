@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -62,7 +63,7 @@ struct PullRequest {
     head_ref_oid: String,
     #[serde(rename = "headRefName")]
     head_ref_name: String,
-    #[serde(rename = "authorAssociation")]
+    #[serde(default, rename = "authorAssociation")]
     author_association: String,
     title: String,
 }
@@ -78,6 +79,103 @@ fn is_allowed_author_association(association: &str, allowed: &[String]) -> bool 
     allowed
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(association))
+}
+
+fn split_repo_name(repo: &str) -> Result<(&str, &str)> {
+    match repo.split_once('/') {
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() => Ok((owner, name)),
+        _ => anyhow::bail!("Repository must be in owner/name form: {repo}"),
+    }
+}
+
+fn build_author_associations_query(numbers: &[u64]) -> String {
+    let mut query = String::from(
+        "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {",
+    );
+
+    for number in numbers {
+        query.push_str(&format!(
+            " pr{number}: pullRequest(number: {number}) {{ authorAssociation }}"
+        ));
+    }
+
+    query.push_str(" } }");
+    query
+}
+
+#[derive(Deserialize)]
+struct AuthorAssociationsResponse {
+    data: AuthorAssociationsData,
+}
+
+#[derive(Deserialize)]
+struct AuthorAssociationsData {
+    repository: HashMap<String, Option<AuthorAssociationPullRequest>>,
+}
+
+#[derive(Deserialize)]
+struct AuthorAssociationPullRequest {
+    #[serde(rename = "authorAssociation")]
+    author_association: String,
+}
+
+async fn fetch_author_associations(repo: &str, numbers: &[u64]) -> Result<HashMap<u64, String>> {
+    let (owner, name) = split_repo_name(repo)?;
+    let mut associations = HashMap::new();
+
+    for chunk in numbers.chunks(50) {
+        let query = build_author_associations_query(chunk);
+        let output = Command::new("gh")
+            .args(["api", "graphql", "-f", &format!("owner={owner}")])
+            .args(["-f", &format!("name={name}")])
+            .args(["-f", &format!("query={query}")])
+            .output()
+            .await
+            .context("Failed to run gh api graphql")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api graphql failed for {repo}: {stderr}");
+        }
+
+        let response: AuthorAssociationsResponse = serde_json::from_slice(&output.stdout)
+            .context("Failed to parse author association GraphQL response")?;
+
+        for (alias, pr) in response.data.repository {
+            let Some(number) = alias
+                .strip_prefix("pr")
+                .and_then(|number| number.parse::<u64>().ok())
+            else {
+                continue;
+            };
+
+            if let Some(pr) = pr {
+                associations.insert(number, pr.author_association);
+            }
+        }
+    }
+
+    Ok(associations)
+}
+
+async fn populate_author_associations(repo: &str, prs: &mut [PullRequest]) -> Result<()> {
+    let numbers: Vec<_> = prs.iter().map(|pr| pr.number).collect();
+    let associations = fetch_author_associations(repo, &numbers).await?;
+
+    for pr in prs {
+        if let Some(association) = associations.get(&pr.number) {
+            pr.author_association.clone_from(association);
+        } else {
+            tracing::warn!(
+                repo = %repo,
+                pr = pr.number,
+                "Author association was missing from GraphQL response"
+            );
+            pr.author_association = "UNKNOWN".to_string();
+        }
+    }
+
+    Ok(())
 }
 
 fn worker_concurrency(max_workers: usize, job_count: usize) -> usize {
@@ -236,14 +334,14 @@ pub async fn run_daemon(
                     "--limit",
                     &params.pr_limit.to_string(),
                     "--json",
-                    "number,headRefOid,headRefName,authorAssociation,title",
+                    "number,headRefOid,headRefName,title",
                 ]);
 
                 let output = command.output().await;
 
                 match output {
                     Ok(out) if out.status.success() => {
-                        let prs: Vec<PullRequest> = match serde_json::from_slice(&out.stdout) {
+                        let mut prs: Vec<PullRequest> = match serde_json::from_slice(&out.stdout) {
                             Ok(p) => p,
                             Err(e) => {
                                 tracing::error!(
@@ -255,6 +353,16 @@ pub async fn run_daemon(
                                 continue;
                             }
                         };
+
+                        if let Err(e) = populate_author_associations(repo, &mut prs).await {
+                            tracing::error!(
+                                repo = %repo,
+                                state = %state,
+                                error = %e,
+                                "Failed to fetch PR author associations"
+                            );
+                            continue;
+                        }
 
                         tracing::info!("Found {} recent {} PRs for {}", prs.len(), state, repo);
 
@@ -639,7 +747,7 @@ async fn trigger_manual_review(
             "--repo",
             &repo,
             "--json",
-            "headRefOid,headRefName,authorAssociation,title",
+            "headRefOid,headRefName,title",
         ])
         .output()
         .await?;
@@ -655,13 +763,15 @@ async fn trigger_manual_review(
         head_ref_oid: String,
         #[serde(rename = "headRefName")]
         head_ref_name: String,
-        #[serde(rename = "authorAssociation")]
-        author_association: String,
         title: String,
     }
 
     let pr_details: PrDetails =
         serde_json::from_slice(&output.stdout).context("Failed to parse PR details")?;
+    let mut associations = fetch_author_associations(&repo, &[pr_number]).await?;
+    let author_association = associations
+        .remove(&pr_number)
+        .with_context(|| format!("Failed to fetch author association for PR #{pr_number}"))?;
 
     let selected_personas = if let Some(filter) = persona_filter {
         let requested = filter.trim();
@@ -688,7 +798,7 @@ async fn trigger_manual_review(
             number: pr_number,
             head_ref_oid: pr_details.head_ref_oid,
             head_ref_name: pr_details.head_ref_name,
-            author_association: pr_details.author_association,
+            author_association,
             title: pr_details.title,
         }],
         params.personas.len() > 1,
@@ -1142,6 +1252,23 @@ mod tests {
         assert!(is_allowed_author_association("collaborator", &allowed));
         assert!(is_allowed_author_association("MEMBER", &allowed));
         assert!(!is_allowed_author_association("FIRST_TIMER", &allowed));
+    }
+
+    #[test]
+    fn split_repo_name_requires_owner_and_name() {
+        assert_eq!(split_repo_name("owner/repo").unwrap(), ("owner", "repo"));
+        assert!(split_repo_name("owner").is_err());
+        assert!(split_repo_name("/repo").is_err());
+        assert!(split_repo_name("owner/").is_err());
+    }
+
+    #[test]
+    fn author_associations_query_uses_pr_aliases() {
+        let query = build_author_associations_query(&[1, 42]);
+
+        assert!(query.contains("repository(owner: $owner, name: $name)"));
+        assert!(query.contains("pr1: pullRequest(number: 1) { authorAssociation }"));
+        assert!(query.contains("pr42: pullRequest(number: 42) { authorAssociation }"));
     }
 
     #[test]
