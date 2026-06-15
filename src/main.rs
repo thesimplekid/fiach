@@ -373,6 +373,7 @@ async fn main() -> Result<()> {
             EnvFilter::new("fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn")
         }))
         .with_target(false)
+        .with_ansi(false)
         .init();
 
     let cli = Cli::parse();
