@@ -351,13 +351,13 @@ When using `bridge`, the host must create and maintain `br-nspawn`, addressing, 
 
 - `sandbox.networkMode = "host"` is the current default because it is the most reliable option for service deployments.
 - `sandbox.networkMode = "bridge"` attaches each sandbox to an existing `br-nspawn` bridge.
-- `sandbox.networkMode = "veth"` blocks access to host-local services but still allows outbound internet access.
+- `sandbox.networkMode = "veth"` gives each sandbox its own `10.64.<index>.0/30` veth subnet, blocks access to host-local services, and still allows outbound internet access through host NAT.
 - `sandbox.networkMode = "private"` disables all network access, which also prevents GitHub and OpenRouter access.
 - Restricting outbound traffic to specific destinations requires host-side enforcement such as `nftables`/`iptables` rules on the `ve-*` interfaces, or a proxy-based egress policy.
 - IP allowlists can be managed in NixOS firewall configuration, but they are brittle for CDN-backed services.
 - If you need domain-level guarantees, use a dedicated proxy or egress gateway; `systemd-nspawn` alone is not sufficient.
 
-`veth` remains available and is the intended tighter-isolation mode, but `host` is the documented default until the `veth` path is hardened further.
+`veth` supports concurrent workers by allocating a unique `/30` per active sandbox. Because the allocator uses the `10.64.1.0/30` through `10.64.254.0/30` pool, NixOS deployments using `veth` must set `maxWorkers` between `1` and `254`; `maxWorkers = 0` is rejected for this mode.
 
 ### Sandbox Write Scope
 

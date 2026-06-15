@@ -140,6 +140,7 @@
                       repos = [ "owner/repo" ];
                       environmentFile = envFile;
                       port = 4321;
+                      maxWorkers = 2;
                       skipPrs = [ "123" "owner/repo#456" ];
                       drafts = true;
                       timeoutMins = 45;
@@ -149,6 +150,10 @@
                       inputPricePerM = 1.25;
                       outputPricePerM = 5.75;
                       withSkill = "cashu-security";
+                      sandbox = {
+                        enable = true;
+                        networkMode = "veth";
+                      };
                     };
                   }
                 ];
@@ -159,16 +164,29 @@
                   match = builtins.match ".*--config ([^ ]+) daemon.*" execStart;
                 in
                 if match == null then throw "Could not extract fiach config path from ExecStart" else builtins.head match;
+              fiachNetwork = testSystem.config.systemd.network.networks."80-fiach-container";
+              fiachNetworkName = fiachNetwork.matchConfig.Name;
+              fiachNetworkAddress = fiachNetwork.networkConfig.Address or "";
+              fiachServicePath = lib.concatMapStringsSep " " toString testSystem.config.systemd.services.fiach.path;
             in
             pkgs.runCommand "fiach-nixos-module-test" { } ''
               set -eu
 
               exec_start=${lib.escapeShellArg execStart}
               config_path=${lib.escapeShellArg configPath}
+              fiach_network_name=${lib.escapeShellArg fiachNetworkName}
+              fiach_network_address=${lib.escapeShellArg fiachNetworkAddress}
+              fiach_service_path=${lib.escapeShellArg fiachServicePath}
 
               printf '%s' "$exec_start" | grep -F -- '--port 4321' >/dev/null
+              printf '%s' "$fiach_network_name" | grep -F 've-fiach-*' >/dev/null
+              test -z "$fiach_network_address"
+              printf '%s' "$fiach_service_path" | grep -F 'iproute2' >/dev/null
 
               grep -F 'port = 4321' "$config_path" >/dev/null
+              grep -F 'max_workers = 2' "$config_path" >/dev/null
+              grep -F 'sandbox_network = "veth"' "$config_path" >/dev/null
+              grep -F 'sandbox_rootfs = ' "$config_path" >/dev/null
               grep -F 'skip_prs = [' "$config_path" >/dev/null
               grep -F '"123"' "$config_path" >/dev/null
               grep -F '"owner/repo#456"' "$config_path" >/dev/null
@@ -485,6 +503,12 @@
                 home = cfg.dataDir;
               };
               users.groups.fiach = lib.mkIf (!cfg.sandbox.enable) { };
+              assertions = [
+                {
+                  assertion = !(cfg.sandbox.enable && cfg.sandbox.networkMode == "veth" && (cfg.maxWorkers == 0 || cfg.maxWorkers > 254));
+                  message = "services.fiach.sandbox.networkMode = \"veth\" requires maxWorkers between 1 and 254 so each concurrent sandbox can receive a unique /30 subnet.";
+                }
+              ];
 
               systemd.services.fiach =
                 let
@@ -493,16 +517,22 @@
                   # Inside the sandboxed container we have a private network
                   # namespace.  systemd-nspawn names the container side of the
                   # veth pair "host0".  This script gives host0 a static IP,
-                  # adds a default route via the host (10.64.0.1), and writes
-                  # a resolv.conf pointing at public DNS resolvers.
+                  # adds a default route via the host, and writes a resolv.conf
+                  # pointing at public DNS resolvers.
                   sandboxEntrypoint = pkgs.writeShellScriptBin "fiach-sandbox-entrypoint" ''
                     set -e
+
+                    : "''${FIACH_SANDBOX_DNS_PRIMARY:=1.1.1.1}"
+                    : "''${FIACH_SANDBOX_DNS_SECONDARY:=9.9.9.9}"
 
                     check_tcp() {
                       ${pkgs.coreutils}/bin/timeout 3 ${pkgs.bash}/bin/bash -c ":</dev/tcp/$1/$2" >/dev/null 2>&1
                     }
 
                     if [ "${cfg.sandbox.networkMode}" = "veth" ]; then
+                      : "''${FIACH_SANDBOX_HOST_GATEWAY:?missing FIACH_SANDBOX_HOST_GATEWAY}"
+                      : "''${FIACH_SANDBOX_GUEST_CIDR:?missing FIACH_SANDBOX_GUEST_CIDR}"
+
                       # Bring up loopback and the container side of the veth pair.
                       ${pkgs.iproute2}/bin/ip link set lo up || true
 
@@ -515,15 +545,15 @@
                       done
 
                       ${pkgs.iproute2}/bin/ip link set host0 up
-                      ${pkgs.iproute2}/bin/ip addr add 10.64.0.2/30 dev host0
-                      ${pkgs.iproute2}/bin/ip route add default via 10.64.0.1
+                      ${pkgs.iproute2}/bin/ip addr replace "$FIACH_SANDBOX_GUEST_CIDR" dev host0
+                      ${pkgs.iproute2}/bin/ip route replace default via "$FIACH_SANDBOX_HOST_GATEWAY"
                     fi
 
                     # Static DNS so we don't depend on the host's resolv.conf.
                     # Cloudflare primary, Quad9 fallback.
                     cat > /etc/resolv.conf <<EOF
-                    nameserver 1.1.1.1
-                    nameserver 9.9.9.9
+                    nameserver $FIACH_SANDBOX_DNS_PRIMARY
+                    nameserver $FIACH_SANDBOX_DNS_SECONDARY
                     EOF
 
                     if [ "${cfg.sandbox.networkMode}" = "veth" ]; then
@@ -531,13 +561,13 @@
                       # systemd-networkd. Wait for outbound IP connectivity and
                       # DNS-backed GitHub connectivity before starting the review.
                       for _ in $(${pkgs.coreutils}/bin/seq 1 30); do
-                        if check_tcp 1.1.1.1 53 && check_tcp api.github.com 443; then
+                        if check_tcp "$FIACH_SANDBOX_DNS_PRIMARY" 53 && check_tcp api.github.com 443; then
                           break
                         fi
                         sleep 1
                       done
 
-                      if ! check_tcp 1.1.1.1 53 || ! check_tcp api.github.com 443; then
+                      if ! check_tcp "$FIACH_SANDBOX_DNS_PRIMARY" 53 || ! check_tcp api.github.com 443; then
                         echo "sandbox veth network preflight failed" >&2
                         echo "--- ip addr ---" >&2
                         ${pkgs.iproute2}/bin/ip addr show >&2 || true
@@ -660,7 +690,7 @@
                   wants = [ "network-online.target" ];
                   wantedBy = [ "multi-user.target" ];
 
-                  path = with pkgs; [ git gh systemd ];
+                  path = with pkgs; [ git gh iproute2 systemd ];
                   serviceConfig = {
                     ExecStart = "${fiachPkg}/bin/fiach --config ${configFile} daemon --port ${toString cfg.port}";
                     EnvironmentFile = cfg.environmentFile;
@@ -687,10 +717,8 @@
             # systemd-nspawn names the host end of a plain --network-veth pair
             # "ve-<machine>". Fiach uses short machine names with the "fiach-"
             # prefix so these interface names avoid kernel truncation.
-            # We give it a fixed /30 address and NAT outbound traffic so the
-            # container can reach the public internet via the host's default
-            # route.  The container side picks up the matching static IP via the
-            # entrypoint script defined above.
+            # Fiach assigns each host link a per-sandbox /30 address at runtime
+            # and networkd provides NAT for outbound traffic.
             (lib.mkIf (cfg.sandbox.enable && cfg.sandbox.networkMode == "veth") {
               boot.kernel.sysctl = {
                 "net.ipv4.ip_forward" = lib.mkDefault 1;
@@ -701,8 +729,8 @@
               systemd.network.networks."80-fiach-container" = {
                 matchConfig.Name = "ve-fiach-*";
                 networkConfig = {
-                  Address = "10.64.0.1/30";
                   IPMasquerade = "both";
+                  KeepConfiguration = "static";
                   LinkLocalAddressing = "no";
                   LLDP = "no";
                   EmitLLDP = "no";

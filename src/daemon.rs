@@ -1,8 +1,9 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -15,6 +16,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::disclose::DiscloseConfig;
 use crate::review::{CompletedReview, ReviewExecution, ReviewParams, run_review};
+
+const VETH_SUBNET_BASE_OCTETS: (u8, u8) = (10, 64);
+const VETH_SUBNET_MIN_INDEX: u8 = 1;
+const VETH_SUBNET_MAX_INDEX: u8 = 254;
+const VETH_DNS_PRIMARY: &str = "1.1.1.1";
+const VETH_DNS_SECONDARY: &str = "9.9.9.9";
+
+static ACTIVE_VETH_SUBNETS: OnceLock<Mutex<HashSet<u8>>> = OnceLock::new();
 
 pub enum DaemonMessage {
     TriggerReview {
@@ -190,6 +199,107 @@ fn worker_concurrency(max_workers: usize, job_count: usize) -> usize {
     }
 }
 
+fn is_veth_network(params: &DaemonParams) -> bool {
+    params.sandbox_rootfs.is_some() && params.sandbox_network.as_deref() == Some("veth")
+}
+
+fn validate_sandbox_network_capacity(params: &DaemonParams) -> Result<()> {
+    if is_veth_network(params) {
+        validate_veth_worker_capacity(params.max_workers)?;
+    }
+
+    Ok(())
+}
+
+fn validate_veth_worker_capacity(max_workers: usize) -> Result<()> {
+    if max_workers == 0 || max_workers > usize::from(VETH_SUBNET_MAX_INDEX) {
+        anyhow::bail!(
+            "sandbox.networkMode = \"veth\" requires max_workers between 1 and {}; got {}",
+            VETH_SUBNET_MAX_INDEX,
+            max_workers
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SandboxVethReservation {
+    index: u8,
+}
+
+impl SandboxVethReservation {
+    fn reserve(machine_name: &str) -> Result<Self> {
+        let active_subnets = ACTIVE_VETH_SUBNETS.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut active_subnets = active_subnets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sandbox veth subnet allocator mutex was poisoned"))?;
+
+        Ok(Self {
+            index: reserve_sandbox_veth_index(machine_name, &mut active_subnets)?,
+        })
+    }
+
+    fn host_gateway(&self) -> String {
+        format!(
+            "{}.{}.{}.1",
+            VETH_SUBNET_BASE_OCTETS.0, VETH_SUBNET_BASE_OCTETS.1, self.index
+        )
+    }
+
+    fn host_cidr(&self) -> String {
+        format!("{}/30", self.host_gateway())
+    }
+
+    fn guest_cidr(&self) -> String {
+        format!(
+            "{}.{}.{}.2/30",
+            VETH_SUBNET_BASE_OCTETS.0, VETH_SUBNET_BASE_OCTETS.1, self.index
+        )
+    }
+}
+
+impl Drop for SandboxVethReservation {
+    fn drop(&mut self) {
+        if let Some(active_subnets) = ACTIVE_VETH_SUBNETS.get()
+            && let Ok(mut active_subnets) = active_subnets.lock()
+        {
+            active_subnets.remove(&self.index);
+        }
+    }
+}
+
+fn sandbox_veth_start_index(machine_name: &str) -> u8 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    machine_name.hash(&mut hasher);
+    VETH_SUBNET_MIN_INDEX
+        + (hasher.finish() % u64::from(VETH_SUBNET_MAX_INDEX - VETH_SUBNET_MIN_INDEX + 1)) as u8
+}
+
+fn reserve_sandbox_veth_index(machine_name: &str, active_subnets: &mut HashSet<u8>) -> Result<u8> {
+    let start = sandbox_veth_start_index(machine_name);
+
+    for offset in 0..=u16::from(VETH_SUBNET_MAX_INDEX - VETH_SUBNET_MIN_INDEX) {
+        let index = VETH_SUBNET_MIN_INDEX
+            + ((u16::from(start - VETH_SUBNET_MIN_INDEX) + offset)
+                % u16::from(VETH_SUBNET_MAX_INDEX - VETH_SUBNET_MIN_INDEX + 1)) as u8;
+
+        if active_subnets.insert(index) {
+            return Ok(index);
+        }
+    }
+
+    anyhow::bail!(
+        "No sandbox veth subnets are available in 10.64.{}.0/30 through 10.64.{}.0/30",
+        VETH_SUBNET_MIN_INDEX,
+        VETH_SUBNET_MAX_INDEX
+    );
+}
+
+fn sandbox_host_interface_name(machine_name: &str) -> String {
+    format!("ve-{machine_name}")
+}
+
 fn review_jobs(
     personas: &[crate::persona::PersonaSource],
     prs: &[PullRequest],
@@ -286,6 +396,8 @@ pub async fn run_daemon(
     if repo_list.is_empty() {
         anyhow::bail!("No repositories specified to monitor");
     }
+
+    validate_sandbox_network_capacity(&params)?;
 
     // Ensure gh is authenticated
     let gh_auth = Command::new("gh")
@@ -815,6 +927,53 @@ async fn trigger_manual_review(
     Ok(())
 }
 
+async fn wait_for_link(interface: &str) -> Result<()> {
+    for _ in 1..=100 {
+        let output = Command::new("ip")
+            .args(["link", "show", "dev", interface])
+            .output()
+            .await
+            .with_context(|| format!("Failed to inspect sandbox veth interface {interface}"))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    anyhow::bail!("Timed out waiting for sandbox veth interface {interface}");
+}
+
+async fn run_ip_command(args: &[&str]) -> Result<()> {
+    let output = Command::new("ip")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("Failed to run ip {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ip {} failed: {}", args.join(" "), stderr.trim());
+    }
+
+    Ok(())
+}
+
+async fn configure_sandbox_veth_host(
+    machine_name: &str,
+    network: &SandboxVethReservation,
+) -> Result<()> {
+    let interface = sandbox_host_interface_name(machine_name);
+    let host_cidr = network.host_cidr();
+
+    wait_for_link(&interface).await?;
+    run_ip_command(&["addr", "replace", &host_cidr, "dev", &interface]).await?;
+    run_ip_command(&["link", "set", "dev", &interface, "up"]).await?;
+
+    Ok(())
+}
+
 async fn run_sandboxed_review(
     params: &DaemonParams,
     review_params: &ReviewParams,
@@ -881,6 +1040,11 @@ async fn run_sandboxed_review(
         review_params.pr_number,
         &review_params.review_kind,
     );
+    let veth_network = if params.sandbox_network.as_deref() == Some("veth") {
+        Some(SandboxVethReservation::reserve(&machine_name)?)
+    } else {
+        None
+    };
     cmd.arg(format!("--machine={machine_name}"));
     cmd.arg(format!("--directory={}", runtime_rootfs.display()));
     // --private-users=no: DynamicUser provides a transient UID without subuid/subgid
@@ -902,6 +1066,25 @@ async fn run_sandboxed_review(
         run_dir.display(),
         "/sandbox-output"
     ));
+
+    if let Some(network) = &veth_network {
+        cmd.arg(format!(
+            "--setenv=FIACH_SANDBOX_HOST_GATEWAY={}",
+            network.host_gateway()
+        ));
+        cmd.arg(format!(
+            "--setenv=FIACH_SANDBOX_GUEST_CIDR={}",
+            network.guest_cidr()
+        ));
+        cmd.arg(format!(
+            "--setenv=FIACH_SANDBOX_DNS_PRIMARY={}",
+            VETH_DNS_PRIMARY
+        ));
+        cmd.arg(format!(
+            "--setenv=FIACH_SANDBOX_DNS_SECONDARY={}",
+            VETH_DNS_SECONDARY
+        ));
+    }
 
     // Bind mount /nix/store read-only so the Nix-built rootfs symlinks resolve correctly
     let nix_store = std::path::Path::new("/nix/store");
@@ -1026,6 +1209,7 @@ async fn run_sandboxed_review(
         pr = %review_params.pr_number,
         rootfs = %runtime_rootfs.display(),
         machine = %machine_name,
+        veth_subnet = veth_network.as_ref().map(|network| network.index),
         log = %nspawn_log.display(),
         network = ?params.sandbox_network,
         "Launching sandboxed review"
@@ -1061,6 +1245,18 @@ async fn run_sandboxed_review(
     cmd.stderr(Stdio::from(log_file));
 
     let mut child = cmd.spawn().context("Failed to spawn systemd-nspawn")?;
+
+    if let Some(network) = &veth_network
+        && let Err(error) = configure_sandbox_veth_host(&machine_name, network).await
+    {
+        let _ = child.kill().await;
+        anyhow::bail!(
+            "Failed to configure sandbox veth host link for machine {} using subnet 10.64.{}.0/30: {}",
+            machine_name,
+            network.index,
+            error
+        );
+    }
 
     let timeout_duration = std::time::Duration::from_secs(review_params.timeout_mins * 60 + 300);
 
@@ -1380,6 +1576,59 @@ mod tests {
             sandbox_machine_name("owner/repo", 42, "security", 123),
             sandbox_machine_name("owner/repo", 42, "security", 124)
         );
+    }
+
+    #[test]
+    fn sandbox_veth_start_index_is_stable_and_in_pool() {
+        let first = sandbox_veth_start_index("fiach-test01");
+        let second = sandbox_veth_start_index("fiach-test01");
+
+        assert_eq!(first, second);
+        assert!((VETH_SUBNET_MIN_INDEX..=VETH_SUBNET_MAX_INDEX).contains(&first));
+    }
+
+    #[test]
+    fn sandbox_veth_index_probes_to_avoid_active_collision() {
+        let machine_name = "fiach-collide";
+        let first = sandbox_veth_start_index(machine_name);
+        let mut active = HashSet::from([first]);
+
+        let second = reserve_sandbox_veth_index(machine_name, &mut active).unwrap();
+
+        assert_ne!(first, second);
+        assert!(active.contains(&first));
+        assert!(active.contains(&second));
+        assert!((VETH_SUBNET_MIN_INDEX..=VETH_SUBNET_MAX_INDEX).contains(&second));
+    }
+
+    #[test]
+    fn sandbox_veth_reservation_formats_host_and_guest_addresses() {
+        let reservation = SandboxVethReservation { index: 42 };
+
+        assert_eq!(reservation.host_gateway(), "10.64.42.1");
+        assert_eq!(reservation.host_cidr(), "10.64.42.1/30");
+        assert_eq!(reservation.guest_cidr(), "10.64.42.2/30");
+    }
+
+    #[test]
+    fn sandbox_veth_index_reports_pool_exhaustion() {
+        let mut active: HashSet<u8> = (VETH_SUBNET_MIN_INDEX..=VETH_SUBNET_MAX_INDEX).collect();
+
+        let error = reserve_sandbox_veth_index("fiach-full", &mut active).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("No sandbox veth subnets are available")
+        );
+    }
+
+    #[test]
+    fn sandbox_veth_worker_capacity_rejects_unbounded_or_too_large() {
+        assert!(validate_veth_worker_capacity(1).is_ok());
+        assert!(validate_veth_worker_capacity(254).is_ok());
+        assert!(validate_veth_worker_capacity(0).is_err());
+        assert!(validate_veth_worker_capacity(255).is_err());
     }
 
     #[test]
