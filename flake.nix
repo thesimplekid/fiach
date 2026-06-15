@@ -344,7 +344,7 @@
             maxRetries = lib.mkOption {
               type = lib.types.int;
               default = 3;
-              description = "Maximum number of retries for LLM provider failures.";
+              description = "Maximum number of retries for LLM provider failures and failed review attempts.";
             };
 
             retryDelaySecs = lib.mkOption {
@@ -498,12 +498,16 @@
                   sandboxEntrypoint = pkgs.writeShellScriptBin "fiach-sandbox-entrypoint" ''
                     set -e
 
+                    check_tcp() {
+                      ${pkgs.coreutils}/bin/timeout 3 ${pkgs.bash}/bin/bash -c ":</dev/tcp/$1/$2" >/dev/null 2>&1
+                    }
+
                     if [ "${cfg.sandbox.networkMode}" = "veth" ]; then
                       # Bring up loopback and the container side of the veth pair.
                       ${pkgs.iproute2}/bin/ip link set lo up || true
 
                       # host0 may take a moment to appear after the container starts.
-                      for _ in 1 2 3 4 5 6 7 8 9 10; do
+                      for _ in $(${pkgs.coreutils}/bin/seq 1 50); do
                         if ${pkgs.iproute2}/bin/ip link show host0 >/dev/null 2>&1; then
                           break
                         fi
@@ -521,6 +525,29 @@
                     nameserver 1.1.1.1
                     nameserver 9.9.9.9
                     EOF
+
+                    if [ "${cfg.sandbox.networkMode}" = "veth" ]; then
+                      # The host end of the veth is configured asynchronously by
+                      # systemd-networkd. Wait for outbound IP connectivity and
+                      # DNS-backed GitHub connectivity before starting the review.
+                      for _ in $(${pkgs.coreutils}/bin/seq 1 30); do
+                        if check_tcp 1.1.1.1 53 && check_tcp api.github.com 443; then
+                          break
+                        fi
+                        sleep 1
+                      done
+
+                      if ! check_tcp 1.1.1.1 53 || ! check_tcp api.github.com 443; then
+                        echo "sandbox veth network preflight failed" >&2
+                        echo "--- ip addr ---" >&2
+                        ${pkgs.iproute2}/bin/ip addr show >&2 || true
+                        echo "--- ip route ---" >&2
+                        ${pkgs.iproute2}/bin/ip route show >&2 || true
+                        echo "--- resolv.conf ---" >&2
+                        cat /etc/resolv.conf >&2 || true
+                        exit 1
+                      fi
+                    fi
 
                     mkdir -p /tmp/.local/state/goose/logs
                     mkdir -p /root/.local/state/goose/logs

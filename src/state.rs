@@ -51,6 +51,17 @@ pub enum ReviewDecision {
     RetryFailed,
 }
 
+struct ShouldReviewInput<'a> {
+    db_path: &'a Path,
+    repo: &'a str,
+    pr: u64,
+    current_hash: &'a str,
+    review_kind: &'a str,
+    force: bool,
+    timeout_mins: u64,
+    max_failed_retries: Option<u32>,
+}
+
 fn pr_state_key(repo: &str, pr: u64, review_kind: &str) -> String {
     if review_kind == DEFAULT_REVIEW_KIND {
         format!("{}_{}", repo, pr)
@@ -125,6 +136,52 @@ pub fn should_review(
     force: bool,
     timeout_mins: u64,
 ) -> Result<ReviewDecision> {
+    should_review_inner(ShouldReviewInput {
+        db_path,
+        repo,
+        pr,
+        current_hash,
+        review_kind,
+        force,
+        timeout_mins,
+        max_failed_retries: None,
+    })
+}
+
+/// Checks if a PR needs review, bounding same-commit failed-review retries.
+pub fn should_review_with_retry_limit(
+    db_path: &Path,
+    repo: &str,
+    pr: u64,
+    current_hash: &str,
+    review_kind: &str,
+    timeout_mins: u64,
+    max_failed_retries: u32,
+) -> Result<ReviewDecision> {
+    should_review_inner(ShouldReviewInput {
+        db_path,
+        repo,
+        pr,
+        current_hash,
+        review_kind,
+        force: false,
+        timeout_mins,
+        max_failed_retries: Some(max_failed_retries),
+    })
+}
+
+fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
+    let ShouldReviewInput {
+        db_path,
+        repo,
+        pr,
+        current_hash,
+        review_kind,
+        force,
+        timeout_mins,
+        max_failed_retries,
+    } = input;
+
     if force {
         tracing::debug!("Force flag set, bypassing state check");
         return Ok(ReviewDecision::FirstReview);
@@ -176,8 +233,25 @@ pub fn should_review(
                     }
                     if metadata.commit_hash == current_hash {
                         if metadata.status == "failed" {
+                            if let Some(max_failed_retries) = max_failed_retries
+                                && metadata.retry_count >= max_failed_retries
+                            {
+                                tracing::warn!(
+                                    repo = %repo,
+                                    pr = pr,
+                                    commit = %current_hash,
+                                    review_kind = %review_kind,
+                                    retries = metadata.retry_count,
+                                    max_retries = max_failed_retries,
+                                    "Skipping previously failed review after retry limit"
+                                );
+                                return Ok(ReviewDecision::Skip);
+                            }
                             tracing::info!(
+                                repo = %repo,
+                                pr = pr,
                                 commit = %current_hash,
+                                review_kind = %review_kind,
                                 retries = metadata.retry_count,
                                 "Retrying previously failed review at the same commit"
                             );
@@ -437,6 +511,28 @@ pub fn list_reviews(db_path: &Path) -> Result<Vec<(String, u64, ReviewMetadata)>
 mod tests {
     use super::*;
 
+    fn metadata(commit_hash: &str, status: &str, retry_count: u32) -> ReviewMetadata {
+        ReviewMetadata {
+            review_kind: "security".to_string(),
+            commit_hash: commit_hash.to_string(),
+            model: "test".to_string(),
+            timestamp: 0,
+            findings_count: 0,
+            status: status.to_string(),
+            severity: "none".to_string(),
+            pr_classification: "none".to_string(),
+            duration_secs: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cost_usd: Some(0.0),
+            report_url: None,
+            is_rereview: false,
+            time_reviewed: None,
+            retry_count,
+        }
+    }
+
     #[test]
     fn default_review_kind_uses_legacy_keys() {
         assert_eq!(
@@ -471,5 +567,46 @@ mod tests {
             parse_pr_state_key("owner/repo|42|security"),
             Some(("owner/repo".to_string(), 42))
         );
+    }
+
+    #[test]
+    fn failed_review_retries_until_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let repo = "owner/repo";
+        let pr = 42;
+        let commit = "abcdef";
+        let review_kind = "security";
+
+        mark_reviewed(&db_path, repo, pr, &metadata(commit, "failed", 2)).unwrap();
+
+        assert_eq!(
+            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
+            ReviewDecision::RetryFailed
+        );
+        assert_eq!(
+            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 2).unwrap(),
+            ReviewDecision::Skip
+        );
+    }
+
+    #[test]
+    fn retry_lock_increments_failed_review_retry_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let repo = "owner/repo";
+        let pr = 42;
+        let commit = "abcdef";
+        let review_kind = "security";
+
+        mark_reviewed(&db_path, repo, pr, &metadata(commit, "failed", 0)).unwrap();
+
+        assert!(lock_for_review(&db_path, repo, pr, commit, review_kind, 30).unwrap());
+
+        let locked = get_pr_review(&db_path, repo, pr, review_kind)
+            .unwrap()
+            .unwrap();
+        assert_eq!(locked.status, "in_progress");
+        assert_eq!(locked.retry_count, 1);
     }
 }

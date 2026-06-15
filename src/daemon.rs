@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -550,27 +551,31 @@ async fn process_daemon_job(
         return Ok(PrProcessStatus::Skipped);
     }
 
-    match crate::state::should_review(
+    let review_decision = crate::state::should_review_with_retry_limit(
         &params.db_path,
         repo,
         pr.number,
         &pr.head_ref_oid,
         &job.review_kind,
-        false,
         params.timeout_mins,
-    ) {
-        Ok(crate::state::ReviewDecision::FirstReview)
-        | Ok(crate::state::ReviewDecision::ReReview)
-        | Ok(crate::state::ReviewDecision::RetryFailed) => {
-            let decision = crate::state::should_review(
-                &params.db_path,
-                repo,
-                pr.number,
-                &pr.head_ref_oid,
-                &job.review_kind,
-                false,
-                params.timeout_mins,
-            )?;
+        params.max_retries,
+    );
+
+    match review_decision {
+        Ok(
+            decision @ (crate::state::ReviewDecision::FirstReview
+            | crate::state::ReviewDecision::ReReview
+            | crate::state::ReviewDecision::RetryFailed),
+        ) => {
+            let retry_count_for_attempt = if decision == crate::state::ReviewDecision::RetryFailed {
+                crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.retry_count.saturating_add(1))
+                    .unwrap_or(1)
+            } else {
+                0
+            };
             let is_rereview = matches!(decision, crate::state::ReviewDecision::ReReview);
 
             match crate::state::lock_for_review(
@@ -673,13 +678,6 @@ async fn process_daemon_job(
             };
 
             if let Err(e) = review_result {
-                let retry_count =
-                    crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
-                        .ok()
-                        .flatten()
-                        .map(|m| m.retry_count)
-                        .unwrap_or(0);
-
                 let meta = crate::state::ReviewMetadata {
                     review_kind: job.review_kind.clone(),
                     commit_hash: pr.head_ref_oid.clone(),
@@ -701,7 +699,7 @@ async fn process_daemon_job(
                             .format(&time::format_description::well_known::Rfc3339)
                             .unwrap_or_default(),
                     ),
-                    retry_count,
+                    retry_count: retry_count_for_attempt,
                 };
                 let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);
 
@@ -1071,7 +1069,14 @@ async fn run_sandboxed_review(
             match status_res {
                 Ok(Ok(status)) => {
                     if !status.success() {
-                        anyhow::bail!("Sandboxed review failed with status: {}", status);
+                        let log_tail = tail_file(&nspawn_log, 40)
+                            .unwrap_or_else(|e| format!("failed to read sandbox log: {e}"));
+                        anyhow::bail!(
+                            "Sandboxed review failed with status: {}; log: {}; recent output:\n{}",
+                            status,
+                            nspawn_log.display(),
+                            log_tail
+                        );
                     }
                 }
                 Ok(Err(e)) => {
@@ -1139,6 +1144,16 @@ async fn run_sandboxed_review(
     };
 
     let mut metadata = completed.metadata;
+    metadata.retry_count = crate::state::get_pr_review(
+        &params.db_path,
+        &review_params.repo,
+        review_params.pr_number,
+        &review_params.review_kind,
+    )
+    .ok()
+    .flatten()
+    .map(|m| m.retry_count)
+    .unwrap_or(metadata.retry_count);
     metadata.report_url = report_url;
     if metadata.status == "none"
         && let Some(reaction) = review_params
@@ -1281,6 +1296,31 @@ fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_slice(&bytes).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
+fn tail_file(path: &Path, max_lines: usize) -> Result<String> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open log file at {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut lines = VecDeque::with_capacity(max_lines);
+
+    for line in reader.lines() {
+        let line =
+            line.with_context(|| format!("Failed to read log file at {}", path.display()))?;
+        if max_lines == 0 {
+            continue;
+        }
+        if lines.len() == max_lines {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    if lines.is_empty() {
+        Ok("<sandbox log was empty>".to_string())
+    } else {
+        Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,6 +1380,15 @@ mod tests {
             sandbox_machine_name("owner/repo", 42, "security", 123),
             sandbox_machine_name("owner/repo", 42, "security", 124)
         );
+    }
+
+    #[test]
+    fn tail_file_returns_recent_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("nspawn.log");
+        std::fs::write(&log_path, "one\ntwo\nthree\nfour\n").unwrap();
+
+        assert_eq!(tail_file(&log_path, 2).unwrap(), "three\nfour");
     }
 
     #[test]

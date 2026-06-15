@@ -148,7 +148,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Maximum number of retries for LLM provider failures
+        /// Maximum number of retries for LLM provider failures and failed review attempts
         #[arg(long)]
         max_retries: Option<u32>,
 
@@ -250,7 +250,7 @@ enum Commands {
         #[arg(long)]
         db_path: Option<PathBuf>,
 
-        /// Maximum number of retries for LLM provider failures
+        /// Maximum number of retries for LLM provider failures and failed review attempts
         #[arg(long)]
         max_retries: Option<u32>,
 

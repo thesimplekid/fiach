@@ -308,7 +308,7 @@ The following options are available under `services.fiach`:
 | `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no findings were found. |
 | `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
 | `timeoutMins` | integer | `30` | Timeout in minutes for each review session. |
-| `maxRetries` | integer | `3` | Maximum number of retries for LLM provider failures. |
+| `maxRetries` | integer | `3` | Maximum number of retries for LLM provider failures and failed review attempts. |
 | `retryDelaySecs` | integer | `10` | Initial delay in seconds before retrying an LLM failure. |
 | `maxCostUsd` | float or null | `null` | Maximum budget in USD for each review. |
 | `inputPricePerM` | float or null | `null` | Override input token price per 1M tokens in USD. |
