@@ -351,7 +351,7 @@ When using `bridge`, the host must create and maintain `br-nspawn`, addressing, 
 
 - `sandbox.networkMode = "host"` is the current default because it is the most reliable option for service deployments.
 - `sandbox.networkMode = "bridge"` attaches each sandbox to an existing `br-nspawn` bridge.
-- `sandbox.networkMode = "veth"` gives each sandbox its own `10.64.<index>.0/30` veth subnet, blocks access to host-local services, and still allows outbound internet access through host NAT.
+- `sandbox.networkMode = "veth"` gives each sandbox its own `10.64.<index>.0/30` veth subnet, blocks access to host-local services, and configures NixOS NAT for outbound internet access from the `10.64.0.0/16` sandbox pool.
 - `sandbox.networkMode = "private"` disables all network access, which also prevents GitHub and OpenRouter access.
 - Restricting outbound traffic to specific destinations requires host-side enforcement such as `nftables`/`iptables` rules on the `ve-*` interfaces, or a proxy-based egress policy.
 - IP allowlists can be managed in NixOS firewall configuration, but they are brittle for CDN-backed services.

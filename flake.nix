@@ -717,8 +717,9 @@
             # systemd-nspawn names the host end of a plain --network-veth pair
             # "ve-<machine>". Fiach uses short machine names with the "fiach-"
             # prefix so these interface names avoid kernel truncation.
-            # Fiach assigns each host link a per-sandbox /30 address at runtime
-            # and networkd provides NAT for outbound traffic.
+            # Fiach assigns each host link a per-sandbox /30 address at runtime.
+            # NixOS NAT provides outbound internet access for the sandbox pool,
+            # while networkd keeps the dynamic host-side veth links configured.
             (lib.mkIf (cfg.sandbox.enable && cfg.sandbox.networkMode == "veth") {
               boot.kernel.sysctl = {
                 "net.ipv4.ip_forward" = lib.mkDefault 1;
@@ -735,6 +736,11 @@
                   LLDP = "no";
                   EmitLLDP = "no";
                 };
+              };
+
+              networking.nat = {
+                enable = lib.mkDefault true;
+                internalIPs = [ "10.64.0.0/16" ];
               };
 
               networking.firewall.trustedInterfaces = [ "ve-fiach-+" ];
