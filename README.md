@@ -117,6 +117,7 @@ cargo run -- review \
 ### 5. Interacting with the Daemon Web Server
 
 When running the daemon, an interactive web server starts automatically on port `3000` (configurable via `--port`). This allows you to inspect the daemon's history and trigger reviews on demand.
+Set `FIACH_SERVER_TOKEN` to require `Authorization: Bearer <token>` or `X-Fiach-Token: <token>` on all endpoints except `/health`.
 
 - **Check health:**
   ```bash
@@ -157,7 +158,7 @@ personas = ["builtin:pr-review", "builtin:security"]
 max_workers = 2
 ```
 
-Each persona gets its own state key and report path, so a successful PR review pass does not suppress the security pass for the same PR/commit. `max_workers` applies to the expanded review-job queue: two personas across ten PRs creates twenty review jobs.
+Each persona gets its own state key and report path, so a successful PR review pass does not suppress the security pass for the same PR/commit. In `sync-pr` mode, non-default personas also get persona-scoped sync branches and report files. `max_workers` applies to the expanded review-job queue: two personas across ten PRs creates twenty review jobs.
 
 A custom persona file can contain these placeholders which are filled at runtime:
 - `{repo}` — The target repository.

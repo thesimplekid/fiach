@@ -79,11 +79,17 @@ struct ExistingSyncPr {
     base_ref_name: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DisclosureTarget<'a> {
+    pub repo: &'a str,
+    pub pr_number: u64,
+    pub commit_hash: &'a str,
+    pub review_kind: &'a str,
+}
+
 pub async fn handle_disclosure(
     report_path: &Path,
-    repo: &str,
-    pr_number: u64,
-    commit_hash: &str,
+    target: DisclosureTarget<'_>,
     findings_found: bool,
     config: &DiscloseConfig,
 ) -> Result<Option<String>> {
@@ -99,7 +105,7 @@ pub async fn handle_disclosure(
                 );
                 return Ok(None);
             }
-            post_pr_comment(report_path, repo, pr_number)
+            post_pr_comment(report_path, target.repo, target.pr_number)
                 .await
                 .map(Some)
         }
@@ -113,18 +119,23 @@ pub async fn handle_disclosure(
                 .sync_repo
                 .as_ref()
                 .context("sync_repo must be provided for SyncPr mode")?;
-            create_sync_pr(report_path, repo, pr_number, commit_hash, sync_repo)
-                .await
-                .map(Some)
+            create_sync_pr(
+                report_path,
+                target.repo,
+                target.pr_number,
+                target.commit_hash,
+                target.review_kind,
+                sync_repo,
+            )
+            .await
+            .map(Some)
         }
     }
 }
 
 pub async fn handle_structured_disclosure(
     report_path: &Path,
-    repo: &str,
-    pr_number: u64,
-    commit_hash: &str,
+    target: DisclosureTarget<'_>,
     artifact: &ReportingArtifact,
     policy: &DisclosurePolicy,
     config: &DiscloseConfig,
@@ -156,7 +167,7 @@ pub async fn handle_structured_disclosure(
                 .flat_map(|finding| finding.inline_comments.clone())
                 .collect::<Vec<_>>();
             let body = crate::reporting::review_summary_body(&accepted);
-            post_pr_review(repo, pr_number, &body, comments)
+            post_pr_review(target.repo, target.pr_number, &body, comments)
                 .await
                 .map(Some)
         }
@@ -170,9 +181,16 @@ pub async fn handle_structured_disclosure(
                 .sync_repo
                 .as_ref()
                 .context("sync_repo must be provided for SyncPr mode")?;
-            create_sync_pr(report_path, repo, pr_number, commit_hash, sync_repo)
-                .await
-                .map(Some)
+            create_sync_pr(
+                report_path,
+                target.repo,
+                target.pr_number,
+                target.commit_hash,
+                target.review_kind,
+                sync_repo,
+            )
+            .await
+            .map(Some)
         }
     }
 }
@@ -338,6 +356,7 @@ async fn create_sync_pr(
     repo: &str,
     pr_number: u64,
     commit_hash: &str,
+    review_kind: &str,
     sync_repo: &str,
 ) -> Result<String> {
     tracing::info!(
@@ -377,8 +396,7 @@ async fn create_sync_pr(
     let title = extract_title(&report_content)
         .unwrap_or_else(|| format!("Vulnerability in {}#{}", repo, pr_number));
 
-    let safe_repo_name = repo.replace("/", "-");
-    let branch_name = format!("report/{}-pr{}", safe_repo_name, pr_number);
+    let branch_name = sync_branch_name(repo, pr_number, review_kind);
     let base_branch = current_git_branch(&repo_dir).await?;
     let existing_open_pr = find_open_sync_pr(&repo_dir, &branch_name, &base_branch).await?;
 
@@ -400,7 +418,9 @@ async fn create_sync_pr(
     )
     .await?;
 
-    let existing_report_path = repo_dir.join(repo).join(format!("pr-{}.md", pr_number));
+    let existing_report_path = repo_dir
+        .join(repo)
+        .join(sync_report_file_name(pr_number, review_kind));
 
     let final_report_content = if existing_report_path.exists() {
         let old_content = std::fs::read_to_string(&existing_report_path)
@@ -451,6 +471,7 @@ async fn create_sync_pr(
     } else {
         commit_hash
     };
+    let safe_repo_name = repo.replace("/", "-");
     let commit_msg = format!(
         "audit({}-pr{}): {} ({})",
         safe_repo_name, pr_number, title, short_hash
@@ -539,6 +560,48 @@ async fn create_sync_pr(
     tracing::info!("Successfully created Sync PR: {}", pr_url);
 
     Ok(pr_url)
+}
+
+fn sync_branch_name(repo: &str, pr_number: u64, review_kind: &str) -> String {
+    let safe_repo_name = repo.replace("/", "-");
+    if review_kind == crate::state::DEFAULT_REVIEW_KIND {
+        format!("report/{safe_repo_name}-pr{pr_number}")
+    } else {
+        format!(
+            "report/{safe_repo_name}-pr{pr_number}-{}",
+            sync_safe_component(review_kind)
+        )
+    }
+}
+
+fn sync_report_file_name(pr_number: u64, review_kind: &str) -> String {
+    if review_kind == crate::state::DEFAULT_REVIEW_KIND {
+        format!("pr-{pr_number}.md")
+    } else {
+        format!("pr-{pr_number}-{}.md", sync_safe_component(review_kind))
+    }
+}
+
+fn sync_safe_component(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_separator = false;
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            out.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "custom".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 async fn current_git_branch(repo_dir: &Path) -> Result<String> {
@@ -801,5 +864,30 @@ mod tests {
 
         assert_eq!(config.review_start.as_deref(), Some("eyes"));
         assert_eq!(config.no_findings.as_deref(), Some("+1"));
+    }
+
+    #[test]
+    fn sync_paths_are_legacy_for_default_review_kind() {
+        assert_eq!(
+            sync_branch_name("owner/repo", 42, crate::state::DEFAULT_REVIEW_KIND),
+            "report/owner-repo-pr42"
+        );
+        assert_eq!(
+            sync_report_file_name(42, crate::state::DEFAULT_REVIEW_KIND),
+            "pr-42.md"
+        );
+    }
+
+    #[test]
+    fn sync_paths_are_scoped_for_persona_review_kind() {
+        assert_eq!(
+            sync_branch_name("owner/repo", 42, "pr-review"),
+            "report/owner-repo-pr42-pr-review"
+        );
+        assert_eq!(sync_report_file_name(42, "security"), "pr-42-security.md");
+        assert_eq!(
+            sync_report_file_name(42, "Custom Persona.md"),
+            "pr-42-custom-persona-md.md"
+        );
     }
 }

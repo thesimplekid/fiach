@@ -19,10 +19,17 @@ use tracing_subscriber::{EnvFilter, fmt};
 use self::config::{FiachConfig, MultiString};
 use self::disclose::ReportMode;
 
+fn parse_report_mode(value: &str) -> Result<ReportMode> {
+    ReportMode::from_str(value).map_err(|error| anyhow::anyhow!(error))
+}
+
 fn parse_persona_sources(values: Vec<String>) -> Vec<persona::PersonaSource> {
     values
         .into_iter()
-        .map(|value| persona::PersonaSource::from_str(&value).unwrap())
+        .map(|value| match persona::PersonaSource::from_str(&value) {
+            Ok(source) => source,
+            Err(never) => match never {},
+        })
         .collect()
 }
 
@@ -383,7 +390,10 @@ async fn main() -> Result<()> {
     let cloned_token = cancel_token.clone();
 
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.unwrap();
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %error, "Failed to listen for Ctrl-C");
+            return;
+        }
         tracing::warn!("Ctrl-C received, shutting down...");
         cloned_token.cancel();
     });
@@ -433,7 +443,7 @@ async fn main() -> Result<()> {
             let report_mode_str = report_mode
                 .or(rev_cfg.report_mode)
                 .unwrap_or_else(|| "local".to_string());
-            let report_mode = ReportMode::from_str(&report_mode_str).unwrap_or_default();
+            let report_mode = parse_report_mode(&report_mode_str)?;
             let output = output.or(rev_cfg.output);
             let skill = with_skill.or(rev_cfg.with_skill);
             let db_path = db_path
@@ -567,7 +577,7 @@ async fn main() -> Result<()> {
             let report_mode_str = report_mode
                 .or(daemon_cfg.report_mode)
                 .unwrap_or_else(|| "local".to_string());
-            let report_mode = ReportMode::from_str(&report_mode_str).unwrap_or_default();
+            let report_mode = parse_report_mode(&report_mode_str)?;
 
             let interval_secs = interval.or(daemon_cfg.interval).unwrap_or(300);
             let pr_states = pr_state
@@ -682,6 +692,9 @@ async fn main() -> Result<()> {
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("reports")),
                 daemon_tx: tx,
+                server_token: std::env::var("FIACH_SERVER_TOKEN")
+                    .ok()
+                    .filter(|token| !token.trim().is_empty()),
             };
 
             tokio::spawn(async move {

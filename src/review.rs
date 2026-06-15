@@ -1097,9 +1097,12 @@ pub async fn run_review(
             let report_url = if artifact.markdown_only_fallback {
                 crate::disclose::handle_disclosure(
                     report_file,
-                    &params.repo,
-                    params.pr_number,
-                    workspace.commit_hash.as_str(),
+                    crate::disclose::DisclosureTarget {
+                        repo: &params.repo,
+                        pr_number: params.pr_number,
+                        commit_hash: workspace.commit_hash.as_str(),
+                        review_kind: &params.review_kind,
+                    },
                     false,
                     &params.disclose_config,
                 )
@@ -1107,9 +1110,12 @@ pub async fn run_review(
             } else {
                 crate::disclose::handle_structured_disclosure(
                     report_file,
-                    &params.repo,
-                    params.pr_number,
-                    workspace.commit_hash.as_str(),
+                    crate::disclose::DisclosureTarget {
+                        repo: &params.repo,
+                        pr_number: params.pr_number,
+                        commit_hash: workspace.commit_hash.as_str(),
+                        review_kind: &params.review_kind,
+                    },
                     &artifact,
                     &policy,
                     &params.disclose_config,
@@ -1160,7 +1166,7 @@ pub async fn run_review(
             bail!("Review cancelled");
         }
 
-        return Ok(Some(completed));
+        Ok(Some(completed))
     } else {
         let limit_reached = turn_count >= params.max_turns;
         if limit_reached {
@@ -1175,16 +1181,12 @@ pub async fn run_review(
                 "Agent finished without submitting structured findings"
             );
         }
+        workspace.cleanup().await?;
+        if cancel_token.is_cancelled() {
+            bail!("Review cancelled");
+        }
+        bail!("Review finished without submitting a structured result");
     }
-
-    // 11. Clean up workspace
-    workspace.cleanup().await?;
-
-    if cancel_token.is_cancelled() {
-        bail!("Review cancelled");
-    }
-
-    Ok(None)
 }
 
 #[cfg(test)]
