@@ -683,7 +683,7 @@ async fn main() -> Result<()> {
                 sandbox_extra_args: sandbox_extra_args.or(daemon_cfg.sandbox_extra_args),
             };
 
-            let port = port.unwrap_or(3000);
+            let port = port.or(daemon_cfg.port).unwrap_or(3000);
             let (tx, rx) = tokio::sync::mpsc::channel(100);
             let app_state = server::AppState {
                 db_path: params.db_path.clone(),

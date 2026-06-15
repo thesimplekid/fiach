@@ -38,6 +38,7 @@ impl MultiString {
 #[derive(Debug, Deserialize, Default)]
 pub struct DaemonConfig {
     pub repos: Option<Vec<String>>,
+    pub port: Option<u16>,
     pub interval: Option<u64>,
     pub provider: Option<String>,
     pub model: Option<String>,

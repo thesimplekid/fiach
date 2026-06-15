@@ -13,6 +13,7 @@ pub enum ReportMode {
     Local,
     PrComment,
     SyncPr,
+    Hybrid,
 }
 
 impl std::fmt::Display for ReportMode {
@@ -21,6 +22,7 @@ impl std::fmt::Display for ReportMode {
             Self::Local => write!(f, "local"),
             Self::PrComment => write!(f, "pr-comment"),
             Self::SyncPr => write!(f, "sync-pr"),
+            Self::Hybrid => write!(f, "hybrid"),
         }
     }
 }
@@ -33,6 +35,7 @@ impl std::str::FromStr for ReportMode {
             "local" => Ok(ReportMode::Local),
             "pr-comment" => Ok(ReportMode::PrComment),
             "sync-pr" => Ok(ReportMode::SyncPr),
+            "hybrid" => Ok(ReportMode::Hybrid),
             _ => Err(format!("Invalid report mode: {}", s)),
         }
     }
@@ -130,6 +133,21 @@ pub async fn handle_disclosure(
             .await
             .map(Some)
         }
+        ReportMode::Hybrid => {
+            if !findings_found && !config.notify_on_empty {
+                tracing::info!(
+                    "No findings found and notify_on_empty is false. Skipping hybrid disclosure."
+                );
+                return Ok(None);
+            }
+            if policy_comments_allowed(target.review_kind) {
+                post_pr_comment(report_path, target.repo, target.pr_number)
+                    .await
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -140,28 +158,14 @@ pub async fn handle_structured_disclosure(
     policy: &DisclosurePolicy,
     config: &DiscloseConfig,
 ) -> Result<Option<String>> {
-    let accepted = artifact.accepted_findings(policy);
-    let findings_found = !accepted.is_empty() && !artifact.verifier_failed;
-
-    match config.mode {
-        ReportMode::Local => {
+    match structured_disclosure_route(target, artifact, policy, config) {
+        StructuredDisclosureRoute::Local => {
             tracing::info!("ReportMode is Local. Report saved to {:?}", report_path);
             Ok(Some(report_path.to_string_lossy().to_string()))
         }
-        ReportMode::PrComment => {
-            if !findings_found && !config.notify_on_empty {
-                tracing::info!("No verified findings approved for disclosure; skipping PR review");
-                return Ok(None);
-            }
-            if !policy.pr_context.comments_allowed() {
-                tracing::info!(
-                    state = %policy.pr_context.state,
-                    merged = policy.pr_context.merged,
-                    "PR lifecycle state does not allow comments; skipping PR disclosure"
-                );
-                return Ok(None);
-            }
-
+        StructuredDisclosureRoute::Skip => Ok(None),
+        StructuredDisclosureRoute::PrReview => {
+            let accepted = artifact.accepted_findings(policy);
             let comments = accepted
                 .iter()
                 .flat_map(|finding| finding.inline_comments.clone())
@@ -171,12 +175,7 @@ pub async fn handle_structured_disclosure(
                 .await
                 .map(Some)
         }
-        ReportMode::SyncPr => {
-            if !findings_found && !config.notify_on_empty {
-                tracing::info!("No verified findings approved for disclosure; skipping Sync PR");
-                return Ok(None);
-            }
-
+        StructuredDisclosureRoute::SyncPr => {
             let sync_repo = config
                 .sync_repo
                 .as_ref()
@@ -193,6 +192,93 @@ pub async fn handle_structured_disclosure(
             .map(Some)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredDisclosureRoute {
+    Local,
+    Skip,
+    PrReview,
+    SyncPr,
+}
+
+fn structured_disclosure_route(
+    target: DisclosureTarget<'_>,
+    artifact: &ReportingArtifact,
+    policy: &DisclosurePolicy,
+    config: &DiscloseConfig,
+) -> StructuredDisclosureRoute {
+    let accepted_pr_findings = artifact.accepted_findings(policy);
+    let findings_found = !accepted_pr_findings.is_empty() && !artifact.verifier_failed;
+
+    match config.mode {
+        ReportMode::Local => StructuredDisclosureRoute::Local,
+        ReportMode::PrComment => {
+            if !findings_found && !config.notify_on_empty {
+                tracing::info!("No verified findings approved for disclosure; skipping PR review");
+                return StructuredDisclosureRoute::Skip;
+            }
+            if !policy.pr_context.comments_allowed() {
+                tracing::info!(
+                    state = %policy.pr_context.state,
+                    merged = policy.pr_context.merged,
+                    "PR lifecycle state does not allow comments; skipping PR disclosure"
+                );
+                return StructuredDisclosureRoute::Skip;
+            }
+
+            StructuredDisclosureRoute::PrReview
+        }
+        ReportMode::SyncPr => {
+            if !findings_found && !config.notify_on_empty {
+                tracing::info!("No verified findings approved for disclosure; skipping Sync PR");
+                return StructuredDisclosureRoute::Skip;
+            }
+
+            StructuredDisclosureRoute::SyncPr
+        }
+        ReportMode::Hybrid => {
+            if artifact.verifier_failed {
+                tracing::info!("Verifier failed; skipping hybrid disclosure");
+                return StructuredDisclosureRoute::Skip;
+            }
+
+            if !accepted_pr_findings.is_empty() {
+                if policy.pr_context.comments_allowed() {
+                    return StructuredDisclosureRoute::PrReview;
+                }
+                tracing::info!(
+                    state = %policy.pr_context.state,
+                    merged = policy.pr_context.merged,
+                    "PR lifecycle state does not allow comments; skipping PR-introduced hybrid disclosure"
+                );
+            }
+
+            let non_pr_findings = artifact
+                .confirmed_findings_including_non_pr(policy)
+                .into_iter()
+                .filter(|finding| !finding.verdict.introduced_by_pr)
+                .count();
+
+            if is_security_review_kind(target.review_kind) && non_pr_findings > 0 {
+                StructuredDisclosureRoute::SyncPr
+            } else if config.notify_on_empty && policy.pr_context.comments_allowed() {
+                StructuredDisclosureRoute::PrReview
+            } else {
+                StructuredDisclosureRoute::Skip
+            }
+        }
+    }
+}
+
+fn is_security_review_kind(review_kind: &str) -> bool {
+    review_kind == "security" || review_kind == "builtin:security"
+}
+
+fn policy_comments_allowed(review_kind: &str) -> bool {
+    is_security_review_kind(review_kind)
+        || review_kind == "pr-review"
+        || review_kind == "builtin:pr-review"
 }
 
 #[derive(Serialize)]
@@ -812,6 +898,188 @@ fn extract_title(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::reporting::{
+        AffectedLocation, CommandTranscript, DisclosurePolicy, Finding, FindingInput, PrContext,
+        ReportingArtifact, Verdict,
+    };
+
+    fn policy() -> DisclosurePolicy {
+        DisclosurePolicy {
+            pr_context: PrContext {
+                state: "open".to_string(),
+                merged: false,
+                base_ref_name: "main".to_string(),
+                default_branch: "main".to_string(),
+                base_commit: "base".to_string(),
+                head_commit: "head".to_string(),
+            },
+            diff_anchors: BTreeMap::from([("src/lib.rs".to_string(), BTreeSet::from([10]))]),
+        }
+    }
+
+    fn target(review_kind: &str) -> DisclosureTarget<'_> {
+        DisclosureTarget {
+            repo: "owner/repo",
+            pr_number: 42,
+            commit_hash: "abc123",
+            review_kind,
+        }
+    }
+
+    fn disclose_config(mode: ReportMode) -> DiscloseConfig {
+        DiscloseConfig {
+            mode,
+            sync_repo: Some("owner/security-sync".to_string()),
+            notify_on_empty: false,
+            reactions: ReactionConfig::default(),
+        }
+    }
+
+    fn artifact(introduced_by_pr: bool) -> ReportingArtifact {
+        let finding = Finding::from_input(
+            0,
+            FindingInput {
+                title: "Bug".to_string(),
+                severity: "high".to_string(),
+                confidence: "high".to_string(),
+                affected_locations: vec![AffectedLocation {
+                    path: "src/lib.rs".to_string(),
+                    start_line: Some(10),
+                    end_line: None,
+                }],
+                evidence: "evidence".to_string(),
+                skills_used: Vec::new(),
+                body_markdown: "body".to_string(),
+            },
+        )
+        .unwrap();
+
+        ReportingArtifact {
+            findings: vec![finding],
+            verdicts: vec![Verdict {
+                finding_id: "F-1".to_string(),
+                confirmed: true,
+                introduced_by_pr,
+                present_on_pr_branch: true,
+                present_on_base: !introduced_by_pr,
+                present_on_default_branch: !introduced_by_pr,
+                disclosure_decision: if introduced_by_pr {
+                    "disclose".to_string()
+                } else {
+                    "suppress".to_string()
+                },
+                title_override: None,
+                severity_override: None,
+                impact_override: None,
+                final_comment_body: Some("body".to_string()),
+                affected_locations: Vec::new(),
+                command_transcripts: vec![CommandTranscript {
+                    command: "cargo test".to_string(),
+                    branch_or_commit: "head".to_string(),
+                    key_output: "failed".to_string(),
+                    interpretation: "reproduced".to_string(),
+                }],
+                rationale: "confirmed".to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn no_findings_artifact() -> ReportingArtifact {
+        ReportingArtifact::default()
+    }
+
+    #[test]
+    fn hybrid_security_pr_introduced_finding_posts_to_pr() {
+        let route = structured_disclosure_route(
+            target("security"),
+            &artifact(true),
+            &policy(),
+            &disclose_config(ReportMode::Hybrid),
+        );
+
+        assert_eq!(route, StructuredDisclosureRoute::PrReview);
+    }
+
+    #[test]
+    fn hybrid_security_non_pr_finding_syncs_to_sync_repo() {
+        let route = structured_disclosure_route(
+            target("security"),
+            &artifact(false),
+            &policy(),
+            &disclose_config(ReportMode::Hybrid),
+        );
+
+        assert_eq!(route, StructuredDisclosureRoute::SyncPr);
+    }
+
+    #[test]
+    fn hybrid_pr_review_non_pr_finding_does_not_sync() {
+        let route = structured_disclosure_route(
+            target("pr-review"),
+            &artifact(false),
+            &policy(),
+            &disclose_config(ReportMode::Hybrid),
+        );
+
+        assert_eq!(route, StructuredDisclosureRoute::Skip);
+    }
+
+    #[test]
+    fn existing_structured_report_modes_keep_routes() {
+        let policy = policy();
+        let introduced = artifact(true);
+        let non_introduced = artifact(false);
+        let empty = no_findings_artifact();
+
+        assert_eq!(
+            structured_disclosure_route(
+                target("security"),
+                &introduced,
+                &policy,
+                &disclose_config(ReportMode::Local),
+            ),
+            StructuredDisclosureRoute::Local
+        );
+        assert_eq!(
+            structured_disclosure_route(
+                target("security"),
+                &introduced,
+                &policy,
+                &disclose_config(ReportMode::PrComment),
+            ),
+            StructuredDisclosureRoute::PrReview
+        );
+        assert_eq!(
+            structured_disclosure_route(
+                target("security"),
+                &introduced,
+                &policy,
+                &disclose_config(ReportMode::SyncPr),
+            ),
+            StructuredDisclosureRoute::SyncPr
+        );
+        assert_eq!(
+            structured_disclosure_route(
+                target("security"),
+                &non_introduced,
+                &policy,
+                &disclose_config(ReportMode::PrComment),
+            ),
+            StructuredDisclosureRoute::Skip
+        );
+        assert_eq!(
+            structured_disclosure_route(
+                target("security"),
+                &empty,
+                &policy,
+                &disclose_config(ReportMode::SyncPr),
+            ),
+            StructuredDisclosureRoute::Skip
+        );
+    }
 
     #[test]
     fn parse_open_sync_prs_reads_base_branch() {

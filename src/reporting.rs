@@ -36,6 +36,30 @@ impl ReportingArtifact {
     }
 
     pub fn accepted_findings(&self, policy: &DisclosurePolicy) -> Vec<AcceptedFinding> {
+        self.accepted_findings_with_policy(policy, true)
+    }
+
+    pub fn confirmed_findings_including_non_pr(
+        &self,
+        policy: &DisclosurePolicy,
+    ) -> Vec<AcceptedFinding> {
+        self.findings_with_policy(policy, false, false)
+    }
+
+    fn accepted_findings_with_policy(
+        &self,
+        policy: &DisclosurePolicy,
+        require_introduced_by_pr: bool,
+    ) -> Vec<AcceptedFinding> {
+        self.findings_with_policy(policy, require_introduced_by_pr, true)
+    }
+
+    fn findings_with_policy(
+        &self,
+        policy: &DisclosurePolicy,
+        require_introduced_by_pr: bool,
+        require_disclosure_decision: bool,
+    ) -> Vec<AcceptedFinding> {
         self.findings
             .iter()
             .filter_map(|finding| {
@@ -43,7 +67,13 @@ impl ReportingArtifact {
                     .verdicts
                     .iter()
                     .find(|verdict| verdict.finding_id == finding.id)?;
-                AcceptedFinding::from_parts(finding, verdict, policy)
+                AcceptedFinding::from_parts(
+                    finding,
+                    verdict,
+                    policy,
+                    require_introduced_by_pr,
+                    require_disclosure_decision,
+                )
             })
             .collect()
     }
@@ -262,10 +292,16 @@ pub struct AcceptedFinding {
 }
 
 impl AcceptedFinding {
-    fn from_parts(finding: &Finding, verdict: &Verdict, policy: &DisclosurePolicy) -> Option<Self> {
+    fn from_parts(
+        finding: &Finding,
+        verdict: &Verdict,
+        policy: &DisclosurePolicy,
+        require_introduced_by_pr: bool,
+        require_disclosure_decision: bool,
+    ) -> Option<Self> {
         if !verdict.confirmed
-            || !verdict.introduced_by_pr
-            || !verdict.wants_disclosure()
+            || (require_introduced_by_pr && !verdict.introduced_by_pr)
+            || (require_disclosure_decision && !verdict.wants_disclosure())
             || verdict.command_transcripts.is_empty()
         {
             return None;

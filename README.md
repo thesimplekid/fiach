@@ -251,7 +251,8 @@ In your `flake.nix` or `configuration.nix`:
             reportMode = "sync-pr";
             syncRepo = "my-org/security-audits";
             
-            # Environment file containing OPENROUTER_API_KEY and GITHUB_TOKEN (KEY=VALUE format)
+            # Environment file containing GITHUB_TOKEN and the selected provider API key.
+            # FIACH_SERVER_TOKEN is optional and protects the local web control API.
             environmentFile = "/run/secrets/fiach-env";
 
             # Sandbox Isolation (Highly Recommended)
@@ -284,24 +285,34 @@ The following options are available under `services.fiach`:
 |---|---|---|---|
 | `enable` | boolean | `false` | Enable the Fiach Daemon. |
 | `repos` | list of string | *none* | List of repositories to monitor (e.g., `["org/repo"]`). |
+| `port` | integer | `3000` | Port for the interactive web server. |
 | `interval` | integer | `300` | Polling interval in seconds. |
 | `updatedWithinDays` | integer | `120` | Number of days to look back for updated PRs when `filterByUpdated` is enabled. |
 | `filterByUpdated` | boolean | `true` | Whether to include the `updated:>=` GitHub search filter when discovering PRs. Set to `false` to query only by PR state and draft setting. |
 | `prStates` | list of string | `["open"]` | List of PR states to poll (e.g., `["open"]`, `["open", "merged"]`). |
 | `prLimit` | integer | `1000` | Maximum number of PRs to fetch from GitHub per polling cycle. |
+| `skipPrs` | list of string | `[]` | PR numbers or repo-qualified PRs to skip. |
 | `allowedAuthorAssociations` | list of string | `["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]` | GitHub PR author associations allowed to trigger daemon reviews. |
 | `maxWorkers` | integer | `1` | Maximum number of review jobs to run concurrently per polling query. `0` means unlimited. With multiple personas, each PR/persona pair is a review job. |
+| `drafts` | boolean | `false` | Whether to include draft PRs. |
 | `provider` | string | `"openrouter"` | Goose provider to use, such as `"openrouter"`, `"anthropic"`, `"openai"`, or `"google"`. |
 | `model` | string | `"google/gemini-3.1-pro-preview"` | Model to use with the selected provider. |
 | `verifierProvider` | string or null | `null` | Provider to use for the verifier pass. Defaults to `provider` when unset. |
 | `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
-| `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN` and the selected provider API key. |
+| `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN`, the selected provider API key, and optionally `FIACH_SERVER_TOKEN`. |
 | `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |
-| `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`) | `"local"` | Mode for reporting findings. |
-| `syncRepo` | string or null | `null` | GitHub repository to sync reports to. Required if `reportMode` is `"sync-pr"`. |
+| `withSkill` | string or null | `null` | Optional skill name to instruct the agent to use. |
+| `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`, `"hybrid"`) | `"local"` | Mode for reporting findings. `hybrid` comments on PR-introduced findings and syncs non-PR security findings. |
+| `syncRepo` | string or null | `null` | GitHub repository to sync reports to. Required if `reportMode` is `"sync-pr"`, and for non-PR security findings in `hybrid` mode. |
 | `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no findings were found. |
 | `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
+| `timeoutMins` | integer | `30` | Timeout in minutes for each review session. |
+| `maxRetries` | integer | `3` | Maximum number of retries for LLM provider failures. |
+| `retryDelaySecs` | integer | `10` | Initial delay in seconds before retrying an LLM failure. |
+| `maxCostUsd` | float or null | `null` | Maximum budget in USD for each review. |
+| `inputPricePerM` | float or null | `null` | Override input token price per 1M tokens in USD. |
+| `outputPricePerM` | float or null | `null` | Override output token price per 1M tokens in USD. |
 | `dataDir` | string | `"/var/lib/fiach"` | Directory to store state database and reports. |
 | `contextGroups` | attrset | `{}` | Context groups mapped by target repo (contains `repos` list). |
 | `sandbox.enable` | boolean | `false` | Enable Sandboxed PR reviews via systemd-nspawn. |

@@ -122,6 +122,68 @@
             buildInputs = with pkgs; [ openssl sqlite zlib ] ++ libsDarwin;
           };
 
+          checks.nixos-module =
+            let
+              envFile = pkgs.writeText "fiach-env" ''
+                GITHUB_TOKEN=ghp_example
+                OPENROUTER_API_KEY=sk-example
+                FIACH_SERVER_TOKEN=server-example
+              '';
+              testSystem = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    system.stateVersion = "25.11";
+                    services.fiach = {
+                      enable = true;
+                      repos = [ "owner/repo" ];
+                      environmentFile = envFile;
+                      port = 4321;
+                      skipPrs = [ "123" "owner/repo#456" ];
+                      drafts = true;
+                      timeoutMins = 45;
+                      maxRetries = 7;
+                      retryDelaySecs = 20;
+                      maxCostUsd = 12.5;
+                      inputPricePerM = 1.25;
+                      outputPricePerM = 5.75;
+                      withSkill = "cashu-security";
+                    };
+                  }
+                ];
+              };
+              execStart = testSystem.config.systemd.services.fiach.serviceConfig.ExecStart;
+              configPath =
+                let
+                  match = builtins.match ".*--config ([^ ]+) daemon.*" execStart;
+                in
+                if match == null then throw "Could not extract fiach config path from ExecStart" else builtins.head match;
+            in
+            pkgs.runCommand "fiach-nixos-module-test" { } ''
+              set -eu
+
+              exec_start=${lib.escapeShellArg execStart}
+              config_path=${lib.escapeShellArg configPath}
+
+              printf '%s' "$exec_start" | grep -F -- '--port 4321' >/dev/null
+
+              grep -F 'port = 4321' "$config_path" >/dev/null
+              grep -F 'skip_prs = [' "$config_path" >/dev/null
+              grep -F '"123"' "$config_path" >/dev/null
+              grep -F '"owner/repo#456"' "$config_path" >/dev/null
+              grep -F 'drafts = true' "$config_path" >/dev/null
+              grep -F 'timeout_mins = 45' "$config_path" >/dev/null
+              grep -F 'max_retries = 7' "$config_path" >/dev/null
+              grep -F 'retry_delay_secs = 20' "$config_path" >/dev/null
+              grep -F 'max_cost_usd = 12.5' "$config_path" >/dev/null
+              grep -F 'input_price_per_m = 1.25' "$config_path" >/dev/null
+              grep -F 'output_price_per_m = 5.75' "$config_path" >/dev/null
+              grep -F 'with_skill = "cashu-security"' "$config_path" >/dev/null
+
+              touch "$out"
+            '';
+
           devShells =
             let
               stable = pkgs.mkShell (
@@ -176,6 +238,12 @@
               type = lib.types.int;
               default = 300;
               description = "Polling interval in seconds";
+            };
+
+            port = lib.mkOption {
+              type = lib.types.int;
+              default = 3000;
+              description = "Port for the interactive web server.";
             };
 
             updatedWithinDays = lib.mkOption {
@@ -240,7 +308,7 @@
 
             environmentFile = lib.mkOption {
               type = lib.types.path;
-              description = "Path to environment file containing GITHUB_TOKEN and the selected provider API key";
+              description = "Path to environment file containing GITHUB_TOKEN, the selected provider API key, and optionally FIACH_SERVER_TOKEN.";
             };
 
             persona = lib.mkOption {
@@ -256,9 +324,9 @@
             };
 
             reportMode = lib.mkOption {
-              type = lib.types.enum [ "local" "pr-comment" "sync-pr" ];
+              type = lib.types.enum [ "local" "pr-comment" "sync-pr" "hybrid" ];
               default = "local";
-              description = "Mode for reporting findings. Options: local, pr-comment, sync-pr";
+              description = "Mode for reporting findings. Options: local, pr-comment, sync-pr, hybrid";
             };
 
             maxTurns = lib.mkOption {
@@ -267,10 +335,52 @@
               description = "Maximum number of turns for the agent (prevents runaway costs)";
             };
 
+            timeoutMins = lib.mkOption {
+              type = lib.types.int;
+              default = 30;
+              description = "Timeout in minutes for each review session.";
+            };
+
+            maxRetries = lib.mkOption {
+              type = lib.types.int;
+              default = 3;
+              description = "Maximum number of retries for LLM provider failures.";
+            };
+
+            retryDelaySecs = lib.mkOption {
+              type = lib.types.int;
+              default = 10;
+              description = "Initial delay in seconds before retrying an LLM failure.";
+            };
+
+            maxCostUsd = lib.mkOption {
+              type = lib.types.nullOr lib.types.float;
+              default = null;
+              description = "Maximum budget in USD for each review.";
+            };
+
+            inputPricePerM = lib.mkOption {
+              type = lib.types.nullOr lib.types.float;
+              default = null;
+              description = "Override input token price per 1M tokens in USD.";
+            };
+
+            outputPricePerM = lib.mkOption {
+              type = lib.types.nullOr lib.types.float;
+              default = null;
+              description = "Override output token price per 1M tokens in USD.";
+            };
+
+            withSkill = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Optional skill name to instruct the agent to use.";
+            };
+
             syncRepo = lib.mkOption {
               type = lib.types.nullOr lib.types.str;
               default = null;
-              description = "GitHub repository to sync reports to (e.g., 'owner/security-audits'). Required if reportMode is sync-pr.";
+              description = "GitHub repository to sync reports to (e.g., 'owner/security-audits'). Required if reportMode is sync-pr, and for non-PR security findings in hybrid mode.";
             };
 
             notifyOnEmpty = lib.mkOption {
@@ -295,6 +405,18 @@
               type = lib.types.bool;
               default = true;
               description = "Run a verifier pass before disclosure when findings are present.";
+            };
+
+            skipPrs = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "PR numbers or repo-qualified PRs to skip, e.g. '123' or 'org/repo#456'.";
+            };
+
+            drafts = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Whether to include draft PRs.";
             };
 
             dataDir = lib.mkOption {
@@ -458,13 +580,16 @@
                   configFile = tomlFormat.generate "fiach.toml" {
                     daemon = {
                       repos = cfg.repos;
+                      port = cfg.port;
                       interval = cfg.interval;
                       updated_within_days = cfg.updatedWithinDays;
                       filter_by_updated = cfg.filterByUpdated;
                       pr_state = cfg.prStates;
                       pr_limit = cfg.prLimit;
+                      skip_prs = cfg.skipPrs;
                       allowed_author_associations = cfg.allowedAuthorAssociations;
                       max_workers = cfg.maxWorkers;
+                      drafts = cfg.drafts;
                       provider = cfg.provider;
                       model = cfg.model;
                       db_path = "${cfg.dataDir}/fiach.redb";
@@ -472,12 +597,23 @@
                       report_mode = cfg.reportMode;
                       verify_findings = cfg.verifyFindings;
                       max_turns = cfg.maxTurns;
+                      timeout_mins = cfg.timeoutMins;
+                      max_retries = cfg.maxRetries;
+                      retry_delay_secs = cfg.retryDelaySecs;
                     } // personaConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
                       verifier_provider = cfg.verifierProvider;
                     } // lib.optionalAttrs (cfg.verifierModel != null) {
                       verifier_model = cfg.verifierModel;
+                    } // lib.optionalAttrs (cfg.withSkill != null) {
+                      with_skill = cfg.withSkill;
                     } // lib.optionalAttrs (cfg.syncRepo != null) {
                       sync_repo = cfg.syncRepo;
+                    } // lib.optionalAttrs (cfg.maxCostUsd != null) {
+                      max_cost_usd = cfg.maxCostUsd;
+                    } // lib.optionalAttrs (cfg.inputPricePerM != null) {
+                      input_price_per_m = cfg.inputPricePerM;
+                    } // lib.optionalAttrs (cfg.outputPricePerM != null) {
+                      output_price_per_m = cfg.outputPricePerM;
                     } // lib.optionalAttrs cfg.notifyOnEmpty {
                       notify_on_empty = cfg.notifyOnEmpty;
                     } // {
@@ -499,7 +635,7 @@
 
                   path = with pkgs; [ git gh systemd ];
                   serviceConfig = {
-                    ExecStart = "${fiachPkg}/bin/fiach --config ${configFile} daemon";
+                    ExecStart = "${fiachPkg}/bin/fiach --config ${configFile} daemon --port ${toString cfg.port}";
                     EnvironmentFile = cfg.environmentFile;
                     StateDirectory = "fiach";
                     WorkingDirectory = cfg.dataDir;
