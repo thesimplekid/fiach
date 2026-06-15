@@ -164,7 +164,7 @@
                   match = builtins.match ".*--config ([^ ]+) daemon.*" execStart;
                 in
                 if match == null then throw "Could not extract fiach config path from ExecStart" else builtins.head match;
-              fiachNetwork = testSystem.config.systemd.network.networks."80-fiach-container";
+              fiachNetwork = testSystem.config.systemd.network.networks."10-fiach-container";
               fiachNetworkName = fiachNetwork.matchConfig.Name;
               fiachNetworkAddress = fiachNetwork.networkConfig.Address or "";
               fiachServicePath = lib.concatMapStringsSep " " toString testSystem.config.systemd.services.fiach.path;
@@ -529,6 +529,10 @@
                       ${pkgs.coreutils}/bin/timeout 3 ${pkgs.bash}/bin/bash -c ":</dev/tcp/$1/$2" >/dev/null 2>&1
                     }
 
+                    resolve_host() {
+                      ${pkgs.coreutils}/bin/timeout 5 ${pkgs.glibc.bin}/bin/getent hosts "$1" >/dev/null 2>&1
+                    }
+
                     if [ "${cfg.sandbox.networkMode}" = "veth" ]; then
                       : "''${FIACH_SANDBOX_HOST_GATEWAY:?missing FIACH_SANDBOX_HOST_GATEWAY}"
                       : "''${FIACH_SANDBOX_GUEST_CIDR:?missing FIACH_SANDBOX_GUEST_CIDR}"
@@ -561,18 +565,51 @@
                       # systemd-networkd. Wait for outbound IP connectivity and
                       # DNS-backed GitHub connectivity before starting the review.
                       for _ in $(${pkgs.coreutils}/bin/seq 1 30); do
-                        if check_tcp "$FIACH_SANDBOX_DNS_PRIMARY" 53 && check_tcp api.github.com 443; then
+                        if resolve_host api.github.com && check_tcp api.github.com 443; then
                           break
                         fi
                         sleep 1
                       done
 
-                      if ! check_tcp "$FIACH_SANDBOX_DNS_PRIMARY" 53 || ! check_tcp api.github.com 443; then
+                      if ! resolve_host api.github.com || ! check_tcp api.github.com 443; then
                         echo "sandbox veth network preflight failed" >&2
+                        echo "--- preflight probes ---" >&2
+                        echo "dns_primary_tcp_53=$(
+                          if check_tcp "$FIACH_SANDBOX_DNS_PRIMARY" 53; then
+                            echo ok
+                          else
+                            echo failed
+                          fi
+                        )" >&2
+                        echo "dns_secondary_tcp_53=$(
+                          if check_tcp "$FIACH_SANDBOX_DNS_SECONDARY" 53; then
+                            echo ok
+                          else
+                            echo failed
+                          fi
+                        )" >&2
+                        echo "resolve_api_github_com=$(
+                          if resolve_host api.github.com; then
+                            echo ok
+                          else
+                            echo failed
+                          fi
+                        )" >&2
+                        echo "api_github_com_tcp_443=$(
+                          if check_tcp api.github.com 443; then
+                            echo ok
+                          else
+                            echo failed
+                          fi
+                        )" >&2
+                        echo "--- getent hosts api.github.com ---" >&2
+                        ${pkgs.glibc.bin}/bin/getent hosts api.github.com >&2 || true
                         echo "--- ip addr ---" >&2
                         ${pkgs.iproute2}/bin/ip addr show >&2 || true
                         echo "--- ip route ---" >&2
                         ${pkgs.iproute2}/bin/ip route show >&2 || true
+                        echo "--- ip neigh ---" >&2
+                        ${pkgs.iproute2}/bin/ip neigh show >&2 || true
                         echo "--- resolv.conf ---" >&2
                         cat /etc/resolv.conf >&2 || true
                         exit 1
@@ -619,6 +656,7 @@
                       cacert
                       iana-etc
                       iproute2
+                      glibc.bin
                       python3
                       sandboxEntrypoint
                       sandboxSkills
@@ -727,7 +765,10 @@
               };
 
               systemd.network.enable = true;
-              systemd.network.networks."80-fiach-container" = {
+              # This must sort before systemd's default 80-container-ve.network;
+              # otherwise networkd can claim ve-fiach-* and assign its default
+              # container subnet before Fiach's runtime 10.64.x.1/30 address is kept.
+              systemd.network.networks."10-fiach-container" = {
                 matchConfig.Name = "ve-fiach-*";
                 networkConfig = {
                   IPMasquerade = "both";
