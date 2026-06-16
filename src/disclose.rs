@@ -165,7 +165,7 @@ pub async fn handle_structured_disclosure(
         }
         StructuredDisclosureRoute::Skip => Ok(None),
         StructuredDisclosureRoute::PrReview => {
-            let accepted = artifact.accepted_findings(policy);
+            let accepted = artifact.publishable_findings(policy);
             let comments = accepted
                 .iter()
                 .flat_map(|finding| finding.inline_comments.clone())
@@ -208,12 +208,20 @@ fn structured_disclosure_route(
     policy: &DisclosurePolicy,
     config: &DiscloseConfig,
 ) -> StructuredDisclosureRoute {
-    let accepted_pr_findings = artifact.accepted_findings(policy);
+    let accepted_pr_findings = artifact.publishable_findings(policy);
+    let duplicate_only =
+        accepted_pr_findings.is_empty() && !artifact.already_reported_findings(policy).is_empty();
     let findings_found = !accepted_pr_findings.is_empty() && !artifact.verifier_failed;
 
     match config.mode {
         ReportMode::Local => StructuredDisclosureRoute::Local,
         ReportMode::PrComment => {
+            if duplicate_only {
+                tracing::info!(
+                    "All verified PR findings were already reported; skipping PR review"
+                );
+                return StructuredDisclosureRoute::Skip;
+            }
             if !findings_found && !config.notify_on_empty {
                 tracing::info!("No verified findings approved for disclosure; skipping PR review");
                 return StructuredDisclosureRoute::Skip;
@@ -240,6 +248,13 @@ fn structured_disclosure_route(
         ReportMode::Hybrid => {
             if artifact.verifier_failed {
                 tracing::info!("Verifier failed; skipping hybrid disclosure");
+                return StructuredDisclosureRoute::Skip;
+            }
+
+            if duplicate_only {
+                tracing::info!(
+                    "All verified PR findings were already reported; skipping hybrid PR disclosure"
+                );
                 return StructuredDisclosureRoute::Skip;
             }
 
@@ -901,8 +916,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::reporting::{
-        AffectedLocation, CommandTranscript, DisclosurePolicy, Finding, FindingInput, PrContext,
-        ReportingArtifact, Verdict,
+        AffectedLocation, CommandTranscript, DisclosurePolicy, DuplicateDecision, Finding,
+        FindingInput, PrContext, ReportingArtifact, Verdict,
     };
 
     fn policy() -> DisclosurePolicy {
@@ -991,6 +1006,18 @@ mod tests {
         ReportingArtifact::default()
     }
 
+    fn duplicate_artifact() -> ReportingArtifact {
+        let mut artifact = artifact(true);
+        artifact.duplicate_decisions.push(DuplicateDecision {
+            finding_id: "F-1".to_string(),
+            already_reported: true,
+            matching_comment_ids: vec![101],
+            confidence: "high".to_string(),
+            rationale: "same root issue already reported".to_string(),
+        });
+        artifact
+    }
+
     #[test]
     fn hybrid_security_pr_introduced_finding_posts_to_pr() {
         let route = structured_disclosure_route(
@@ -1025,6 +1052,84 @@ mod tests {
         );
 
         assert_eq!(route, StructuredDisclosureRoute::Skip);
+    }
+
+    #[test]
+    fn duplicate_only_pr_comment_skips_even_when_notify_on_empty() {
+        let mut config = disclose_config(ReportMode::PrComment);
+        config.notify_on_empty = true;
+
+        let route = structured_disclosure_route(
+            target("pr-review"),
+            &duplicate_artifact(),
+            &policy(),
+            &config,
+        );
+
+        assert_eq!(route, StructuredDisclosureRoute::Skip);
+    }
+
+    #[test]
+    fn mixed_duplicate_and_new_findings_still_posts_review() {
+        let mut artifact = artifact(true);
+        let second = Finding::from_input(
+            1,
+            FindingInput {
+                title: "New bug".to_string(),
+                severity: "high".to_string(),
+                confidence: "high".to_string(),
+                affected_locations: vec![AffectedLocation {
+                    path: "src/lib.rs".to_string(),
+                    start_line: Some(10),
+                    end_line: None,
+                }],
+                evidence: "evidence".to_string(),
+                skills_used: Vec::new(),
+                body_markdown: "new body".to_string(),
+            },
+        )
+        .unwrap();
+        artifact.findings.push(second);
+        artifact.verdicts.push(Verdict {
+            finding_id: "F-2".to_string(),
+            confirmed: true,
+            introduced_by_pr: true,
+            present_on_pr_branch: true,
+            present_on_base: false,
+            present_on_default_branch: false,
+            disclosure_decision: "disclose".to_string(),
+            title_override: None,
+            severity_override: None,
+            impact_override: None,
+            final_comment_body: Some("new body".to_string()),
+            affected_locations: Vec::new(),
+            command_transcripts: vec![CommandTranscript {
+                command: "cargo test".to_string(),
+                branch_or_commit: "head".to_string(),
+                key_output: "failed".to_string(),
+                interpretation: "reproduced".to_string(),
+            }],
+            rationale: "confirmed".to_string(),
+        });
+        artifact.duplicate_decisions.push(DuplicateDecision {
+            finding_id: "F-1".to_string(),
+            already_reported: true,
+            matching_comment_ids: vec![101],
+            confidence: "high".to_string(),
+            rationale: "same root issue already reported".to_string(),
+        });
+
+        let route = structured_disclosure_route(
+            target("pr-review"),
+            &artifact,
+            &policy(),
+            &disclose_config(ReportMode::PrComment),
+        );
+
+        assert_eq!(route, StructuredDisclosureRoute::PrReview);
+        let publishable = artifact.publishable_findings(&policy());
+        assert_eq!(publishable.len(), 1);
+        assert_eq!(publishable[0].finding_id, "F-2");
     }
 
     #[test]

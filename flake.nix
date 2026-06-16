@@ -324,6 +324,24 @@
               description = "Goose provider to use for the verifier pass. Defaults to services.fiach.provider when unset.";
             };
 
+            dedupeExistingComments = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Run duplicate suppression against existing PR discussion before posting verified findings.";
+            };
+
+            dedupeModel = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Model to use for duplicate suppression. Defaults through verifierModel then model when unset.";
+            };
+
+            dedupeProvider = lib.mkOption {
+              type = lib.types.nullOr (lib.types.enum [ "openrouter" "anthropic" "openai" "google" ]);
+              default = null;
+              description = "Goose provider to use for duplicate suppression. Defaults through verifierProvider then provider when unset.";
+            };
+
             environmentFile = lib.mkOption {
               type = lib.types.path;
               description = "Path to environment file containing GITHUB_TOKEN, the selected provider API key, and optionally FIACH_SERVER_TOKEN.";
@@ -669,6 +687,7 @@
                       out_dir = "${cfg.dataDir}/reports";
                       report_mode = cfg.reportMode;
                       verify_findings = cfg.verifyFindings;
+                      dedupe_existing_comments = cfg.dedupeExistingComments;
                       max_turns = cfg.maxTurns;
                       timeout_mins = cfg.timeoutMins;
                       max_retries = cfg.maxRetries;
@@ -677,6 +696,10 @@
                       verifier_provider = cfg.verifierProvider;
                     } // lib.optionalAttrs (cfg.verifierModel != null) {
                       verifier_model = cfg.verifierModel;
+                    } // lib.optionalAttrs (cfg.dedupeProvider != null) {
+                      dedupe_provider = cfg.dedupeProvider;
+                    } // lib.optionalAttrs (cfg.dedupeModel != null) {
+                      dedupe_model = cfg.dedupeModel;
                     } // lib.optionalAttrs (cfg.withSkill != null) {
                       with_skill = cfg.withSkill;
                     } // lib.optionalAttrs (cfg.syncRepo != null) {

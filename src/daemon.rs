@@ -41,6 +41,9 @@ pub struct DaemonParams {
     pub model: String,
     pub verifier_provider: Option<String>,
     pub verifier_model: Option<String>,
+    pub dedupe_existing_comments: bool,
+    pub dedupe_provider: Option<String>,
+    pub dedupe_model: Option<String>,
     pub skill: Option<String>,
     pub personas: Vec<crate::persona::PersonaSource>,
     pub max_turns: u32,
@@ -758,6 +761,9 @@ async fn process_daemon_job(
                 model: params.model.clone(),
                 verifier_provider: params.verifier_provider.clone(),
                 verifier_model: params.verifier_model.clone(),
+                dedupe_existing_comments: params.dedupe_existing_comments,
+                dedupe_provider: params.dedupe_provider.clone(),
+                dedupe_model: params.dedupe_model.clone(),
                 output: output_path,
                 skill: params.skill.clone(),
                 persona: job.persona.clone(),
@@ -1162,6 +1168,13 @@ async fn run_sandboxed_review(
     if let Some(model) = &review_params.verifier_model {
         cmd.arg("--verifier-model").arg(model);
     }
+    cmd.arg("--dedupe-existing-comments").arg("false");
+    if let Some(provider) = &review_params.dedupe_provider {
+        cmd.arg("--dedupe-provider").arg(provider);
+    }
+    if let Some(model) = &review_params.dedupe_model {
+        cmd.arg("--dedupe-model").arg(model);
+    }
 
     let _ = &review_params.output;
     cmd.arg("--output").arg("/sandbox-output/report.md");
@@ -1307,7 +1320,45 @@ async fn run_sandboxed_review(
         read_json_file::<crate::reporting::ReportingArtifact>(&structured_path),
         read_json_file::<crate::reporting::DisclosurePolicy>(&policy_path),
     ) {
-        (Ok(artifact), Ok(policy)) => {
+        (Ok(mut artifact), Ok(policy)) => {
+            let workspace_path = report_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let dedupe_result = crate::review::apply_duplicate_suppression(
+                crate::review::DuplicateSuppressionParams {
+                    artifact: &mut artifact,
+                    workspace_path,
+                    repo: &review_params.repo,
+                    pr_number: review_params.pr_number,
+                    pr_context: &policy.pr_context,
+                    policy: &policy,
+                    provider: &review_params.provider,
+                    model: &review_params.model,
+                    verifier_provider: review_params.verifier_provider.as_deref(),
+                    verifier_model: review_params.verifier_model.as_deref(),
+                    dedupe_existing_comments: review_params.dedupe_existing_comments,
+                    dedupe_provider: review_params.dedupe_provider.as_deref(),
+                    dedupe_model: review_params.dedupe_model.as_deref(),
+                    max_retries: review_params.max_retries,
+                    retry_delay_secs: review_params.retry_delay_secs,
+                    timeout_mins: review_params.timeout_mins,
+                    max_turns: review_params.max_turns,
+                    cancel_token: cancel_token.clone(),
+                },
+            )
+            .await?;
+            if dedupe_result.is_some() {
+                let report_content = crate::reporting::render_markdown(
+                    &review_params.repo,
+                    review_params.pr_number,
+                    &artifact,
+                    Some(&policy),
+                );
+                std::fs::write(&report_path, report_content)
+                    .context("Failed to write host duplicate-suppressed report")?;
+                std::fs::write(&structured_path, serde_json::to_vec_pretty(&artifact)?)
+                    .context("Failed to write host duplicate-suppressed structured artifact")?;
+            }
             crate::disclose::handle_structured_disclosure(
                 &report_path,
                 crate::disclose::DisclosureTarget {
@@ -1343,6 +1394,37 @@ async fn run_sandboxed_review(
     };
 
     let mut metadata = completed.metadata;
+    if let (Ok(artifact), Ok(policy)) = (
+        read_json_file::<crate::reporting::ReportingArtifact>(&structured_path),
+        read_json_file::<crate::reporting::DisclosurePolicy>(&policy_path),
+    ) {
+        let publishable = artifact.publishable_findings(&policy);
+        let already_reported = artifact.already_reported_findings(&policy);
+        metadata.findings_count = publishable.len() as u32;
+        metadata.status = if artifact.markdown_only_fallback {
+            "markdown-only".to_string()
+        } else if artifact.verifier_failed {
+            "unverified".to_string()
+        } else if !publishable.is_empty() {
+            "confirmed".to_string()
+        } else if !already_reported.is_empty() {
+            "already-reported".to_string()
+        } else if artifact.no_findings.is_some() {
+            "none".to_string()
+        } else {
+            "rejected".to_string()
+        };
+        metadata.severity = publishable
+            .iter()
+            .map(|finding| finding.severity.clone())
+            .next()
+            .unwrap_or_else(|| "none".to_string());
+        metadata.pr_classification = if publishable.is_empty() {
+            "none".to_string()
+        } else {
+            review_params.pr_number.to_string()
+        };
+    }
     metadata.retry_count = crate::state::get_pr_review(
         &params.db_path,
         &review_params.repo,

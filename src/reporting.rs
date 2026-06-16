@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 pub enum ReviewPhase {
     Finder,
     Verifier,
+    Dedupe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -20,6 +21,8 @@ pub struct ReportingArtifact {
     pub no_findings: Option<NoFindings>,
     #[serde(default)]
     pub verdicts: Vec<Verdict>,
+    #[serde(default)]
+    pub duplicate_decisions: Vec<DuplicateDecision>,
     #[serde(default)]
     pub verifier_failed: bool,
     #[serde(default)]
@@ -37,6 +40,32 @@ impl ReportingArtifact {
 
     pub fn accepted_findings(&self, policy: &DisclosurePolicy) -> Vec<AcceptedFinding> {
         self.accepted_findings_with_policy(policy, true)
+    }
+
+    pub fn publishable_findings(&self, policy: &DisclosurePolicy) -> Vec<AcceptedFinding> {
+        self.accepted_findings(policy)
+            .into_iter()
+            .filter(|finding| !self.is_already_reported(&finding.finding_id))
+            .collect()
+    }
+
+    pub fn already_reported_findings(&self, policy: &DisclosurePolicy) -> Vec<AcceptedFinding> {
+        self.accepted_findings(policy)
+            .into_iter()
+            .filter(|finding| self.is_already_reported(&finding.finding_id))
+            .collect()
+    }
+
+    pub fn is_already_reported(&self, finding_id: &str) -> bool {
+        self.duplicate_decisions
+            .iter()
+            .any(|decision| decision.suppresses_finding(finding_id))
+    }
+
+    pub fn duplicate_decision_for(&self, finding_id: &str) -> Option<&DuplicateDecision> {
+        self.duplicate_decisions
+            .iter()
+            .find(|decision| decision.finding_id == finding_id)
     }
 
     pub fn confirmed_findings_including_non_pr(
@@ -236,6 +265,112 @@ impl Verdict {
             self.disclosure_decision.to_ascii_lowercase().as_str(),
             "disclose" | "pr-comment" | "comment" | "inline"
         )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DuplicateDecision {
+    pub finding_id: String,
+    pub already_reported: bool,
+    #[serde(default)]
+    pub matching_comment_ids: Vec<u64>,
+    pub confidence: String,
+    pub rationale: String,
+}
+
+impl DuplicateDecision {
+    pub fn validate(&mut self, finding_ids: &BTreeSet<String>) -> Result<()> {
+        validate_required("finding_id", &self.finding_id)?;
+        if !finding_ids.contains(&self.finding_id) {
+            bail!(
+                "duplicate decision references unknown finding_id `{}`",
+                self.finding_id
+            );
+        }
+        validate_required("confidence", &self.confidence)?;
+        self.confidence = normalize_scalar(std::mem::take(&mut self.confidence));
+        validate_required("rationale", &self.rationale)
+    }
+
+    pub fn suppresses_finding(&self, finding_id: &str) -> bool {
+        self.finding_id == finding_id
+            && self.already_reported
+            && !self.matching_comment_ids.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingPrComment {
+    pub id: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl ExistingPrComment {
+    pub fn from_issue_comment(value: &Value) -> Option<Self> {
+        Self::from_value(value, "top-level", None, None)
+    }
+
+    pub fn from_inline_comment(value: &Value) -> Option<Self> {
+        let path = value
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let line = value
+            .get("line")
+            .or_else(|| value.get("original_line"))
+            .and_then(|value| value.as_u64());
+        Self::from_value(value, "inline", path, line)
+    }
+
+    pub fn from_review(value: &Value) -> Option<Self> {
+        Self::from_value(value, "review", None, None)
+    }
+
+    fn from_value(
+        value: &Value,
+        kind: &str,
+        path: Option<String>,
+        line: Option<u64>,
+    ) -> Option<Self> {
+        let id = value.get("id")?.as_u64()?;
+        let body = value
+            .get("body")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if body.is_empty() {
+            return None;
+        }
+        let author = value
+            .get("user")
+            .and_then(|user| user.get("login"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let url = value
+            .get("html_url")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+
+        Some(Self {
+            id,
+            kind: kind.to_string(),
+            author,
+            body,
+            path,
+            line,
+            url,
+        })
     }
 }
 
@@ -462,6 +597,44 @@ pub fn reporting_tools() -> Vec<Tool> {
                 ],
             ),
         ),
+        Tool::new(
+            "submit_duplicate_decision".to_string(),
+            "Submit whether one verified finding was already reported in existing PR discussion."
+                .to_string(),
+            object_schema(
+                vec![
+                    (
+                        "finding_id",
+                        string_schema("Verified finding id, for example F-1"),
+                    ),
+                    (
+                        "already_reported",
+                        bool_schema(
+                            "Whether an existing PR comment already reports the same root issue",
+                        ),
+                    ),
+                    (
+                        "matching_comment_ids",
+                        array_schema(number_schema("GitHub comment or review id that matched")),
+                    ),
+                    (
+                        "confidence",
+                        string_schema("Confidence in the duplicate decision"),
+                    ),
+                    (
+                        "rationale",
+                        string_schema("Brief rationale citing why the comments do or do not match"),
+                    ),
+                ],
+                vec![
+                    "finding_id",
+                    "already_reported",
+                    "matching_comment_ids",
+                    "confidence",
+                    "rationale",
+                ],
+            ),
+        ),
     ]
 }
 
@@ -518,12 +691,17 @@ pub fn render_markdown(
     policy: Option<&DisclosurePolicy>,
 ) -> String {
     let accepted = policy
-        .map(|policy| artifact.accepted_findings(policy))
+        .map(|policy| artifact.publishable_findings(policy))
+        .unwrap_or_default();
+    let already_reported = policy
+        .map(|policy| artifact.already_reported_findings(policy))
         .unwrap_or_default();
     let status = if artifact.verifier_failed {
         "unverified"
     } else if !accepted.is_empty() {
         "confirmed"
+    } else if !already_reported.is_empty() {
+        "already-reported"
     } else if artifact.no_findings.is_some() {
         "none"
     } else {
@@ -551,7 +729,7 @@ findings_count: {findings_count}
 ---
 
 "#,
-        title = markdown_title(artifact, &accepted),
+        title = markdown_title(artifact, &accepted, &already_reported),
         skills = skills
             .iter()
             .map(|skill| format!("\"{}\"", skill.replace('"', "\\\"")))
@@ -572,7 +750,7 @@ findings_count: {findings_count}
 
     if accepted.is_empty() {
         out.push_str(
-            "## Summary\nNo verified PR-introduced findings were approved for disclosure.\n\n",
+            "## Summary\nNo new verified PR-introduced findings were approved for disclosure.\n\n",
         );
     } else {
         out.push_str(
@@ -606,6 +784,32 @@ findings_count: {findings_count}
             }
             out.push('\n');
         }
+    }
+
+    if !already_reported.is_empty() {
+        out.push_str("## Already Reported\n");
+        for finding in &already_reported {
+            let matches = artifact
+                .duplicate_decision_for(&finding.finding_id)
+                .map(|decision| {
+                    decision
+                        .matching_comment_ids
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let rationale = artifact
+                .duplicate_decision_for(&finding.finding_id)
+                .map(|decision| decision.rationale.trim())
+                .unwrap_or("duplicate decision did not include a rationale");
+            out.push_str(&format!(
+                "- {} ({}): matched existing comment ids [{}]. {}\n",
+                finding.title, finding.finding_id, matches, rationale
+            ));
+        }
+        out.push('\n');
     }
 
     let rejected: Vec<_> = artifact
@@ -670,6 +874,9 @@ pub fn validate_artifact(artifact: &mut ReportingArtifact) -> Result<()> {
     }
     for verdict in &mut artifact.verdicts {
         verdict.validate(&ids)?;
+    }
+    for decision in &mut artifact.duplicate_decisions {
+        decision.validate(&ids)?;
     }
     Ok(())
 }
@@ -787,12 +994,19 @@ fn collect_skills(artifact: &ReportingArtifact) -> Vec<String> {
     normalize_skills(skills)
 }
 
-fn markdown_title(artifact: &ReportingArtifact, accepted: &[AcceptedFinding]) -> String {
+fn markdown_title(
+    artifact: &ReportingArtifact,
+    accepted: &[AcceptedFinding],
+    already_reported: &[AcceptedFinding],
+) -> String {
     if artifact.verifier_failed {
         return "Unverified review".to_string();
     }
     if let Some(finding) = accepted.first() {
         return finding.title.replace('"', "\\\"");
+    }
+    if !already_reported.is_empty() {
+        return "Verified findings already reported".to_string();
     }
     if artifact.no_findings.is_some() {
         return "No verified findings".to_string();
@@ -828,6 +1042,59 @@ mod tests {
                 "src/lib.rs".to_string(),
                 BTreeSet::from([10_u32, 11_u32]),
             )]),
+        }
+    }
+
+    fn accepted_artifact(count: usize) -> ReportingArtifact {
+        let findings = (0..count)
+            .map(|index| {
+                Finding::from_input(
+                    index,
+                    FindingInput {
+                        title: format!("Bug {}", index + 1),
+                        severity: "high".to_string(),
+                        confidence: "high".to_string(),
+                        affected_locations: vec![AffectedLocation {
+                            path: "src/lib.rs".to_string(),
+                            start_line: Some(10 + index as u32),
+                            end_line: None,
+                        }],
+                        evidence: "evidence".to_string(),
+                        skills_used: Vec::new(),
+                        body_markdown: format!("body {}", index + 1),
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let verdicts = (0..count)
+            .map(|index| Verdict {
+                finding_id: format!("F-{}", index + 1),
+                confirmed: true,
+                introduced_by_pr: true,
+                present_on_pr_branch: true,
+                present_on_base: false,
+                present_on_default_branch: false,
+                disclosure_decision: "disclose".to_string(),
+                title_override: None,
+                severity_override: None,
+                impact_override: None,
+                final_comment_body: None,
+                affected_locations: Vec::new(),
+                command_transcripts: vec![CommandTranscript {
+                    command: "cargo test".to_string(),
+                    branch_or_commit: "head".to_string(),
+                    key_output: "failed".to_string(),
+                    interpretation: "reproduced".to_string(),
+                }],
+                rationale: "confirmed".to_string(),
+            })
+            .collect();
+
+        ReportingArtifact {
+            findings,
+            verdicts,
+            ..Default::default()
         }
     }
 
@@ -938,5 +1205,99 @@ mod tests {
         };
 
         assert!(artifact.accepted_findings(&policy()).is_empty());
+    }
+
+    #[test]
+    fn duplicate_decision_with_match_suppresses_publishable_finding() {
+        let mut artifact = accepted_artifact(2);
+        artifact.duplicate_decisions.push(DuplicateDecision {
+            finding_id: "F-1".to_string(),
+            already_reported: true,
+            matching_comment_ids: vec![101],
+            confidence: "high".to_string(),
+            rationale: "same issue already reported".to_string(),
+        });
+
+        validate_artifact(&mut artifact).unwrap();
+
+        let publishable = artifact.publishable_findings(&policy());
+        let already_reported = artifact.already_reported_findings(&policy());
+        assert_eq!(publishable.len(), 1);
+        assert_eq!(publishable[0].finding_id, "F-2");
+        assert_eq!(already_reported.len(), 1);
+        assert_eq!(already_reported[0].finding_id, "F-1");
+    }
+
+    #[test]
+    fn duplicate_decision_without_matching_ids_does_not_suppress() {
+        let mut artifact = accepted_artifact(1);
+        artifact.duplicate_decisions.push(DuplicateDecision {
+            finding_id: "F-1".to_string(),
+            already_reported: true,
+            matching_comment_ids: Vec::new(),
+            confidence: "high".to_string(),
+            rationale: "claimed duplicate without concrete comment".to_string(),
+        });
+
+        validate_artifact(&mut artifact).unwrap();
+
+        assert_eq!(artifact.publishable_findings(&policy()).len(), 1);
+        assert!(artifact.already_reported_findings(&policy()).is_empty());
+    }
+
+    #[test]
+    fn render_markdown_includes_already_reported_section() {
+        let mut artifact = accepted_artifact(1);
+        artifact.duplicate_decisions.push(DuplicateDecision {
+            finding_id: "F-1".to_string(),
+            already_reported: true,
+            matching_comment_ids: vec![42],
+            confidence: "high".to_string(),
+            rationale: "existing review comment reports the same root issue".to_string(),
+        });
+        validate_artifact(&mut artifact).unwrap();
+
+        let markdown = render_markdown("owner/repo", 7, &artifact, Some(&policy()));
+
+        assert!(markdown.contains("status: already-reported"));
+        assert!(markdown.contains("## Already Reported"));
+        assert!(markdown.contains("matched existing comment ids [42]"));
+        assert!(!markdown.contains("## Suppressed Candidates\n- F-1"));
+    }
+
+    #[test]
+    fn normalizes_existing_pr_comments_from_github_shapes() {
+        let issue = json!({
+            "id": 1,
+            "body": "top-level body",
+            "html_url": "https://github.test/comment/1",
+            "user": { "login": "alice" }
+        });
+        let inline = json!({
+            "id": 2,
+            "body": "inline body",
+            "path": "src/lib.rs",
+            "line": 10,
+            "html_url": "https://github.test/comment/2",
+            "user": { "login": "bob" }
+        });
+        let review = json!({
+            "id": 3,
+            "body": "review body",
+            "html_url": "https://github.test/review/3",
+            "user": { "login": "carol" }
+        });
+
+        let issue = ExistingPrComment::from_issue_comment(&issue).unwrap();
+        let inline = ExistingPrComment::from_inline_comment(&inline).unwrap();
+        let review = ExistingPrComment::from_review(&review).unwrap();
+
+        assert_eq!(issue.kind, "top-level");
+        assert_eq!(issue.author.as_deref(), Some("alice"));
+        assert_eq!(inline.kind, "inline");
+        assert_eq!(inline.path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(inline.line, Some(10));
+        assert_eq!(review.kind, "review");
+        assert_eq!(review.body, "review body");
     }
 }

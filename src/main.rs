@@ -119,6 +119,18 @@ enum Commands {
         #[arg(long)]
         verifier_provider: Option<String>,
 
+        /// Suppress verified findings that existing PR discussion already reported
+        #[arg(long)]
+        dedupe_existing_comments: Option<bool>,
+
+        /// Model to use for duplicate suppression. Defaults through verifier then main model.
+        #[arg(long)]
+        dedupe_model: Option<String>,
+
+        /// Provider to use for duplicate suppression. Defaults through verifier then main provider.
+        #[arg(long)]
+        dedupe_provider: Option<String>,
+
         /// Path to write the review report. If not provided, defaults to
         /// "./reports/PR{pr_number}_{commit_hash}.md" in the current working directory.
         #[arg(long)]
@@ -229,6 +241,18 @@ enum Commands {
         /// Provider to use for the verifier pass. Defaults to --provider.
         #[arg(long)]
         verifier_provider: Option<String>,
+
+        /// Suppress verified findings that existing PR discussion already reported
+        #[arg(long)]
+        dedupe_existing_comments: Option<bool>,
+
+        /// Model to use for duplicate suppression. Defaults through verifier then main model.
+        #[arg(long)]
+        dedupe_model: Option<String>,
+
+        /// Provider to use for duplicate suppression. Defaults through verifier then main provider.
+        #[arg(long)]
+        dedupe_provider: Option<String>,
 
         /// Explicitly instruct the agent to use a specific skill.
         #[arg(long)]
@@ -407,6 +431,9 @@ async fn main() -> Result<()> {
             provider,
             verifier_model,
             verifier_provider,
+            dedupe_existing_comments,
+            dedupe_model,
+            dedupe_provider,
             output,
             with_skill,
             persona,
@@ -439,6 +466,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| "openrouter".to_string());
             let verifier_model = verifier_model.or(rev_cfg.verifier_model);
             let verifier_provider = verifier_provider.or(rev_cfg.verifier_provider);
+            let dedupe_existing_comments = dedupe_existing_comments
+                .or(rev_cfg.dedupe_existing_comments)
+                .unwrap_or(true);
+            let dedupe_model = dedupe_model.or(rev_cfg.dedupe_model);
+            let dedupe_provider = dedupe_provider.or(rev_cfg.dedupe_provider);
             let personas = resolve_personas(persona, rev_cfg.persona, rev_cfg.personas);
             let use_persona_kind = personas.len() > 1;
             let report_mode_str = report_mode
@@ -470,6 +502,9 @@ async fn main() -> Result<()> {
                     provider: provider.clone(),
                     verifier_model: verifier_model.clone(),
                     verifier_provider: verifier_provider.clone(),
+                    dedupe_existing_comments,
+                    dedupe_model: dedupe_model.clone(),
+                    dedupe_provider: dedupe_provider.clone(),
                     output: output_for_persona(output.clone(), &persona, use_persona_kind),
                     skill: skill.clone(),
                     persona: persona.clone(),
@@ -525,6 +560,9 @@ async fn main() -> Result<()> {
             provider,
             verifier_model,
             verifier_provider,
+            dedupe_existing_comments,
+            dedupe_model,
+            dedupe_provider,
             with_skill,
             persona,
             max_turns,
@@ -574,6 +612,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| "openrouter".to_string());
             let verifier_model = verifier_model.or(daemon_cfg.verifier_model);
             let verifier_provider = verifier_provider.or(daemon_cfg.verifier_provider);
+            let dedupe_existing_comments = dedupe_existing_comments
+                .or(daemon_cfg.dedupe_existing_comments)
+                .unwrap_or(true);
+            let dedupe_model = dedupe_model.or(daemon_cfg.dedupe_model);
+            let dedupe_provider = dedupe_provider.or(daemon_cfg.dedupe_provider);
             let personas = resolve_personas(persona, daemon_cfg.persona, daemon_cfg.personas);
             let report_mode_str = report_mode
                 .or(daemon_cfg.report_mode)
@@ -634,6 +677,9 @@ async fn main() -> Result<()> {
                 model,
                 verifier_provider,
                 verifier_model,
+                dedupe_existing_comments,
+                dedupe_provider,
+                dedupe_model,
                 skill: with_skill.or(daemon_cfg.with_skill),
                 personas,
                 max_turns: max_turns.or(daemon_cfg.max_turns).unwrap_or(60),
