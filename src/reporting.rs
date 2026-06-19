@@ -422,6 +422,8 @@ pub struct AcceptedFinding {
     pub impact: Option<String>,
     pub body: String,
     pub inline_comments: Vec<InlineComment>,
+    #[serde(default)]
+    pub additional_locations: Vec<AffectedLocation>,
     pub unanchored_locations: Vec<AffectedLocation>,
     pub verdict: Verdict,
 }
@@ -457,14 +459,29 @@ impl AcceptedFinding {
         };
 
         let mut inline_comments = Vec::new();
+        let mut additional_locations = Vec::new();
         let mut unanchored_locations = Vec::new();
+        let mut seen_locations = BTreeSet::new();
         for location in locations {
+            let location_key = (
+                location.path.clone(),
+                location.start_line,
+                location.end_line,
+            );
+            if !seen_locations.insert(location_key) {
+                continue;
+            }
+
             if policy.valid_anchor(&location) {
-                inline_comments.push(InlineComment {
-                    path: location.path.clone(),
-                    line: location.start_line.unwrap_or_default(),
-                    body: body.clone(),
-                });
+                if inline_comments.is_empty() {
+                    inline_comments.push(InlineComment {
+                        path: location.path.clone(),
+                        line: location.start_line.unwrap_or_default(),
+                        body: body.clone(),
+                    });
+                } else {
+                    additional_locations.push(location);
+                }
             } else {
                 unanchored_locations.push(location);
             }
@@ -483,6 +500,7 @@ impl AcceptedFinding {
             impact: verdict.impact_override.clone(),
             body,
             inline_comments,
+            additional_locations,
             unanchored_locations,
             verdict: verdict.clone(),
         })
@@ -772,6 +790,16 @@ findings_count: {findings_count}
                     transcript.command, transcript.branch_or_commit, transcript.interpretation
                 ));
             }
+            if !finding.additional_locations.is_empty() {
+                out.push_str("\n### Additional Locations\n");
+                for location in &finding.additional_locations {
+                    out.push_str(&format!(
+                        "- {}:{}\n",
+                        location.path,
+                        location.start_line.unwrap_or_default()
+                    ));
+                }
+            }
             if !finding.unanchored_locations.is_empty() {
                 out.push_str("\n### Unanchored Locations\n");
                 for location in &finding.unanchored_locations {
@@ -848,6 +876,16 @@ pub fn review_summary_body(accepted: &[AcceptedFinding]) -> String {
             finding.severity,
             finding.impact.as_deref().unwrap_or("see inline comment")
         ));
+        if !finding.additional_locations.is_empty() {
+            body.push_str("  Additional locations included in summary:\n");
+            for location in &finding.additional_locations {
+                body.push_str(&format!(
+                    "  - {}:{}\n",
+                    location.path,
+                    location.start_line.unwrap_or_default()
+                ));
+            }
+        }
         if !finding.unanchored_locations.is_empty() {
             body.push_str("  Unanchored locations included in summary:\n");
             for location in &finding.unanchored_locations {
@@ -1166,6 +1204,86 @@ mod tests {
 
         assert_eq!(accepted.len(), 1);
         assert_eq!(accepted[0].inline_comments[0].line, 10);
+    }
+
+    #[test]
+    fn accepted_finding_posts_one_inline_comment_per_finding() {
+        let finding = Finding::from_input(
+            0,
+            FindingInput {
+                title: "Bug".to_string(),
+                severity: "High".to_string(),
+                confidence: "high".to_string(),
+                affected_locations: vec![
+                    AffectedLocation {
+                        path: "src/lib.rs".to_string(),
+                        start_line: Some(10),
+                        end_line: None,
+                    },
+                    AffectedLocation {
+                        path: "src/lib.rs".to_string(),
+                        start_line: Some(11),
+                        end_line: None,
+                    },
+                    AffectedLocation {
+                        path: "src/lib.rs".to_string(),
+                        start_line: Some(11),
+                        end_line: None,
+                    },
+                    AffectedLocation {
+                        path: "src/lib.rs".to_string(),
+                        start_line: Some(12),
+                        end_line: None,
+                    },
+                ],
+                evidence: "evidence".to_string(),
+                skills_used: vec!["rust".to_string()],
+                body_markdown: "body".to_string(),
+            },
+        )
+        .unwrap();
+        let mut artifact = ReportingArtifact {
+            findings: vec![finding],
+            verdicts: vec![Verdict {
+                finding_id: "F-1".to_string(),
+                confirmed: true,
+                introduced_by_pr: true,
+                present_on_pr_branch: true,
+                present_on_base: false,
+                present_on_default_branch: false,
+                disclosure_decision: "disclose".to_string(),
+                title_override: None,
+                severity_override: None,
+                impact_override: None,
+                final_comment_body: None,
+                affected_locations: Vec::new(),
+                command_transcripts: vec![CommandTranscript {
+                    command: "cargo test".to_string(),
+                    branch_or_commit: "head".to_string(),
+                    key_output: "failed".to_string(),
+                    interpretation: "reproduced".to_string(),
+                }],
+                rationale: "confirmed".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        validate_artifact(&mut artifact).unwrap();
+        let accepted = artifact.accepted_findings(&policy());
+
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].inline_comments.len(), 1);
+        assert_eq!(accepted[0].inline_comments[0].line, 10);
+        assert_eq!(accepted[0].additional_locations.len(), 1);
+        assert_eq!(accepted[0].additional_locations[0].start_line, Some(11));
+        assert_eq!(accepted[0].unanchored_locations.len(), 1);
+        assert_eq!(accepted[0].unanchored_locations[0].start_line, Some(12));
+
+        let summary = review_summary_body(&accepted);
+        assert!(summary.contains("Additional locations included in summary"));
+        assert!(summary.contains("src/lib.rs:11"));
+        assert!(summary.contains("Unanchored locations included in summary"));
+        assert!(summary.contains("src/lib.rs:12"));
     }
 
     #[test]
