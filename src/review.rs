@@ -97,59 +97,6 @@ impl SessionUsageSnapshot {
             total_tokens,
         }
     }
-
-    fn has_usage(self) -> bool {
-        self.input_tokens > 0 || self.output_tokens > 0 || self.total_tokens > 0
-    }
-
-    fn advances_turn(self, previous: Self) -> bool {
-        if self.input_tokens > previous.input_tokens {
-            return true;
-        }
-
-        previous.input_tokens == 0
-            && self.input_tokens == 0
-            && !previous.has_usage()
-            && self.has_usage()
-    }
-}
-
-#[derive(Debug, Default)]
-struct AgentTurnCounter {
-    assistant_messages: u32,
-    usage_turns: u32,
-    saw_usage: bool,
-    last_usage: SessionUsageSnapshot,
-}
-
-impl AgentTurnCounter {
-    fn record_assistant_message(&mut self, session: Option<&Session>) -> u32 {
-        self.record_assistant_usage(session.map(SessionUsageSnapshot::from_session))
-    }
-
-    fn record_assistant_usage(&mut self, usage: Option<SessionUsageSnapshot>) -> u32 {
-        self.assistant_messages += 1;
-
-        if let Some(current_usage) = usage
-            && current_usage.has_usage()
-        {
-            self.saw_usage = true;
-            if current_usage.advances_turn(self.last_usage) {
-                self.usage_turns += 1;
-            }
-            self.last_usage = current_usage;
-        }
-
-        self.current()
-    }
-
-    fn current(&self) -> u32 {
-        if self.saw_usage {
-            self.usage_turns
-        } else {
-            self.assistant_messages
-        }
-    }
 }
 
 fn session_accumulated_tokens(session: &Session) -> (u64, u64) {
@@ -827,6 +774,11 @@ pub async fn run_review(
 
     // 8. Stream the agent's response with a timeout
     tracing::info!(
+        repo = %params.repo,
+        pr = params.pr_number,
+        review_kind = %params.review_kind,
+        phase = "finder",
+        session_id = %session_config.id,
         max_turns = params.max_turns,
         timeout_mins = params.timeout_mins,
         "Sending review request to agent..."
@@ -835,10 +787,12 @@ pub async fn run_review(
     let review_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
-        let mut turn_counter = AgentTurnCounter::default();
         let mut budget_exceeded = false;
         let mut cost_unavailable_warned = false;
         let mut last_assistant_text: Option<String> = None;
+        let mut last_progress_log = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .unwrap_or_else(Instant::now);
 
         let mut stream = loop {
             let user_message_clone = user_message.clone();
@@ -896,7 +850,6 @@ pub async fn run_review(
                                 tracing::trace!(message = %json, "Agent message");
                             }
 
-                            // Detect turns (LLM responses)
                             if message.role == Role::Assistant {
                                 let text = message.as_concat_text();
                                 if !text.trim().is_empty() {
@@ -909,132 +862,107 @@ pub async fn run_review(
                                     .get_session(&session_config.id, false)
                                     .await
                                     .ok();
-                                let previous_turn_count = turn_counter.current();
-                                let accumulated_turn_count =
-                                    turn_counter.record_assistant_message(session.as_ref());
-                                let turn_advanced = accumulated_turn_count > previous_turn_count;
 
                                 if let Some(session) = session.as_ref() {
-                                    if turn_advanced
-                                        && (accumulated_turn_count % 5 == 0
-                                            || accumulated_turn_count == 1)
-                                    {
-                                        let (current_input, _) =
-                                            session_accumulated_tokens(session);
+                                    let (current_input, _) = session_accumulated_tokens(session);
+                                    peak_input_tokens = peak_input_tokens.max(current_input);
 
-                                        // Heuristic: peak input in a session is roughly the history size of the last turn.
-                                        peak_input_tokens = peak_input_tokens.max(
-                                            (2 * current_input)
-                                                / (accumulated_turn_count as u64 + 1),
-                                        );
+                                    let session_cost = cost_from_session(
+                                        session,
+                                        &params.provider,
+                                        &params.model,
+                                        input_price_per_m,
+                                        output_price_per_m,
+                                    );
+                                    let current_cost =
+                                        sum_known_costs([direct_call_cost_usd, session_cost]);
 
-                                        let session_cost = cost_from_session(
-                                            session,
-                                            &params.provider,
-                                            &params.model,
-                                            input_price_per_m,
-                                            output_price_per_m,
-                                        );
-                                        let current_cost =
-                                            sum_known_costs([direct_call_cost_usd, session_cost]);
-
+                                    if last_progress_log.elapsed() >= Duration::from_secs(30) {
+                                        last_progress_log = Instant::now();
                                         tracing::info!(
-                                            turn = accumulated_turn_count,
-                                            goose_max_turns = params.max_turns,
+                                            repo = %params.repo,
+                                            pr = params.pr_number,
+                                            review_kind = %params.review_kind,
+                                            phase = "finder",
+                                            session_id = %session_config.id,
                                             cost = %format_cost(current_cost),
                                             "Review in progress..."
                                         );
+                                    }
 
-                                        // Budget check
-                                        if params.max_cost_usd.is_some()
-                                            && session_cost.is_none()
-                                            && !cost_unavailable_warned
-                                        {
-                                            cost_unavailable_warned = true;
-                                            tracing::warn!(
-                                                provider = %params.provider,
-                                                model = %params.model,
-                                                "Cost is unknown; --max-cost cannot be enforced unless provider usage and model pricing are available or explicit prices are configured"
-                                            );
-                                        }
-
-                                        if let Some(max_cost) = params.max_cost_usd
-                                            && let Some(current_cost) = current_cost
-                                            && current_cost > max_cost
-                                            && !budget_exceeded
-                                        {
-                                            tracing::warn!(
-                                                cost = %format_cost(Some(current_cost)),
-                                                max = %format_cost(Some(max_cost)),
-                                                "Budget exceeded! Requesting immediate report..."
-                                            );
-                                            budget_exceeded = true;
-
-                                            let budget_nudge = "BUDGET EXCEEDED! Stop analyzing and submit your current result now. Use `submit_finding` for each candidate, or `submit_no_findings` if there are no candidates. Do not do anything else.".to_string();
-                                            let follow_up_message = Message::user().with_text(&budget_nudge);
-
-                                            tracing::info!("Nudging agent to finalize report due to budget...");
-
-                                            let mut s_opt = None;
-                                            let mut last_err = None;
-                                            while retries <= params.max_retries {
-                                                match agent
-                                                    .reply(
-                                                        follow_up_message.clone(),
-                                                        session_config.clone(),
-                                                        None,
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(s) => {
-                                                        s_opt = Some(s);
-                                                        break;
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::error!(
-                                                            "Failed to send budget nudge: {}, retrying...",
-                                                            e
-                                                        );
-                                                        last_err = Some(e);
-                                                        retries += 1;
-                                                        tokio::time::sleep(Duration::from_secs(
-                                                            delay,
-                                                        ))
-                                                        .await;
-                                                        delay *= 2;
-                                                    }
-                                                }
-                                            }
-                                            match s_opt {
-                                                Some(s) => {
-                                                    stream = s;
-                                                    continue;
-                                                }
-                                                None => {
-                                                    if let Some(err) = last_err {
-                                                        tracing::warn!("Failed to restart stream for budget nudge after retries. Last error: {}", err);
-                                                    } else {
-                                                        tracing::warn!("Failed to restart stream for budget nudge after retries.");
-                                                    }
-                                                    return Ok(accumulated_turn_count);
-                                                }
-                                            }
-                                        }
-                                    } else if turn_advanced {
-                                        tracing::debug!(
-                                            turn = accumulated_turn_count,
-                                            goose_max_turns = params.max_turns,
-                                            "Agent turn completed"
+                                    if params.max_cost_usd.is_some()
+                                        && session_cost.is_none()
+                                        && !cost_unavailable_warned
+                                    {
+                                        cost_unavailable_warned = true;
+                                        tracing::warn!(
+                                            provider = %params.provider,
+                                            model = %params.model,
+                                            "Cost is unknown; --max-cost cannot be enforced unless provider usage and model pricing are available or explicit prices are configured"
                                         );
                                     }
-                                } else if turn_advanced {
-                                    tracing::debug!(
-                                        turn = accumulated_turn_count,
-                                        goose_max_turns = params.max_turns,
-                                        "Agent turn completed without session usage"
-                                    );
-                                }
 
+                                    if let Some(max_cost) = params.max_cost_usd
+                                        && let Some(current_cost) = current_cost
+                                        && current_cost > max_cost
+                                        && !budget_exceeded
+                                    {
+                                        tracing::warn!(
+                                            cost = %format_cost(Some(current_cost)),
+                                            max = %format_cost(Some(max_cost)),
+                                            "Budget exceeded! Requesting immediate report..."
+                                        );
+                                        budget_exceeded = true;
+
+                                        let budget_nudge = "BUDGET EXCEEDED! Stop analyzing and submit your current result now. Use `submit_finding` for each candidate, or `submit_no_findings` if there are no candidates. Do not do anything else.".to_string();
+                                        let follow_up_message = Message::user().with_text(&budget_nudge);
+
+                                        tracing::info!("Nudging agent to finalize report due to budget...");
+
+                                        let mut s_opt = None;
+                                        let mut last_err = None;
+                                        while retries <= params.max_retries {
+                                            match agent
+                                                .reply(
+                                                    follow_up_message.clone(),
+                                                    session_config.clone(),
+                                                    None,
+                                                )
+                                                .await
+                                            {
+                                                Ok(s) => {
+                                                    s_opt = Some(s);
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to send budget nudge: {}, retrying...",
+                                                        e
+                                                    );
+                                                    last_err = Some(e);
+                                                    retries += 1;
+                                                    tokio::time::sleep(Duration::from_secs(delay))
+                                                        .await;
+                                                    delay *= 2;
+                                                }
+                                            }
+                                        }
+                                        match s_opt {
+                                            Some(s) => {
+                                                stream = s;
+                                                continue;
+                                            }
+                                            None => {
+                                                if let Some(err) = last_err {
+                                                    tracing::warn!("Failed to restart stream for budget nudge after retries. Last error: {}", err);
+                                                } else {
+                                                    tracing::warn!("Failed to restart stream for budget nudge after retries.");
+                                                }
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(Ok(_)) => {
@@ -1060,7 +988,11 @@ pub async fn run_review(
                             };
 
                             tracing::info!(
-                                turns = turn_counter.current(),
+                                repo = %params.repo,
+                                pr = params.pr_number,
+                                review_kind = %params.review_kind,
+                                phase = "finder",
+                                session_id = %session_config.id,
                                 attempt = retries + 1,
                                 max_retries = params.max_retries,
                                 "Stream interrupted; retrying with a follow-up prompt"
@@ -1105,19 +1037,23 @@ pub async fn run_review(
                         }
                         None => {
                             if reporting_artifact.lock().await.finder_complete() {
-                                return Ok(turn_counter.current()); // Stream finished successfully
+                                return Ok(()); // Stream finished successfully
                             }
 
                             if budget_exceeded && retries > 0 {
-                                return Ok(turn_counter.current());
+                                return Ok(());
                             }
 
                             if retries >= params.max_retries {
                                 tracing::warn!(
-                                    turns = turn_counter.current(),
+                                    repo = %params.repo,
+                                    pr = params.pr_number,
+                                    review_kind = %params.review_kind,
+                                    phase = "finder",
+                                    session_id = %session_config.id,
                                     "Agent stopped prematurely and reached retry limit without writing report"
                                 );
-                                return Ok(turn_counter.current());
+                                return Ok(());
                             }
 
                             let follow_up_text = if budget_exceeded {
@@ -1134,7 +1070,11 @@ pub async fn run_review(
                             };
 
                             tracing::info!(
-                                turns = turn_counter.current(),
+                                repo = %params.repo,
+                                pr = params.pr_number,
+                                review_kind = %params.review_kind,
+                                phase = "finder",
+                                session_id = %session_config.id,
                                 attempt = retries + 1,
                                 max_retries = params.max_retries,
                                 "Agent stream ended before structured findings were submitted; retrying with a follow-up prompt"
@@ -1182,20 +1122,19 @@ pub async fn run_review(
             }
         }
     };
-    let mut turn_count =
-        match timeout(Duration::from_secs(params.timeout_mins * 60), review_future).await {
-            Ok(result) => result?,
-            Err(_) => {
-                tracing::warn!(
-                    timeout_mins = params.timeout_mins,
-                    "Review session timed out"
-                );
-                bail!(
-                    "Review session timed out after {} minutes",
-                    params.timeout_mins
-                );
-            }
-        };
+    match timeout(Duration::from_secs(params.timeout_mins * 60), review_future).await {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::warn!(
+                timeout_mins = params.timeout_mins,
+                "Review session timed out"
+            );
+            bail!(
+                "Review session timed out after {} minutes",
+                params.timeout_mins
+            );
+        }
+    };
 
     // 9. Collect final session metrics before cleaning up
     if let Ok(session) = agent
@@ -1206,8 +1145,7 @@ pub async fn run_review(
     {
         let (input, output) = session_accumulated_tokens(&session);
 
-        // For a growing conversation, peak ≈ (2 * sum) / (count + 1)
-        peak_input_tokens = peak_input_tokens.max((2 * input) / (turn_count as u64 + 1));
+        peak_input_tokens = peak_input_tokens.max(input);
         total_output_tokens += output;
         total_processed_tokens += input + output;
         main_session_cost_usd = cost_from_session(
@@ -1258,7 +1196,6 @@ pub async fn run_review(
                 cancel_token: cancel_token.clone(),
             })
             .await?;
-            turn_count += verifier_result.turns;
             peak_input_tokens = peak_input_tokens.max(verifier_result.peak_input_tokens);
             total_output_tokens += verifier_result.output_tokens;
             total_processed_tokens += verifier_result.total_tokens;
@@ -1311,7 +1248,6 @@ pub async fn run_review(
         })
         .await?
         {
-            turn_count += dedupe_result.turns;
             peak_input_tokens = peak_input_tokens.max(dedupe_result.peak_input_tokens);
             total_output_tokens += dedupe_result.output_tokens;
             total_processed_tokens += dedupe_result.total_tokens;
@@ -1371,8 +1307,6 @@ pub async fn run_review(
             path = %report_path,
             structured = %structured_path.display(),
             policy = %policy_path.display(),
-            turns = turn_count,
-            goose_max_turns = params.max_turns,
             should_notify = should_notify,
             findings_count = findings_count,
             status = %status,
@@ -1505,11 +1439,7 @@ pub async fn run_review(
 
         Ok(Some(completed))
     } else {
-        tracing::warn!(
-            turns = turn_count,
-            goose_max_turns = params.max_turns,
-            "Agent finished without submitting structured findings"
-        );
+        tracing::warn!("Agent finished without submitting structured findings");
         workspace.cleanup().await?;
         if cancel_token.is_cancelled() {
             bail!("Review cancelled");
@@ -1788,7 +1718,6 @@ async fn gh_api_paginated_array(endpoint: &str) -> Result<Vec<serde_json::Value>
 
 #[derive(Debug, Default)]
 pub struct VerificationStats {
-    pub turns: u32,
     pub peak_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
@@ -1992,7 +1921,6 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
     let dedupe_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
-        let mut turn_counter = AgentTurnCounter::default();
         let mut stream = loop {
             match agent
                 .reply(
@@ -2043,16 +1971,6 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
                                 params.artifact.clone(),
                             )
                             .await?;
-
-                            if message.role == Role::Assistant {
-                                let session = agent
-                                    .config
-                                    .session_manager
-                                    .get_session(&session_config.id, false)
-                                    .await
-                                    .ok();
-                                turn_counter.record_assistant_message(session.as_ref());
-                            }
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
@@ -2083,10 +2001,10 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
                         }
                         None => {
                             if dedupe_complete(&params.artifact, &expected_ids).await {
-                                return Ok(turn_counter.current());
+                                return Ok(());
                             }
                             if retries >= params.max_retries {
-                                return Ok(turn_counter.current());
+                                return Ok(());
                             }
                             let retry_prompt = "You stopped before submitting duplicate decisions for all verified findings. Continue and call `submit_duplicate_decision` exactly once for every remaining finding.".to_string();
                             retries += 1;
@@ -2107,14 +2025,11 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
         }
     };
 
-    let turns = timeout(Duration::from_secs(params.timeout_mins * 60), dedupe_future)
+    timeout(Duration::from_secs(params.timeout_mins * 60), dedupe_future)
         .await
         .context("Duplicate suppression pass timed out")??;
 
-    let mut stats = VerificationStats {
-        turns,
-        ..Default::default()
-    };
+    let mut stats = VerificationStats::default();
     if let Ok(session) = agent
         .config
         .session_manager
@@ -2122,11 +2037,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
         .await
     {
         let (input, output) = session_accumulated_tokens(&session);
-        stats.peak_input_tokens = if turns == 0 {
-            input
-        } else {
-            (2 * input) / (turns as u64 + 1)
-        };
+        stats.peak_input_tokens = input;
         stats.output_tokens = output;
         stats.total_tokens = input + output;
         stats.cost_usd = cost_from_session(
@@ -2241,7 +2152,6 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     let verifier_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
-        let mut turn_counter = AgentTurnCounter::default();
         let mut stream = loop {
             match agent
                 .reply(
@@ -2292,16 +2202,6 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                                 params.artifact.clone(),
                             )
                             .await?;
-
-                            if message.role == Role::Assistant {
-                                let session = agent
-                                    .config
-                                    .session_manager
-                                    .get_session(&session_config.id, false)
-                                    .await
-                                    .ok();
-                                turn_counter.record_assistant_message(session.as_ref());
-                            }
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
@@ -2332,10 +2232,10 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                         }
                         None => {
                             if params.artifact.lock().await.verifier_complete() {
-                                return Ok(turn_counter.current());
+                                return Ok(());
                             }
                             if retries >= params.max_retries {
-                                return Ok(turn_counter.current());
+                                return Ok(());
                             }
                             let retry_prompt = "You stopped before submitting verdicts for all candidate findings. Continue verification and call `submit_verdict` exactly once for every remaining candidate.".to_string();
                             retries += 1;
@@ -2356,17 +2256,14 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         }
     };
 
-    let turns = timeout(
+    timeout(
         Duration::from_secs(params.timeout_mins * 60),
         verifier_future,
     )
     .await
     .context("Verifier pass timed out")??;
 
-    let mut stats = VerificationStats {
-        turns,
-        ..Default::default()
-    };
+    let mut stats = VerificationStats::default();
     if let Ok(session) = agent
         .config
         .session_manager
@@ -2374,11 +2271,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         .await
     {
         let (input, output) = session_accumulated_tokens(&session);
-        stats.peak_input_tokens = if turns == 0 {
-            input
-        } else {
-            (2 * input) / (turns as u64 + 1)
-        };
+        stats.peak_input_tokens = input;
         stats.output_tokens = output;
         stats.total_tokens = input + output;
         stats.cost_usd = cost_from_session(
@@ -2677,75 +2570,6 @@ Reviewed the PR and found no vulnerabilities.
     fn sum_known_costs_ignores_unknown_components() {
         assert_eq!(sum_known_costs([Some(1.25), None, Some(0.75)]), Some(2.0));
         assert_eq!(sum_known_costs([None, None]), None);
-    }
-
-    #[test]
-    fn agent_turn_counter_falls_back_to_assistant_messages_without_usage() {
-        let mut counter = AgentTurnCounter::default();
-
-        assert_eq!(counter.record_assistant_usage(None), 1);
-        assert_eq!(counter.record_assistant_usage(None), 2);
-        assert_eq!(counter.current(), 2);
-    }
-
-    #[test]
-    fn agent_turn_counter_counts_usage_increases_when_available() {
-        let mut counter = AgentTurnCounter::default();
-
-        assert_eq!(
-            counter.record_assistant_usage(Some(SessionUsageSnapshot {
-                input_tokens: 100,
-                output_tokens: 20,
-                total_tokens: 120,
-            })),
-            1
-        );
-        assert_eq!(
-            counter.record_assistant_usage(Some(SessionUsageSnapshot {
-                input_tokens: 100,
-                output_tokens: 20,
-                total_tokens: 120,
-            })),
-            1
-        );
-        assert_eq!(
-            counter.record_assistant_usage(Some(SessionUsageSnapshot {
-                input_tokens: 250,
-                output_tokens: 50,
-                total_tokens: 300,
-            })),
-            2
-        );
-    }
-
-    #[test]
-    fn agent_turn_counter_ignores_streaming_output_deltas() {
-        let mut counter = AgentTurnCounter::default();
-
-        assert_eq!(
-            counter.record_assistant_usage(Some(SessionUsageSnapshot {
-                input_tokens: 100,
-                output_tokens: 1,
-                total_tokens: 101,
-            })),
-            1
-        );
-        assert_eq!(
-            counter.record_assistant_usage(Some(SessionUsageSnapshot {
-                input_tokens: 100,
-                output_tokens: 20,
-                total_tokens: 120,
-            })),
-            1
-        );
-        assert_eq!(
-            counter.record_assistant_usage(Some(SessionUsageSnapshot {
-                input_tokens: 150,
-                output_tokens: 25,
-                total_tokens: 175,
-            })),
-            2
-        );
     }
 
     #[test]
