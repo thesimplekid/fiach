@@ -102,10 +102,15 @@ impl SessionUsageSnapshot {
         self.input_tokens > 0 || self.output_tokens > 0 || self.total_tokens > 0
     }
 
-    fn exceeds(self, previous: Self) -> bool {
-        self.input_tokens > previous.input_tokens
-            || self.output_tokens > previous.output_tokens
-            || self.total_tokens > previous.total_tokens
+    fn advances_turn(self, previous: Self) -> bool {
+        if self.input_tokens > previous.input_tokens {
+            return true;
+        }
+
+        previous.input_tokens == 0
+            && self.input_tokens == 0
+            && !previous.has_usage()
+            && self.has_usage()
     }
 }
 
@@ -129,10 +134,10 @@ impl AgentTurnCounter {
             && current_usage.has_usage()
         {
             self.saw_usage = true;
-            if current_usage.exceeds(self.last_usage) {
+            if current_usage.advances_turn(self.last_usage) {
                 self.usage_turns += 1;
-                self.last_usage = current_usage;
             }
+            self.last_usage = current_usage;
         }
 
         self.current()
@@ -935,7 +940,7 @@ pub async fn run_review(
 
                                         tracing::info!(
                                             turn = accumulated_turn_count,
-                                            max_turns = params.max_turns,
+                                            goose_max_turns = params.max_turns,
                                             cost = %format_cost(current_cost),
                                             "Review in progress..."
                                         );
@@ -1018,21 +1023,18 @@ pub async fn run_review(
                                     } else if turn_advanced {
                                         tracing::debug!(
                                             turn = accumulated_turn_count,
-                                            max_turns = params.max_turns,
+                                            goose_max_turns = params.max_turns,
                                             "Agent turn completed"
                                         );
                                     }
                                 } else if turn_advanced {
                                     tracing::debug!(
                                         turn = accumulated_turn_count,
-                                        max_turns = params.max_turns,
+                                        goose_max_turns = params.max_turns,
                                         "Agent turn completed without session usage"
                                     );
                                 }
 
-                                if accumulated_turn_count >= params.max_turns {
-                                    return Ok(accumulated_turn_count);
-                                }
                             }
                         }
                         Some(Ok(_)) => {
@@ -1106,9 +1108,7 @@ pub async fn run_review(
                                 return Ok(turn_counter.current()); // Stream finished successfully
                             }
 
-                            if turn_counter.current() >= params.max_turns
-                                || (budget_exceeded && retries > 0)
-                            {
+                            if budget_exceeded && retries > 0 {
                                 return Ok(turn_counter.current());
                             }
 
@@ -1331,7 +1331,6 @@ pub async fn run_review(
             .context("Failed to write disclosure policy artifact")?;
 
         let total_tokens = total_processed_tokens;
-        let limit_reached = turn_count >= params.max_turns;
         let accepted_findings = if artifact.markdown_only_fallback {
             Vec::new()
         } else {
@@ -1373,7 +1372,7 @@ pub async fn run_review(
             structured = %structured_path.display(),
             policy = %policy_path.display(),
             turns = turn_count,
-            limit_reached = limit_reached,
+            goose_max_turns = params.max_turns,
             should_notify = should_notify,
             findings_count = findings_count,
             status = %status,
@@ -1506,19 +1505,11 @@ pub async fn run_review(
 
         Ok(Some(completed))
     } else {
-        let limit_reached = turn_count >= params.max_turns;
-        if limit_reached {
-            tracing::warn!(
-                turns = turn_count,
-                max_turns = params.max_turns,
-                "Agent reached the turn limit without submitting structured findings"
-            );
-        } else {
-            tracing::warn!(
-                turns = turn_count,
-                "Agent finished without submitting structured findings"
-            );
-        }
+        tracing::warn!(
+            turns = turn_count,
+            goose_max_turns = params.max_turns,
+            "Agent finished without submitting structured findings"
+        );
         workspace.cleanup().await?;
         if cancel_token.is_cancelled() {
             bail!("Review cancelled");
@@ -2722,6 +2713,36 @@ Reviewed the PR and found no vulnerabilities.
                 input_tokens: 250,
                 output_tokens: 50,
                 total_tokens: 300,
+            })),
+            2
+        );
+    }
+
+    #[test]
+    fn agent_turn_counter_ignores_streaming_output_deltas() {
+        let mut counter = AgentTurnCounter::default();
+
+        assert_eq!(
+            counter.record_assistant_usage(Some(SessionUsageSnapshot {
+                input_tokens: 100,
+                output_tokens: 1,
+                total_tokens: 101,
+            })),
+            1
+        );
+        assert_eq!(
+            counter.record_assistant_usage(Some(SessionUsageSnapshot {
+                input_tokens: 100,
+                output_tokens: 20,
+                total_tokens: 120,
+            })),
+            1
+        );
+        assert_eq!(
+            counter.record_assistant_usage(Some(SessionUsageSnapshot {
+                input_tokens: 150,
+                output_tokens: 25,
+                total_tokens: 175,
             })),
             2
         );
