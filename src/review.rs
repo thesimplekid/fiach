@@ -10,7 +10,7 @@ use goose::config::GooseMode;
 use goose::conversation::message::{Message, MessageContent};
 use goose::providers::canonical::maybe_get_canonical_model;
 use goose::providers::create_with_named_model;
-use goose::session::session_manager::SessionType;
+use goose::session::{Session, SessionType};
 use rmcp::model::{CallToolResult, Content, Role};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -56,6 +56,23 @@ fn list_available_skills(skills_dir: Option<&std::path::Path>) -> Vec<String> {
     }
 
     available
+}
+
+fn session_accumulated_tokens(session: &Session) -> (u64, u64) {
+    let input = session
+        .accumulated_usage
+        .input_tokens
+        .or(session.usage.input_tokens)
+        .unwrap_or(0)
+        .max(0) as u64;
+    let output = session
+        .accumulated_usage
+        .output_tokens
+        .or(session.usage.output_tokens)
+        .unwrap_or(0)
+        .max(0) as u64;
+
+    (input, output)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -644,10 +661,8 @@ pub async fn run_review(
                                          .get_session(&session_config.id, false)
                                          .await
                                  {
-                                     let current_input =
-                                         session.accumulated_input_tokens.unwrap_or(0).max(0) as u64;
-
-                                        let current_output = session.accumulated_output_tokens.unwrap_or(0).max(0) as u64;
+                                     let (current_input, current_output) =
+                                         session_accumulated_tokens(&session);
 
                                         // Heuristic: peak input in a session is roughly the history size of the last turn.
                                         peak_input_tokens = peak_input_tokens.max((2 * current_input) / (accumulated_turn_count as u64 + 1));
@@ -910,8 +925,7 @@ pub async fn run_review(
         .get_session(&session_config.id, false)
         .await
     {
-        let input = session.accumulated_input_tokens.unwrap_or(0).max(0) as u64;
-        let output = session.accumulated_output_tokens.unwrap_or(0).max(0) as u64;
+        let (input, output) = session_accumulated_tokens(&session);
 
         // For a growing conversation, peak ≈ (2 * sum) / (count + 1)
         peak_input_tokens = peak_input_tokens.max((2 * input) / (turn_count as u64 + 1));
@@ -1825,8 +1839,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
         .get_session(&session_config.id, false)
         .await
     {
-        let input = session.accumulated_input_tokens.unwrap_or(0).max(0) as u64;
-        let output = session.accumulated_output_tokens.unwrap_or(0).max(0) as u64;
+        let (input, output) = session_accumulated_tokens(&session);
         stats.peak_input_tokens = if turns == 0 {
             input
         } else {
@@ -2063,8 +2076,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         .get_session(&session_config.id, false)
         .await
     {
-        let input = session.accumulated_input_tokens.unwrap_or(0).max(0) as u64;
-        let output = session.accumulated_output_tokens.unwrap_or(0).max(0) as u64;
+        let (input, output) = session_accumulated_tokens(&session);
         stats.peak_input_tokens = if turns == 0 {
             input
         } else {
