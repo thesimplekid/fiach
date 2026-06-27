@@ -255,6 +255,9 @@ In your `flake.nix` or `configuration.nix`:
             # FIACH_SERVER_TOKEN is optional and protects the local web control API.
             environmentFile = "/run/secrets/fiach-env";
 
+            # Optional tracing filter. Use fiach=debug or fiach=trace when debugging.
+            logFilter = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn";
+
             # Sandbox Isolation (Highly Recommended)
             # Isolates each PR review inside a systemd-nspawn container.
             sandbox = {
@@ -300,6 +303,7 @@ The following options are available under `services.fiach`:
 | `verifierProvider` | string or null | `null` | Provider to use for the verifier pass. Defaults to `provider` when unset. |
 | `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
 | `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN`, the selected provider API key, and optionally `FIACH_SERVER_TOKEN`. |
+| `logFilter` | string | `"fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
 | `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |
 | `withSkill` | string or null | `null` | Optional skill name to instruct the agent to use. |

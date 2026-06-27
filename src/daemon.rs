@@ -1117,6 +1117,9 @@ async fn run_sandboxed_review(
     if let Ok(val) = std::env::var("GITHUB_TOKEN") {
         cmd.arg(format!("--setenv=GITHUB_TOKEN={}", val));
     }
+    if let Ok(val) = std::env::var("RUST_LOG") {
+        cmd.arg(format!("--setenv=RUST_LOG={}", val));
+    }
 
     // Default the sandbox CA bundle path so git/gh can verify TLS even when
     // the parent service does not export Nix certificate environment vars.

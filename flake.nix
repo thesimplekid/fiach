@@ -347,6 +347,12 @@
               description = "Path to environment file containing GITHUB_TOKEN, the selected provider API key, and optionally FIACH_SERVER_TOKEN.";
             };
 
+            logFilter = lib.mkOption {
+              type = lib.types.str;
+              default = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn";
+              description = "Tracing filter passed to RUST_LOG for the daemon and sandboxed review children.";
+            };
+
             persona = lib.mkOption {
               type = lib.types.str;
               default = "builtin:security";
@@ -738,6 +744,7 @@
                     Environment = [
                       "HOME=${cfg.dataDir}"
                       "GH_CONFIG_DIR=${cfg.dataDir}/.config/gh"
+                      "RUST_LOG=${cfg.logFilter}"
                     ];
                     Restart = "always";
                     RestartSec = "10s";

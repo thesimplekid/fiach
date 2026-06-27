@@ -6,6 +6,8 @@ use tokio::process::Command;
 
 use crate::reporting::{DisclosurePolicy, InlineComment, ReportingArtifact};
 
+const PR_REACTION_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Clone, clap::ValueEnum, Default, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReportMode {
@@ -376,7 +378,8 @@ pub async fn post_pr_reaction(repo: &str, pr_number: u64, reaction: &str) -> Res
     );
 
     let endpoint = format!("repos/{repo}/issues/{pr_number}/reactions");
-    let output = Command::new("gh")
+    let mut cmd = Command::new("gh");
+    cmd.kill_on_drop(true)
         .args([
             "api",
             &endpoint,
@@ -386,15 +389,27 @@ pub async fn post_pr_reaction(repo: &str, pr_number: u64, reaction: &str) -> Res
             "Accept: application/vnd.github+json",
             "-f",
         ])
-        .arg(format!("content={content}"))
-        .output()
-        .await
-        .context("Failed to run `gh api` for PR reaction")?;
+        .arg(format!("content={content}"));
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(PR_REACTION_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await
+    .context("Timed out posting PR reaction")?
+    .context("Failed to run `gh api` for PR reaction")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("gh api PR reaction failed: {stderr}");
     }
+
+    tracing::info!(
+        repo = %repo,
+        pr = pr_number,
+        reaction = content,
+        "Posted PR reaction"
+    );
 
     Ok(())
 }
