@@ -75,6 +75,154 @@ fn session_accumulated_tokens(session: &Session) -> (u64, u64) {
     (input, output)
 }
 
+fn cost_from_session(
+    session: &Session,
+    provider: &str,
+    model: &str,
+    input_override: Option<f64>,
+    output_override: Option<f64>,
+) -> Option<f64> {
+    if input_override.is_none()
+        && output_override.is_none()
+        && let Some(cost) = session.accumulated_cost
+    {
+        return Some(cost.max(0.0));
+    }
+
+    let (input, output) = session_accumulated_tokens(session);
+    estimate_cost(
+        provider,
+        model,
+        input,
+        output,
+        input_override,
+        output_override,
+    )
+}
+
+fn add_known_cost(total: &mut Option<f64>, cost: Option<f64>) {
+    if let Some(cost) = cost {
+        *total = Some(total.unwrap_or(0.0) + cost);
+    }
+}
+
+fn sum_known_costs(costs: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
+    let mut total = None;
+    for cost in costs {
+        add_known_cost(&mut total, cost);
+    }
+    total
+}
+
+fn format_cost(cost: Option<f64>) -> String {
+    cost.map(|cost| format!("${cost:.4}"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenRouterModelsResponse {
+    data: Vec<OpenRouterModel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenRouterModel {
+    id: String,
+    pricing: OpenRouterPricing,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenRouterPricing {
+    prompt: Option<String>,
+    completion: Option<String>,
+}
+
+fn parse_openrouter_price_per_m(price_per_token: Option<&str>) -> Option<f64> {
+    price_per_token
+        .and_then(|price| price.parse::<f64>().ok())
+        .filter(|price| price.is_finite() && *price >= 0.0)
+        .map(|price| price * 1_000_000.0)
+}
+
+async fn fetch_openrouter_prices_per_m(model_id: &str) -> Result<(Option<f64>, Option<f64>)> {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get("https://openrouter.ai/api/v1/models")
+        .header("User-Agent", "fiach");
+
+    if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY")
+        && !api_key.trim().is_empty()
+    {
+        request = request.bearer_auth(api_key);
+    }
+
+    let response: OpenRouterModelsResponse = request
+        .send()
+        .await
+        .context("Failed to fetch OpenRouter model list")?
+        .error_for_status()
+        .context("OpenRouter model list request failed")?
+        .json()
+        .await
+        .context("Failed to parse OpenRouter model list")?;
+
+    let model = response
+        .data
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .with_context(|| format!("OpenRouter model pricing not found for {model_id}"))?;
+
+    Ok((
+        parse_openrouter_price_per_m(model.pricing.prompt.as_deref()),
+        parse_openrouter_price_per_m(model.pricing.completion.as_deref()),
+    ))
+}
+
+async fn resolve_price_overrides(
+    provider: &str,
+    model: &str,
+    input_override: Option<f64>,
+    output_override: Option<f64>,
+) -> (Option<f64>, Option<f64>) {
+    let mut input_price_per_m = input_override;
+    let mut output_price_per_m = output_override;
+
+    if provider == "openrouter" && (input_price_per_m.is_none() || output_price_per_m.is_none()) {
+        match fetch_openrouter_prices_per_m(model).await {
+            Ok((openrouter_input, openrouter_output)) => {
+                if input_price_per_m.is_none() {
+                    input_price_per_m = openrouter_input;
+                }
+                if output_price_per_m.is_none() {
+                    output_price_per_m = openrouter_output;
+                }
+
+                if input_price_per_m.is_some() && output_price_per_m.is_some() {
+                    tracing::debug!(
+                        model = %model,
+                        input_price_per_m = input_price_per_m,
+                        output_price_per_m = output_price_per_m,
+                        "Resolved OpenRouter model pricing"
+                    );
+                } else {
+                    tracing::warn!(
+                        model = %model,
+                        "OpenRouter model pricing is incomplete; cost may remain unknown"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    model = %model,
+                    error = %error,
+                    "Failed to resolve OpenRouter model pricing; cost may remain unknown"
+                );
+            }
+        }
+    }
+
+    (input_price_per_m, output_price_per_m)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletedReview {
     pub metadata: state::ReviewMetadata,
@@ -165,6 +313,8 @@ pub async fn run_review(
     let mut peak_input_tokens = 0u64;
     let mut total_output_tokens = 0u64;
     let mut total_processed_tokens = 0u64; // For informational logging
+    let mut direct_call_cost_usd = None;
+    let mut main_session_cost_usd = None;
     let skills_dir = resolve_skills_dir()?;
     let reporting_artifact = Arc::new(Mutex::new(ReportingArtifact::default()));
 
@@ -286,6 +436,13 @@ pub async fn run_review(
     let provider = create_with_named_model(&params.provider, &params.model, Vec::new())
         .await
         .with_context(|| format!("Failed to create {} provider", params.provider))?;
+    let (input_price_per_m, output_price_per_m) = resolve_price_overrides(
+        &params.provider,
+        &params.model,
+        params.input_price_per_m,
+        params.output_price_per_m,
+    )
+    .await;
 
     // 3. Create the agent and a hidden session rooted in the workspace
     let agent = Agent::new();
@@ -370,6 +527,17 @@ pub async fn run_review(
                             peak_input_tokens = peak_input_tokens.max(input);
                             total_output_tokens += output;
                             total_processed_tokens += input + output;
+                            add_known_cost(
+                                &mut direct_call_cost_usd,
+                                estimate_cost(
+                                    &params.provider,
+                                    &params.model,
+                                    input,
+                                    output,
+                                    input_price_per_m,
+                                    output_price_per_m,
+                                ),
+                            );
 
                             let response_text = response.as_concat_text().trim().to_lowercase();
                             let mut selected = None;
@@ -587,6 +755,7 @@ pub async fn run_review(
         let mut delay = params.retry_delay_secs;
         let mut accumulated_turn_count = 0;
         let mut budget_exceeded = false;
+        let mut cost_unavailable_warned = false;
         let mut last_assistant_text: Option<String> = None;
 
         let mut stream = loop {
@@ -661,36 +830,50 @@ pub async fn run_review(
                                          .get_session(&session_config.id, false)
                                          .await
                                  {
-                                     let (current_input, current_output) =
+                                     let (current_input, _) =
                                          session_accumulated_tokens(&session);
 
                                         // Heuristic: peak input in a session is roughly the history size of the last turn.
                                         peak_input_tokens = peak_input_tokens.max((2 * current_input) / (accumulated_turn_count as u64 + 1));
 
-                                        let current_cost = estimate_cost(
+                                        let session_cost = cost_from_session(
+                                            &session,
                                             &params.provider,
                                             &params.model,
-                                            peak_input_tokens,
-                                            current_output + total_output_tokens, // Include discovery output
-                                            params.input_price_per_m,
-                                            params.output_price_per_m
-                                        ).unwrap_or(0.0);
+                                            input_price_per_m,
+                                            output_price_per_m,
+                                        );
+                                        let current_cost =
+                                            sum_known_costs([direct_call_cost_usd, session_cost]);
 
                                         tracing::info!(
                                             turn = accumulated_turn_count,
                                             max_turns = params.max_turns,
-                                            cost = %format!("${:.2}", current_cost),
+                                            cost = %format_cost(current_cost),
                                             "Review in progress..."
                                         );
 
                                          // Budget check
+                                         if params.max_cost_usd.is_some()
+                                             && session_cost.is_none()
+                                             && !cost_unavailable_warned
+                                         {
+                                             cost_unavailable_warned = true;
+                                             tracing::warn!(
+                                                 provider = %params.provider,
+                                                 model = %params.model,
+                                                 "Cost is unknown; --max-cost cannot be enforced unless provider usage and model pricing are available or explicit prices are configured"
+                                             );
+                                         }
+
                                          if let Some(max_cost) = params.max_cost_usd
+                                             && let Some(current_cost) = current_cost
                                              && current_cost > max_cost
                                              && !budget_exceeded
                                          {
                                              tracing::warn!(
-                                                 cost = %format!("${:.2}", current_cost),
-                                                 max = %format!("${:.2}", max_cost),
+                                                 cost = %format_cost(Some(current_cost)),
+                                                 max = %format_cost(Some(max_cost)),
                                                  "Budget exceeded! Requesting immediate report..."
                                              );
                                              budget_exceeded = true;
@@ -931,6 +1114,13 @@ pub async fn run_review(
         peak_input_tokens = peak_input_tokens.max((2 * input) / (turn_count as u64 + 1));
         total_output_tokens += output;
         total_processed_tokens += input + output;
+        main_session_cost_usd = cost_from_session(
+            &session,
+            &params.provider,
+            &params.model,
+            input_price_per_m,
+            output_price_per_m,
+        );
     }
 
     let duration_secs = start_time.elapsed().as_secs();
@@ -976,6 +1166,7 @@ pub async fn run_review(
             peak_input_tokens = peak_input_tokens.max(verifier_result.peak_input_tokens);
             total_output_tokens += verifier_result.output_tokens;
             total_processed_tokens += verifier_result.total_tokens;
+            add_known_cost(&mut main_session_cost_usd, verifier_result.cost_usd);
             artifact = reporting_artifact.lock().await.clone();
 
             if !artifact.verifier_complete() {
@@ -989,15 +1180,8 @@ pub async fn run_review(
             artifact.verifier_failed = true;
         }
 
-        let total_tokens = total_processed_tokens;
-        let cost_usd = estimate_cost(
-            &params.provider,
-            &params.model,
-            peak_input_tokens,
-            total_output_tokens,
-            params.input_price_per_m,
-            params.output_price_per_m,
-        );
+        let mut cost_usd = direct_call_cost_usd;
+        add_known_cost(&mut cost_usd, main_session_cost_usd);
 
         let diff_content = std::fs::read_to_string(workspace.path.join(".pr_diff.txt"))
             .unwrap_or_else(|_| String::new());
@@ -1035,6 +1219,7 @@ pub async fn run_review(
             peak_input_tokens = peak_input_tokens.max(dedupe_result.peak_input_tokens);
             total_output_tokens += dedupe_result.output_tokens;
             total_processed_tokens += dedupe_result.total_tokens;
+            add_known_cost(&mut cost_usd, dedupe_result.cost_usd);
             *reporting_artifact.lock().await = artifact.clone();
         }
 
@@ -1049,6 +1234,7 @@ pub async fn run_review(
         fs::write(&policy_path, serde_json::to_vec_pretty(&policy)?)
             .context("Failed to write disclosure policy artifact")?;
 
+        let total_tokens = total_processed_tokens;
         let limit_reached = turn_count >= params.max_turns;
         let accepted_findings = if artifact.markdown_only_fallback {
             Vec::new()
@@ -1099,7 +1285,7 @@ pub async fn run_review(
             pr = %pr_classification,
             duration = %format!("{}s", duration_secs),
             tokens = %format!("in:{} peak:{} out:{} total:{}", total_processed_tokens, peak_input_tokens, total_output_tokens, total_tokens),
-            cost = %cost_usd.map(|c| format!("${:.4}", c)).unwrap_or_else(|| "unknown".to_string()),
+            cost = %format_cost(cost_usd),
             "Review complete"
         );
 
@@ -1519,6 +1705,7 @@ pub struct VerificationStats {
     pub peak_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub cost_usd: Option<f64>,
 }
 
 pub struct DuplicateSuppressionParams<'a> {
@@ -1661,6 +1848,8 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
                 params.provider_name
             )
         })?;
+    let (input_price_per_m, output_price_per_m) =
+        resolve_price_overrides(params.provider_name, params.model, None, None).await;
     let agent = Agent::new();
     let session = agent
         .config
@@ -1847,6 +2036,13 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
         };
         stats.output_tokens = output;
         stats.total_tokens = input + output;
+        stats.cost_usd = cost_from_session(
+            &session,
+            params.provider_name,
+            params.model,
+            input_price_per_m,
+            output_price_per_m,
+        );
     }
 
     Ok(stats)
@@ -1887,6 +2083,8 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                 params.provider_name
             )
         })?;
+    let (input_price_per_m, output_price_per_m) =
+        resolve_price_overrides(params.provider_name, params.model, None, None).await;
     let agent = Agent::new();
     let session = agent
         .config
@@ -2084,6 +2282,13 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         };
         stats.output_tokens = output;
         stats.total_tokens = input + output;
+        stats.cost_usd = cost_from_session(
+            &session,
+            params.provider_name,
+            params.model,
+            input_price_per_m,
+            output_price_per_m,
+        );
     }
 
     Ok(stats)
@@ -2339,6 +2544,53 @@ Reviewed the PR and found no vulnerabilities.
 
         assert!(!is_nonfatal_review_completion_error(&error));
         assert!(is_fatal_error(&error));
+    }
+
+    #[test]
+    fn estimate_cost_returns_none_when_model_pricing_is_unknown() {
+        assert_eq!(
+            estimate_cost("unknown-provider", "unknown-model", 1_000, 500, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn estimate_cost_uses_explicit_prices_for_unknown_models() {
+        let cost = estimate_cost(
+            "unknown-provider",
+            "unknown-model",
+            1_000_000,
+            500_000,
+            Some(2.0),
+            Some(6.0),
+        );
+
+        assert_eq!(cost, Some(5.0));
+    }
+
+    #[test]
+    fn cost_format_preserves_sub_cent_values_and_unknowns() {
+        assert_eq!(format_cost(Some(0.0049)), "$0.0049");
+        assert_eq!(format_cost(None), "unknown");
+    }
+
+    #[test]
+    fn sum_known_costs_ignores_unknown_components() {
+        assert_eq!(sum_known_costs([Some(1.25), None, Some(0.75)]), Some(2.0));
+        assert_eq!(sum_known_costs([None, None]), None);
+    }
+
+    #[test]
+    fn openrouter_price_parser_converts_per_token_to_per_million() {
+        assert_eq!(parse_openrouter_price_per_m(Some("0.000005")), Some(5.0));
+        assert_eq!(parse_openrouter_price_per_m(Some("0.00003")), Some(30.0));
+    }
+
+    #[test]
+    fn openrouter_price_parser_rejects_invalid_prices() {
+        assert_eq!(parse_openrouter_price_per_m(None), None);
+        assert_eq!(parse_openrouter_price_per_m(Some("not-a-price")), None);
+        assert_eq!(parse_openrouter_price_per_m(Some("-0.1")), None);
     }
 
     #[test]
