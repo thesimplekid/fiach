@@ -457,7 +457,7 @@ fn review_lane_prompt(
          Run focused Goose delegate subagents for these lanes before submitting the final structured result:\n\
          {lane_list}\n\n\
          Use the `delegate` tool for the lane work. Start up to {max_review_lanes} lane delegates concurrently with `async: true`, then use `load(source: task_id)` to collect each result. If there are more lanes than the concurrency limit, run them in batches until every lane has returned.\n\
-         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and begin its instructions with `Review lane: <lane>` so host logs can identify lane execution. Give delegates read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate should inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context, and return concise JSON-like candidate notes for its lane only.\n\
+         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and begin its instructions with `Review lane: <lane>` so host logs can identify lane execution. Give delegates read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate should inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context, and return concise JSON-like candidate notes for its lane only, preferably as `{{\"candidates\":[...]}}` or `{{\"candidates\":[]}}`.\n\
          After all lane results are loaded, you are the only agent that synthesizes and submits. Deduplicate candidates across {lane_names}, discard weak or duplicate notes, verify every retained root cause is in `.pr_diff.txt`, add `lane:<name>` to `skills_used` for the lanes that contributed to each retained candidate, then call `submit_finding` for each candidate or `submit_no_findings` if all lanes found nothing actionable.",
     )
 }
@@ -560,6 +560,174 @@ fn call_tool_result_failed(result: &CallToolResult) -> bool {
     result.is_error.unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneLoadFindingStatus {
+    CandidateNotes,
+    NoFindings,
+    Unknown,
+}
+
+impl LaneLoadFindingStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateNotes => "candidate_notes",
+            Self::NoFindings => "no_findings",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaneLoadFindingSummary {
+    status: LaneLoadFindingStatus,
+    text_chars: usize,
+}
+
+fn summarize_lane_load_findings(result: &CallToolResult) -> LaneLoadFindingSummary {
+    let text = result
+        .content
+        .iter()
+        .filter_map(|content| match &content.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text_chars = text.chars().count();
+
+    LaneLoadFindingSummary {
+        status: classify_lane_load_text(&text),
+        text_chars,
+    }
+}
+
+fn classify_lane_load_text(text: &str) -> LaneLoadFindingStatus {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return LaneLoadFindingStatus::Unknown;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(status) = classify_lane_load_json(&value)
+    {
+        return status;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let no_findings_hint = [
+        "no findings",
+        "no actionable findings",
+        "no actionable issues",
+        "no issues found",
+        "no candidates",
+        "found nothing",
+        "nothing actionable",
+        "\"candidates\": []",
+        "\"findings\": []",
+        "candidates: []",
+        "findings: []",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let candidate_hint = has_nonempty_json_like_array(&lower, "candidates")
+        || has_nonempty_json_like_array(&lower, "findings")
+        || [
+            "candidate 1",
+            "finding 1",
+            "issue 1",
+            "candidate:",
+            "finding:",
+            "severity:",
+            "root cause",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+
+    match (candidate_hint, no_findings_hint) {
+        (true, _) => LaneLoadFindingStatus::CandidateNotes,
+        (false, true) => LaneLoadFindingStatus::NoFindings,
+        (false, false) => LaneLoadFindingStatus::Unknown,
+    }
+}
+
+fn has_nonempty_json_like_array(text: &str, key: &str) -> bool {
+    for pattern in [format!("\"{key}\""), key.to_string()] {
+        let mut rest = text;
+        while let Some(index) = rest.find(&pattern) {
+            let after_key = &rest[index + pattern.len()..];
+            rest = after_key;
+            let Some(colon_index) = after_key.find(':') else {
+                continue;
+            };
+            let after_colon = &after_key[colon_index + 1..];
+            let Some(bracket_index) = after_colon.find('[') else {
+                continue;
+            };
+            if !after_colon[..bracket_index].trim().is_empty() {
+                continue;
+            }
+            let after_bracket = after_colon[bracket_index + 1..].trim_start();
+            if !after_bracket.starts_with(']') {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn classify_lane_load_json(value: &serde_json::Value) -> Option<LaneLoadFindingStatus> {
+    classify_lane_load_json_inner(value, true)
+}
+
+fn classify_lane_load_json_inner(
+    value: &serde_json::Value,
+    allow_array_summary: bool,
+) -> Option<LaneLoadFindingStatus> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["has_findings", "found_findings", "found_anything"] {
+                if let Some(value) = map.get(key).and_then(serde_json::Value::as_bool) {
+                    return Some(if value {
+                        LaneLoadFindingStatus::CandidateNotes
+                    } else {
+                        LaneLoadFindingStatus::NoFindings
+                    });
+                }
+            }
+            for key in ["findings_count", "candidate_count", "issue_count"] {
+                if let Some(count) = map.get(key).and_then(serde_json::Value::as_u64) {
+                    return Some(if count > 0 {
+                        LaneLoadFindingStatus::CandidateNotes
+                    } else {
+                        LaneLoadFindingStatus::NoFindings
+                    });
+                }
+            }
+            for key in ["candidates", "findings", "issues"] {
+                if let Some(array) = map.get(key).and_then(serde_json::Value::as_array) {
+                    return Some(if array.is_empty() {
+                        LaneLoadFindingStatus::NoFindings
+                    } else {
+                        LaneLoadFindingStatus::CandidateNotes
+                    });
+                }
+            }
+            map.values()
+                .filter(|value| value.is_object())
+                .find_map(|value| classify_lane_load_json_inner(value, false))
+        }
+        serde_json::Value::Array(array) if allow_array_summary => {
+            if array.is_empty() {
+                Some(LaneLoadFindingStatus::NoFindings)
+            } else {
+                Some(LaneLoadFindingStatus::CandidateNotes)
+            }
+        }
+        _ => None,
+    }
+}
+
 fn log_summon_tool_activity(
     message: &Message,
     state: &mut SummonLaneLogState,
@@ -647,6 +815,11 @@ fn log_summon_tool_activity(
         if let Some(pending) = state.load_calls.remove(&response.id) {
             match &response.tool_result {
                 Ok(result) if !call_tool_result_failed(result) => {
+                    let lane_finding_summary = pending
+                        .lane
+                        .as_ref()
+                        .filter(|_| !pending.peek && !pending.cancel)
+                        .map(|_| summarize_lane_load_findings(result));
                     tracing::info!(
                         repo = %context.repo,
                         pr = context.pr_number,
@@ -658,8 +831,57 @@ fn log_summon_tool_activity(
                         source = ?pending.source,
                         peek = pending.peek,
                         cancel = pending.cancel,
+                        lane_findings = lane_finding_summary
+                            .as_ref()
+                            .map(|summary| summary.status.as_str()),
+                        lane_result_chars = lane_finding_summary
+                            .as_ref()
+                            .map(|summary| summary.text_chars),
                         "Summon load completed"
                     );
+                    if let Some(summary) = lane_finding_summary {
+                        match summary.status {
+                            LaneLoadFindingStatus::CandidateNotes => {
+                                tracing::info!(
+                                    repo = %context.repo,
+                                    pr = context.pr_number,
+                                    review_kind = %context.review_kind,
+                                    phase = %context.phase,
+                                    session_id = %context.session_id,
+                                    lane = ?pending.lane,
+                                    source = ?pending.source,
+                                    text_chars = summary.text_chars,
+                                    "Review lane returned candidate notes"
+                                );
+                            }
+                            LaneLoadFindingStatus::NoFindings => {
+                                tracing::info!(
+                                    repo = %context.repo,
+                                    pr = context.pr_number,
+                                    review_kind = %context.review_kind,
+                                    phase = %context.phase,
+                                    session_id = %context.session_id,
+                                    lane = ?pending.lane,
+                                    source = ?pending.source,
+                                    text_chars = summary.text_chars,
+                                    "Review lane returned no-finding notes"
+                                );
+                            }
+                            LaneLoadFindingStatus::Unknown => {
+                                tracing::info!(
+                                    repo = %context.repo,
+                                    pr = context.pr_number,
+                                    review_kind = %context.review_kind,
+                                    phase = %context.phase,
+                                    session_id = %context.session_id,
+                                    lane = ?pending.lane,
+                                    source = ?pending.source,
+                                    text_chars = summary.text_chars,
+                                    "Review lane result did not expose candidate status"
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(_) => {
                     tracing::warn!(
@@ -3213,6 +3435,70 @@ Reviewed the PR and found no vulnerabilities.
         assert_eq!(
             extract_subagent_task_id(&result),
             Some("20260703_2".to_string())
+        );
+    }
+
+    #[test]
+    fn lane_load_classifier_detects_json_candidates() {
+        let result = CallToolResult::success(vec![Content::text(
+            r#"{"candidates":[{"title":"panic on empty input"}]}"#,
+        )]);
+
+        assert_eq!(
+            summarize_lane_load_findings(&result).status,
+            LaneLoadFindingStatus::CandidateNotes
+        );
+    }
+
+    #[test]
+    fn lane_load_classifier_detects_json_no_findings() {
+        let result = CallToolResult::success(vec![Content::text(r#"{"candidates":[]}"#)]);
+
+        assert_eq!(
+            summarize_lane_load_findings(&result).status,
+            LaneLoadFindingStatus::NoFindings
+        );
+    }
+
+    #[test]
+    fn lane_load_classifier_ignores_unrelated_json_arrays() {
+        assert_eq!(
+            classify_lane_load_text(r#"{"metadata":{"files":[]}}"#),
+            LaneLoadFindingStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn lane_load_classifier_detects_text_no_findings() {
+        assert_eq!(
+            classify_lane_load_text("No actionable findings for this lane."),
+            LaneLoadFindingStatus::NoFindings
+        );
+    }
+
+    #[test]
+    fn lane_load_classifier_detects_json_like_empty_candidates() {
+        assert_eq!(
+            classify_lane_load_text("Result:\n```json\n{\"candidates\": []}\n```"),
+            LaneLoadFindingStatus::NoFindings
+        );
+    }
+
+    #[test]
+    fn lane_load_classifier_detects_json_like_nonempty_candidates() {
+        assert_eq!(
+            classify_lane_load_text(
+                "Result:\n```json\n{\"candidates\": [{\"title\":\"panic\"}]}\n```"
+            ),
+            LaneLoadFindingStatus::CandidateNotes
+        );
+    }
+
+    #[test]
+    fn lane_load_classifier_leaves_ambiguous_text_unknown() {
+        assert_eq!(
+            classify_lane_load_text("Reviewed the diff and checked the relevant paths."),
+            LaneLoadFindingStatus::Unknown
         );
     }
 
