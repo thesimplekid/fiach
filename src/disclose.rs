@@ -423,16 +423,69 @@ pub fn is_non_actionable_status(status: &str) -> bool {
 /// Reacts to a specific comment or review via its GraphQL node id, so the
 /// person who @-mentioned the trigger account can see the bot picked it up.
 pub async fn post_mention_reaction(subject_node_id: &str, reaction: &str) -> Result<()> {
+    mutate_mention_reaction(subject_node_id, reaction, "addReaction").await
+}
+
+/// Removes the bot's own reaction from a comment or review.
+pub async fn remove_mention_reaction(subject_node_id: &str, reaction: &str) -> Result<()> {
+    mutate_mention_reaction(subject_node_id, reaction, "removeReaction").await
+}
+
+/// Posts the final outcome reaction on the trigger mention comment and clears
+/// the review-start reaction, so the comment shows only the outcome.
+pub async fn finalize_mention_reaction(
+    subject_node_id: &str,
+    outcome_reaction: &str,
+    review_start_reaction: Option<&str>,
+) -> Result<()> {
+    post_mention_reaction(subject_node_id, outcome_reaction).await?;
+
+    if let Some(start_reaction) = review_start_reaction
+        && should_clear_start_reaction(start_reaction, outcome_reaction)
+        && let Err(error) = remove_mention_reaction(subject_node_id, start_reaction).await
+    {
+        // The outcome reaction is already up; a leftover start reaction is
+        // cosmetic, so do not fail the caller over it.
+        tracing::warn!(
+            subject = %subject_node_id,
+            error = %error,
+            "Failed to remove review-start reaction from trigger mention comment"
+        );
+    }
+
+    Ok(())
+}
+
+/// Never remove the start reaction when it uses the same emoji as the
+/// outcome, or we would delete the reaction we just posted.
+fn should_clear_start_reaction(review_start: &str, outcome: &str) -> bool {
+    match (
+        normalize_reaction_content(review_start),
+        normalize_reaction_content(outcome),
+    ) {
+        (Ok(start), Ok(outcome)) => start != outcome,
+        _ => false,
+    }
+}
+
+async fn mutate_mention_reaction(
+    subject_node_id: &str,
+    reaction: &str,
+    mutation: &str,
+) -> Result<()> {
     let content = graphql_reaction_content(reaction)?;
     tracing::info!(
         subject = %subject_node_id,
         reaction = content,
-        "Posting trigger mention reaction"
+        mutation = mutation,
+        "Updating trigger mention reaction"
     );
 
-    let query = "mutation($subjectId: ID!, $content: ReactionContent!) { \
-                 addReaction(input: {subjectId: $subjectId, content: $content}) { \
-                 clientMutationId } }";
+    let query = format!(
+        "mutation($subjectId: ID!, $content: ReactionContent!) {{ \
+         {mutation}(input: {{subjectId: $subjectId, content: $content}}) {{ \
+         clientMutationId }} }}"
+    );
     let mut cmd = Command::new("gh");
     cmd.kill_on_drop(true)
         .args(["api", "graphql", "-f", &format!("query={query}")])
@@ -444,12 +497,12 @@ pub async fn post_mention_reaction(subject_node_id: &str, reaction: &str) -> Res
         cmd.output(),
     )
     .await
-    .context("Timed out posting trigger mention reaction")?
+    .context("Timed out updating trigger mention reaction")?
     .context("Failed to run `gh api graphql` for trigger mention reaction")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh api graphql mention reaction failed: {stderr}");
+        bail!("gh api graphql {mutation} failed: {stderr}");
     }
 
     Ok(())
@@ -1319,6 +1372,14 @@ mod tests {
         assert_eq!(graphql_reaction_content("+1").unwrap(), "THUMBS_UP");
         assert_eq!(graphql_reaction_content("rocket").unwrap(), "ROCKET");
         assert!(graphql_reaction_content("wave").is_err());
+    }
+
+    #[test]
+    fn start_reaction_is_only_cleared_when_distinct_from_outcome() {
+        assert!(should_clear_start_reaction("eyes", "+1"));
+        assert!(!should_clear_start_reaction("eyes", "eyes"));
+        assert!(!should_clear_start_reaction("👀", "eyes"));
+        assert!(!should_clear_start_reaction("wave", "+1"));
     }
 
     #[test]

@@ -1766,7 +1766,16 @@ async fn run_sandboxed_review(
             .reactions
             .no_findings
             .as_deref()
-        && let Err(error) = crate::disclose::post_mention_reaction(node_id, reaction).await
+        && let Err(error) = crate::disclose::finalize_mention_reaction(
+            node_id,
+            reaction,
+            review_params
+                .disclose_config
+                .reactions
+                .review_start
+                .as_deref(),
+        )
+        .await
     {
         tracing::warn!(
             repo = %review_params.repo,

@@ -1417,7 +1417,12 @@ pub async fn run_review(
             if let Some(node_id) = params.trigger_mention_node_id.as_deref()
                 && disclose::is_non_actionable_status(&completed.metadata.status)
                 && let Some(reaction) = params.disclose_config.reactions.no_findings.as_deref()
-                && let Err(error) = disclose::post_mention_reaction(node_id, reaction).await
+                && let Err(error) = disclose::finalize_mention_reaction(
+                    node_id,
+                    reaction,
+                    params.disclose_config.reactions.review_start.as_deref(),
+                )
+                .await
             {
                 tracing::warn!(
                     repo = %params.repo,
