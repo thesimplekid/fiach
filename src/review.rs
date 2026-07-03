@@ -320,6 +320,9 @@ pub struct ReviewParams {
     /// Override output token price per 1M tokens (USD)
     pub output_price_per_m: Option<f64>,
     pub is_rereview: bool,
+    /// GraphQL node id of the comment or review whose mention triggered this
+    /// review, used to acknowledge the outcome on that comment.
+    pub trigger_mention_node_id: Option<String>,
     pub execution: ReviewExecution,
 }
 
@@ -1405,6 +1408,22 @@ pub async fn run_review(
                     pr = params.pr_number,
                     error = %error,
                     "Failed to post no-findings reaction"
+                );
+            }
+
+            // Close the loop on the mention that triggered this review: from
+            // the mentioner's perspective, rejected or already-reported
+            // findings also mean "nothing actionable".
+            if let Some(node_id) = params.trigger_mention_node_id.as_deref()
+                && disclose::is_non_actionable_status(&completed.metadata.status)
+                && let Some(reaction) = params.disclose_config.reactions.no_findings.as_deref()
+                && let Err(error) = disclose::post_mention_reaction(node_id, reaction).await
+            {
+                tracing::warn!(
+                    repo = %params.repo,
+                    pr = params.pr_number,
+                    error = %error,
+                    "Failed to post no-findings reaction on trigger mention comment"
                 );
             }
 

@@ -9,6 +9,8 @@ model = "google/gemini-3.1-pro-preview"
 pr_state = ["open", "merged"] # Options: "open", "merged", "closed", "all" (can also be a comma-separated string)
 # filter_by_updated = false # Omit the updated:>= filter; default is true
 # updated_within_days = 120 # Used only when filter_by_updated = true
+# trigger_mention = "fiach-bot" # Only review PRs after this GitHub user is @-mentioned; each mention triggers one review, re-mention to re-review
+# allowed_mention_users = ["lead-maintainer"] # Usernames whose mentions count; defaults to commenters matching allowed_author_associations
 skip_prs = ["1870"] # Skip specific PR numbers globally or per repo
 allowed_author_associations = ["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]
 max_workers = 1 # Maximum concurrent PR reviews per polling query; 0 means unlimited

@@ -72,6 +72,8 @@ pub struct DaemonConfig {
     pub output_price_per_m: Option<f64>,
     pub updated_within_days: Option<u32>,
     pub filter_by_updated: Option<bool>,
+    pub trigger_mention: Option<String>,
+    pub allowed_mention_users: Option<Vec<String>>,
     pub pr_limit: Option<u32>,
     // Sandbox options
     pub sandbox_rootfs: Option<PathBuf>,

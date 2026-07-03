@@ -43,7 +43,7 @@ fn default_review_kind() -> String {
     DEFAULT_REVIEW_KIND.to_string()
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewDecision {
     Skip,
     FirstReview,

@@ -414,6 +414,61 @@ pub async fn post_pr_reaction(repo: &str, pr_number: u64, reaction: &str) -> Res
     Ok(())
 }
 
+/// Review outcomes that mean "nothing actionable" to the person who
+/// triggered the review by mention.
+pub fn is_non_actionable_status(status: &str) -> bool {
+    matches!(status, "none" | "rejected" | "already-reported")
+}
+
+/// Reacts to a specific comment or review via its GraphQL node id, so the
+/// person who @-mentioned the trigger account can see the bot picked it up.
+pub async fn post_mention_reaction(subject_node_id: &str, reaction: &str) -> Result<()> {
+    let content = graphql_reaction_content(reaction)?;
+    tracing::info!(
+        subject = %subject_node_id,
+        reaction = content,
+        "Posting trigger mention reaction"
+    );
+
+    let query = "mutation($subjectId: ID!, $content: ReactionContent!) { \
+                 addReaction(input: {subjectId: $subjectId, content: $content}) { \
+                 clientMutationId } }";
+    let mut cmd = Command::new("gh");
+    cmd.kill_on_drop(true)
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .args(["-f", &format!("subjectId={subject_node_id}")])
+        .args(["-f", &format!("content={content}")]);
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(PR_REACTION_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await
+    .context("Timed out posting trigger mention reaction")?
+    .context("Failed to run `gh api graphql` for trigger mention reaction")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("gh api graphql mention reaction failed: {stderr}");
+    }
+
+    Ok(())
+}
+
+fn graphql_reaction_content(reaction: &str) -> Result<&'static str> {
+    Ok(match normalize_reaction_content(reaction)? {
+        "+1" => "THUMBS_UP",
+        "-1" => "THUMBS_DOWN",
+        "laugh" => "LAUGH",
+        "confused" => "CONFUSED",
+        "heart" => "HEART",
+        "hooray" => "HOORAY",
+        "rocket" => "ROCKET",
+        "eyes" => "EYES",
+        other => bail!("no GraphQL reaction mapping for {other:?}"),
+    })
+}
+
 fn normalize_reaction_content(reaction: &str) -> Result<&'static str> {
     let trimmed = reaction.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -1244,6 +1299,26 @@ mod tests {
         let result = normalize_reaction_content("wave");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_actionable_statuses_cover_clean_rejected_and_already_reported() {
+        assert!(is_non_actionable_status("none"));
+        assert!(is_non_actionable_status("rejected"));
+        assert!(is_non_actionable_status("already-reported"));
+        assert!(!is_non_actionable_status("confirmed"));
+        assert!(!is_non_actionable_status("failed"));
+        assert!(!is_non_actionable_status("unverified"));
+        assert!(!is_non_actionable_status("markdown-only"));
+    }
+
+    #[test]
+    fn graphql_reaction_content_maps_rest_names_to_enum_values() {
+        assert_eq!(graphql_reaction_content("eyes").unwrap(), "EYES");
+        assert_eq!(graphql_reaction_content("👀").unwrap(), "EYES");
+        assert_eq!(graphql_reaction_content("+1").unwrap(), "THUMBS_UP");
+        assert_eq!(graphql_reaction_content("rocket").unwrap(), "ROCKET");
+        assert!(graphql_reaction_content("wave").is_err());
     }
 
     #[test]

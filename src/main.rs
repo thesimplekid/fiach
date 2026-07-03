@@ -350,6 +350,16 @@ enum Commands {
         #[arg(long)]
         filter_by_updated: Option<bool>,
 
+        /// GitHub username whose @-mention triggers a review (e.g. "fiach-bot").
+        /// When set, the daemon only picks up PRs where this user is mentioned.
+        #[arg(long)]
+        trigger_mention: Option<String>,
+
+        /// Comma-separated GitHub usernames allowed to trigger reviews by mentioning
+        /// the trigger account. Defaults to commenters matching --allowed-author-associations.
+        #[arg(long)]
+        allowed_mention_users: Option<String>,
+
         /// Maximum number of PRs to fetch from GitHub
         #[arg(long)]
         pr_limit: Option<u32>,
@@ -538,6 +548,7 @@ async fn main() -> Result<()> {
                     input_price_per_m: input_price.or(rev_cfg.input_price_per_m),
                     output_price_per_m: output_price.or(rev_cfg.output_price_per_m),
                     is_rereview: false,
+                    trigger_mention_node_id: None,
                     execution: review::ReviewExecution {
                         skip_state_check: sandbox_child,
                         persist_side_effects: !sandbox_child,
@@ -587,6 +598,8 @@ async fn main() -> Result<()> {
             output_price,
             updated_within_days,
             filter_by_updated,
+            trigger_mention,
+            allowed_mention_users,
             pr_limit,
             sandbox_rootfs,
             sandbox_network,
@@ -656,6 +669,19 @@ async fn main() -> Result<()> {
                     ]
                 });
             let max_workers = max_workers.or(daemon_cfg.max_workers).unwrap_or(1);
+            let trigger_mention = trigger_mention
+                .or(daemon_cfg.trigger_mention)
+                .map(|s| s.trim().trim_start_matches('@').to_string())
+                .filter(|s| !s.is_empty());
+            let allowed_mention_users = allowed_mention_users
+                .map(|s| {
+                    s.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .or(daemon_cfg.allowed_mention_users)
+                .unwrap_or_default();
 
             tracing::info!(
                 repos = %repos_str,
@@ -667,6 +693,8 @@ async fn main() -> Result<()> {
                 skip_prs = ?skip_prs_list,
                 allowed_author_associations = ?allowed_author_associations,
                 max_workers = max_workers,
+                trigger_mention = ?trigger_mention,
+                allowed_mention_users = ?allowed_mention_users,
                 "Starting fiach daemon"
             );
 
@@ -724,6 +752,8 @@ async fn main() -> Result<()> {
                 filter_by_updated: filter_by_updated
                     .or(daemon_cfg.filter_by_updated)
                     .unwrap_or(true),
+                trigger_mention,
+                allowed_mention_users,
                 pr_limit: pr_limit.or(daemon_cfg.pr_limit).unwrap_or(1000),
                 sandbox_rootfs: sandbox_rootfs.or(daemon_cfg.sandbox_rootfs),
                 sandbox_network: sandbox_network.or(daemon_cfg.sandbox_network),

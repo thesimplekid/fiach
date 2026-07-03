@@ -65,6 +65,8 @@ pub struct DaemonParams {
     pub output_price_per_m: Option<f64>,
     pub updated_within_days: u32,
     pub filter_by_updated: bool,
+    pub trigger_mention: Option<String>,
+    pub allowed_mention_users: Vec<String>,
     pub pr_limit: u32,
     pub sandbox_rootfs: Option<PathBuf>,
     pub sandbox_network: Option<String>,
@@ -350,6 +352,7 @@ fn pr_search_query(
     filter_by_updated: bool,
     updated_within_days: u32,
     drafts: Option<bool>,
+    trigger_mention: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -368,6 +371,10 @@ fn pr_search_query(
         parts.push(format!("draft:{drafts}"));
     }
 
+    if let Some(mention) = trigger_mention {
+        parts.push(format!("mentions:{}", mention.trim_start_matches('@')));
+    }
+
     parts.join(" ")
 }
 
@@ -375,6 +382,201 @@ fn pr_list_state_arg(state: &str) -> String {
     match state.to_ascii_lowercase().as_str() {
         "open" | "closed" | "merged" | "all" => state.to_ascii_lowercase(),
         _ => "all".to_string(),
+    }
+}
+
+const MENTION_PR_VIEW_JSON_FIELDS: &str = "author,body,createdAt,comments,reviews";
+
+#[derive(Debug, Deserialize)]
+struct MentionAuthor {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MentionSource {
+    #[serde(default)]
+    id: Option<String>,
+    author: Option<MentionAuthor>,
+    #[serde(default, rename = "authorAssociation")]
+    author_association: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default, rename = "createdAt")]
+    created_at: Option<String>,
+    #[serde(default, rename = "submittedAt")]
+    submitted_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrMentionDetails {
+    author: Option<MentionAuthor>,
+    #[serde(default)]
+    body: String,
+    #[serde(default, rename = "createdAt")]
+    created_at: Option<String>,
+    #[serde(default)]
+    comments: Vec<MentionSource>,
+    #[serde(default)]
+    reviews: Vec<MentionSource>,
+}
+
+async fn fetch_pr_mention_details(repo: &str, pr_number: u64) -> Result<PrMentionDetails> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            MENTION_PR_VIEW_JSON_FIELDS,
+        ])
+        .output()
+        .await
+        .context("Failed to run gh pr view for mention details")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh pr view failed for {repo}#{pr_number}: {stderr}");
+    }
+
+    serde_json::from_slice(&output.stdout).context("Failed to parse PR mention details")
+}
+
+fn mention_matches(text: &str, username: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let needle = format!("@{}", username.trim_start_matches('@').to_ascii_lowercase());
+    let mut search_from = 0;
+
+    while let Some(found) = text[search_from..].find(&needle) {
+        let start = search_from + found;
+        let end = start + needle.len();
+        // Word boundaries so "@fiach-bot" does not match inside "a@fiach-bot"
+        // or "@fiach-bot2" (GitHub usernames allow alphanumerics and hyphens).
+        let ok_before = text[..start]
+            .chars()
+            .next_back()
+            .map(|ch| !ch.is_ascii_alphanumeric())
+            .unwrap_or(true);
+        let ok_after = text[end..]
+            .chars()
+            .next()
+            .map(|ch| !ch.is_ascii_alphanumeric() && ch != '-')
+            .unwrap_or(true);
+
+        if ok_before && ok_after {
+            return true;
+        }
+        search_from = end;
+    }
+
+    false
+}
+
+fn is_allowed_mentioner(
+    login: &str,
+    association: &str,
+    allowed_users: &[String],
+    allowed_associations: &[String],
+) -> bool {
+    if allowed_users.is_empty() {
+        is_allowed_author_association(association, allowed_associations)
+    } else {
+        allowed_users
+            .iter()
+            .any(|user| user.trim_start_matches('@').eq_ignore_ascii_case(login))
+    }
+}
+
+fn parse_rfc3339_unix(value: &str) -> Option<i64> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ValidMention {
+    timestamp: i64,
+    /// GraphQL node id of the triggering comment or review, used to react to
+    /// it directly. None when the mention is in the PR body, where the
+    /// PR-level review-start reaction already provides feedback.
+    subject_node_id: Option<String>,
+}
+
+/// Newest mention of the trigger account by an allowlisted user in the PR
+/// body, a comment, or a review body.
+fn latest_valid_mention(
+    details: &PrMentionDetails,
+    pr_author_association: &str,
+    mention_user: &str,
+    allowed_users: &[String],
+    allowed_associations: &[String],
+) -> Option<ValidMention> {
+    let mut latest: Option<ValidMention> = None;
+
+    let mut consider = |login: Option<&str>,
+                        association: &str,
+                        body: &str,
+                        timestamp: Option<&str>,
+                        node_id: Option<&str>| {
+        let Some(login) = login else { return };
+        let Some(timestamp) = timestamp.and_then(parse_rfc3339_unix) else {
+            return;
+        };
+        if mention_matches(body, mention_user)
+            && is_allowed_mentioner(login, association, allowed_users, allowed_associations)
+            && latest
+                .as_ref()
+                .is_none_or(|current| timestamp > current.timestamp)
+        {
+            latest = Some(ValidMention {
+                timestamp,
+                subject_node_id: node_id.map(str::to_string),
+            });
+        }
+    };
+
+    consider(
+        details.author.as_ref().map(|author| author.login.as_str()),
+        pr_author_association,
+        &details.body,
+        details.created_at.as_deref(),
+        None,
+    );
+
+    for source in details.comments.iter().chain(details.reviews.iter()) {
+        consider(
+            source.author.as_ref().map(|author| author.login.as_str()),
+            &source.author_association,
+            &source.body,
+            source
+                .created_at
+                .as_deref()
+                .or(source.submitted_at.as_deref()),
+            source.id.as_deref(),
+        );
+    }
+
+    latest
+}
+
+/// A mention is a one-shot trigger: it only (re)starts a review when it is
+/// newer than the last recorded review attempt for this PR and review kind.
+fn apply_mention_trigger(
+    decision: crate::state::ReviewDecision,
+    mention_ts: i64,
+    last_review_ts: Option<i64>,
+) -> crate::state::ReviewDecision {
+    use crate::state::ReviewDecision::{ReReview, Skip};
+
+    let mention_is_fresh = last_review_ts.is_none_or(|last| mention_ts > last);
+
+    match decision {
+        // Same commit already reviewed, but re-mentioned since: review again.
+        Skip if mention_is_fresh => ReReview,
+        // New commit but nobody has re-mentioned since the last review.
+        ReReview if !mention_is_fresh => Skip,
+        other => other,
     }
 }
 
@@ -440,6 +642,7 @@ pub async fn run_daemon(
                     params.filter_by_updated,
                     params.updated_within_days,
                     params.drafts,
+                    params.trigger_mention.as_deref(),
                 );
 
                 let list_state = pr_list_state_arg(state);
@@ -500,7 +703,9 @@ pub async fn run_daemon(
                         );
 
                         let mut outcomes = stream::iter(jobs.iter())
-                            .map(|job| process_daemon_job(&params, repo, job, cancel_token.clone()))
+                            .map(|job| {
+                                process_daemon_job(&params, repo, job, cancel_token.clone(), true)
+                            })
                             .buffer_unordered(concurrency);
 
                         while let Some(outcome) = outcomes.next().await {
@@ -623,6 +828,7 @@ async fn process_daemon_job(
     repo: &str,
     job: &ReviewJob,
     cancel_token: CancellationToken,
+    honor_mention_trigger: bool,
 ) -> Result<PrProcessStatus> {
     if cancel_token.is_cancelled() {
         return Ok(PrProcessStatus::Skipped);
@@ -645,7 +851,18 @@ async fn process_daemon_job(
         return Ok(PrProcessStatus::Skipped);
     }
 
-    if !is_allowed_author_association(&pr.author_association, &params.allowed_author_associations) {
+    let mention_user = if honor_mention_trigger {
+        params.trigger_mention.as_deref()
+    } else {
+        None
+    };
+
+    // In mention-trigger mode the mentioner carries the trust, so the PR
+    // author gate only applies when no mention trigger is in effect. This
+    // lets a maintainer summon a review on e.g. a first-time contributor's PR.
+    if mention_user.is_none()
+        && !is_allowed_author_association(&pr.author_association, &params.allowed_author_associations)
+    {
         tracing::info!(
             repo = %repo,
             pr = pr.number,
@@ -667,6 +884,41 @@ async fn process_daemon_job(
         return Ok(PrProcessStatus::Skipped);
     }
 
+    let mention = if let Some(mention_user) = mention_user {
+        let details = match fetch_pr_mention_details(repo, pr.number).await {
+            Ok(details) => details,
+            Err(e) => {
+                tracing::error!(
+                    repo = %repo,
+                    pr = pr.number,
+                    error = %e,
+                    "Failed to fetch PR mention details"
+                );
+                return Ok(PrProcessStatus::Failed);
+            }
+        };
+
+        let Some(mention) = latest_valid_mention(
+            &details,
+            &pr.author_association,
+            mention_user,
+            &params.allowed_mention_users,
+            &params.allowed_author_associations,
+        ) else {
+            tracing::info!(
+                repo = %repo,
+                pr = pr.number,
+                mention_user = %mention_user,
+                "Skipping PR because no allowlisted user has mentioned the trigger account"
+            );
+            return Ok(PrProcessStatus::Skipped);
+        };
+        Some(mention)
+    } else {
+        None
+    };
+    let mention_ts = mention.as_ref().map(|mention| mention.timestamp);
+
     let review_decision = crate::state::should_review_with_retry_limit(
         &params.db_path,
         repo,
@@ -676,6 +928,33 @@ async fn process_daemon_job(
         params.timeout_mins,
         params.max_retries,
     );
+
+    let review_decision = match review_decision {
+        Ok(decision) => {
+            if let Some(mention_ts) = mention_ts {
+                let last_review_ts =
+                    crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
+                        .ok()
+                        .flatten()
+                        .map(|meta| meta.timestamp);
+                let effective = apply_mention_trigger(decision, mention_ts, last_review_ts);
+                if effective != decision {
+                    tracing::info!(
+                        repo = %repo,
+                        pr = pr.number,
+                        review_kind = %job.review_kind,
+                        original = ?decision,
+                        effective = ?effective,
+                        "Mention trigger adjusted review decision"
+                    );
+                }
+                Ok(effective)
+            } else {
+                Ok(decision)
+            }
+        }
+        Err(e) => Err(e),
+    };
 
     match review_decision {
         Ok(
@@ -746,6 +1025,23 @@ async fn process_daemon_job(
                 }
             }
 
+            // Acknowledge the triggering comment so the mentioner can see the
+            // review is starting. Mentions in the PR body have no node id and
+            // are covered by the PR-level review-start reaction instead.
+            if let Some(node_id) = mention
+                .as_ref()
+                .and_then(|mention| mention.subject_node_id.as_deref())
+                && let Some(reaction) = params.disclose_config.reactions.review_start.as_deref()
+                && let Err(error) = crate::disclose::post_mention_reaction(node_id, reaction).await
+            {
+                tracing::warn!(
+                    repo = %repo,
+                    pr = pr.number,
+                    error = %error,
+                    "Failed to react to trigger mention comment"
+                );
+            }
+
             let output_path = output_path_for_review(
                 params.out_dir.as_deref(),
                 repo,
@@ -781,6 +1077,9 @@ async fn process_daemon_job(
                 input_price_per_m: params.input_price_per_m,
                 output_price_per_m: params.output_price_per_m,
                 is_rereview,
+                trigger_mention_node_id: mention
+                    .as_ref()
+                    .and_then(|mention| mention.subject_node_id.clone()),
                 execution: ReviewExecution {
                     skip_state_check: true,
                     persist_side_effects: true,
@@ -925,8 +1224,9 @@ async fn trigger_manual_review(
     );
 
     let concurrency = worker_concurrency(params.max_workers, jobs.len());
+    // Manual triggers are deliberate, so they bypass the mention gate.
     let mut outcomes = stream::iter(jobs.iter())
-        .map(|job| process_daemon_job(params, &repo, job, cancel_token.clone()))
+        .map(|job| process_daemon_job(params, &repo, job, cancel_token.clone(), false))
         .buffer_unordered(concurrency);
 
     while let Some(outcome) = outcomes.next().await {
@@ -1459,6 +1759,22 @@ async fn run_sandboxed_review(
             "Failed to post no-findings reaction"
         );
     }
+    if let Some(node_id) = review_params.trigger_mention_node_id.as_deref()
+        && crate::disclose::is_non_actionable_status(&metadata.status)
+        && let Some(reaction) = review_params
+            .disclose_config
+            .reactions
+            .no_findings
+            .as_deref()
+        && let Err(error) = crate::disclose::post_mention_reaction(node_id, reaction).await
+    {
+        tracing::warn!(
+            repo = %review_params.repo,
+            pr = review_params.pr_number,
+            error = %error,
+            "Failed to post no-findings reaction on trigger mention comment"
+        );
+    }
     crate::state::mark_reviewed(
         &params.db_path,
         &review_params.repo,
@@ -1739,16 +2055,19 @@ mod tests {
 
     #[test]
     fn pr_search_query_can_omit_updated_filter() {
-        assert_eq!(pr_search_query("open", false, 120, None), "state:open");
         assert_eq!(
-            pr_search_query("open", false, 120, Some(false)),
+            pr_search_query("open", false, 120, None, None),
+            "state:open"
+        );
+        assert_eq!(
+            pr_search_query("open", false, 120, Some(false), None),
             "state:open draft:false"
         );
     }
 
     #[test]
     fn pr_search_query_includes_updated_filter_when_configured() {
-        let query = pr_search_query("open", true, 120, Some(false));
+        let query = pr_search_query("open", true, 120, Some(false), None);
 
         assert!(query.starts_with("state:open updated:>="));
         assert!(query.ends_with(" draft:false"));
@@ -1756,10 +2075,124 @@ mod tests {
 
     #[test]
     fn pr_search_query_omits_state_filter_for_all() {
-        assert_eq!(pr_search_query("all", false, 120, None), "");
+        assert_eq!(pr_search_query("all", false, 120, None, None), "");
         assert_eq!(
-            pr_search_query("all", false, 120, Some(false)),
+            pr_search_query("all", false, 120, Some(false), None),
             "draft:false"
+        );
+    }
+
+    fn mention_source(login: &str, association: &str, body: &str, created_at: &str) -> MentionSource {
+        MentionSource {
+            id: Some(format!("IC_{login}")),
+            author: Some(MentionAuthor {
+                login: login.to_string(),
+            }),
+            author_association: association.to_string(),
+            body: body.to_string(),
+            created_at: Some(created_at.to_string()),
+            submitted_at: None,
+        }
+    }
+
+    #[test]
+    fn mention_matches_respects_word_boundaries() {
+        assert!(mention_matches("please review @fiach-bot", "fiach-bot"));
+        assert!(mention_matches("@FIACH-BOT take a look", "fiach-bot"));
+        assert!(mention_matches("@fiach-bot, thanks", "@fiach-bot"));
+        assert!(!mention_matches("mail me at a@fiach-bot", "fiach-bot"));
+        assert!(!mention_matches("@fiach-bot2 is someone else", "fiach-bot"));
+        assert!(!mention_matches("@fiach-botanic", "fiach-bot"));
+        assert!(!mention_matches("no mention here", "fiach-bot"));
+    }
+
+    #[test]
+    fn mentioner_allowlist_prefers_explicit_users_over_associations() {
+        let users = vec!["Lead-Maintainer".to_string()];
+        let associations = vec!["MEMBER".to_string()];
+
+        assert!(is_allowed_mentioner("lead-maintainer", "NONE", &users, &associations));
+        assert!(!is_allowed_mentioner("drive-by", "MEMBER", &users, &associations));
+        assert!(is_allowed_mentioner("anyone", "member", &[], &associations));
+        assert!(!is_allowed_mentioner("anyone", "NONE", &[], &associations));
+    }
+
+    #[test]
+    fn latest_valid_mention_uses_newest_allowlisted_mention() {
+        let details = PrMentionDetails {
+            author: Some(MentionAuthor {
+                login: "new-contributor".to_string(),
+            }),
+            body: "cc @fiach-bot".to_string(),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            comments: vec![
+                mention_source("drive-by", "NONE", "@fiach-bot review", "2026-01-03T00:00:00Z"),
+                mention_source("maintainer", "MEMBER", "@fiach-bot review", "2026-01-02T00:00:00Z"),
+            ],
+            reviews: vec![],
+        };
+        let associations = vec!["MEMBER".to_string()];
+
+        // PR author (NONE) and drive-by commenter are not allowlisted; only the
+        // maintainer's mention counts, and it carries the comment node id.
+        let mention =
+            latest_valid_mention(&details, "NONE", "fiach-bot", &[], &associations).unwrap();
+        assert_eq!(Some(mention.timestamp), parse_rfc3339_unix("2026-01-02T00:00:00Z"));
+        assert_eq!(mention.subject_node_id.as_deref(), Some("IC_maintainer"));
+
+        let none = latest_valid_mention(&details, "NONE", "other-bot", &[], &associations);
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn latest_valid_mention_in_pr_body_has_no_node_id() {
+        let details = PrMentionDetails {
+            author: Some(MentionAuthor {
+                login: "maintainer".to_string(),
+            }),
+            body: "cc @fiach-bot".to_string(),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            comments: vec![],
+            reviews: vec![],
+        };
+        let associations = vec!["MEMBER".to_string()];
+
+        let mention =
+            latest_valid_mention(&details, "MEMBER", "fiach-bot", &[], &associations).unwrap();
+        assert_eq!(mention.subject_node_id, None);
+    }
+
+    #[test]
+    fn mention_trigger_is_one_shot() {
+        use crate::state::ReviewDecision::*;
+
+        // Never reviewed: any valid mention triggers.
+        assert_eq!(apply_mention_trigger(FirstReview, 100, None), FirstReview);
+        // Re-mentioned after a completed same-commit review: run again.
+        assert_eq!(apply_mention_trigger(Skip, 200, Some(100)), ReReview);
+        // Stale mention on an already-reviewed commit: stay skipped.
+        assert_eq!(apply_mention_trigger(Skip, 100, Some(200)), Skip);
+        // New commit but no fresh mention: do not auto re-review.
+        assert_eq!(apply_mention_trigger(ReReview, 100, Some(200)), Skip);
+        // New commit and fresh mention: review.
+        assert_eq!(apply_mention_trigger(ReReview, 300, Some(200)), ReReview);
+        // Failed attempts keep retrying without a new mention.
+        assert_eq!(apply_mention_trigger(RetryFailed, 100, Some(200)), RetryFailed);
+    }
+
+    #[test]
+    fn pr_search_query_includes_trigger_mention() {
+        assert_eq!(
+            pr_search_query("open", false, 120, None, Some("fiach-bot")),
+            "state:open mentions:fiach-bot"
+        );
+    }
+
+    #[test]
+    fn pr_search_query_strips_leading_at_from_trigger_mention() {
+        assert_eq!(
+            pr_search_query("all", false, 120, None, Some("@fiach-bot")),
+            "mentions:fiach-bot"
         );
     }
 

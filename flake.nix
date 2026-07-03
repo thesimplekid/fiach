@@ -114,7 +114,7 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               outputHashes = {
-                "goose-1.37.0" = "sha256-YEK4cGcSx2ppEtR60x/4wwtJFMDO9jnK5bAo2RW3E64=";
+                "goose-1.39.0" = "sha256-7CXLvfY2jYUB9IG/Z1lPiqwZ7UwIypq32ZLq1SsnHQI=";
               };
             };
 
@@ -150,6 +150,8 @@
                       inputPricePerM = 1.25;
                       outputPricePerM = 5.75;
                       withSkill = "cashu-security";
+                      triggerMention = "fiach-bot";
+                      allowedMentionUsers = [ "lead-maintainer" ];
                       sandbox = {
                         enable = true;
                         networkMode = "veth";
@@ -198,6 +200,8 @@
               grep -F 'input_price_per_m = 1.25' "$config_path" >/dev/null
               grep -F 'output_price_per_m = 5.75' "$config_path" >/dev/null
               grep -F 'with_skill = "cashu-security"' "$config_path" >/dev/null
+              grep -F 'trigger_mention = "fiach-bot"' "$config_path" >/dev/null
+              grep -F 'allowed_mention_users = ["lead-maintainer"]' "$config_path" >/dev/null
 
               touch "$out"
             '';
@@ -292,6 +296,28 @@
               type = lib.types.listOf lib.types.str;
               default = [ "COLLABORATOR" "CONTRIBUTOR" "MEMBER" "OWNER" ];
               description = "GitHub PR author associations allowed to trigger daemon reviews";
+            };
+
+            triggerMention = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = ''
+                GitHub username whose @-mention triggers a review (e.g. "fiach-bot").
+                When set, the daemon only reviews PRs after this account has been
+                mentioned in the PR body, a comment, or a review; each mention
+                triggers one review and a new mention is needed to re-review.
+                When null, every discovered PR is reviewed.
+              '';
+            };
+
+            allowedMentionUsers = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = ''
+                GitHub usernames whose mentions of services.fiach.triggerMention
+                count as a review trigger. When empty, mentions from commenters
+                matching services.fiach.allowedAuthorAssociations count instead.
+              '';
             };
 
             maxWorkers = lib.mkOption {
@@ -708,6 +734,10 @@
                       dedupe_model = cfg.dedupeModel;
                     } // lib.optionalAttrs (cfg.withSkill != null) {
                       with_skill = cfg.withSkill;
+                    } // lib.optionalAttrs (cfg.triggerMention != null) {
+                      trigger_mention = cfg.triggerMention;
+                    } // lib.optionalAttrs (cfg.allowedMentionUsers != [ ]) {
+                      allowed_mention_users = cfg.allowedMentionUsers;
                     } // lib.optionalAttrs (cfg.syncRepo != null) {
                       sync_repo = cfg.syncRepo;
                     } // lib.optionalAttrs (cfg.maxCostUsd != null) {
