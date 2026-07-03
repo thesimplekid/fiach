@@ -457,8 +457,8 @@ fn review_lane_prompt(
          Run focused Goose delegate subagents for these lanes before submitting the final structured result:\n\
          {lane_list}\n\n\
          Use the `delegate` tool for the lane work. Start up to {max_review_lanes} lane delegates concurrently with `async: true`, then use `load(source: task_id)` to collect each result. If there are more lanes than the concurrency limit, run them in batches until every lane has returned.\n\
-         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and begin its instructions with `Review lane: <lane>` so host logs can identify lane execution. Give delegates read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate should inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context, and return concise JSON-like candidate notes for its lane only, preferably as `{{\"candidates\":[...]}}` or `{{\"candidates\":[]}}`.\n\
-         After all lane results are loaded, you are the only agent that synthesizes and submits. Deduplicate candidates across {lane_names}, discard weak or duplicate notes, verify every retained root cause is in `.pr_diff.txt`, add `lane:<name>` to `skills_used` for the lanes that contributed to each retained candidate, then call `submit_finding` for each candidate or `submit_no_findings` if all lanes found nothing actionable.",
+         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and begin its instructions with `Review lane: <lane>` so host logs can identify lane execution. Give delegates read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate must inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context, and return only a concise JSON object for its lane in this shape: `{{\"status\":\"candidates\",\"candidates\":[...]}}` when it found lane candidates, or `{{\"status\":\"no_findings\",\"candidates\":[]}}` when it found none. Candidate objects must name the PR-introduced root cause, affected diff location, impact, confidence, and concrete fix.\n\
+         After all lane results are loaded, you are the only agent that synthesizes and submits. Do not call `submit_finding` or `submit_no_findings` until every lane result has been loaded and every lane candidate has either been retained as a structured finding or explicitly discarded as weak, duplicate, or not rooted in `.pr_diff.txt`. Deduplicate candidates across {lane_names}, discard weak or duplicate notes, verify every retained root cause is in `.pr_diff.txt`, add `lane:<name>` to `skills_used` for the lanes that contributed to each retained candidate, then call `submit_finding` for each candidate or `submit_no_findings` if all lanes found nothing actionable.",
     )
 }
 
@@ -3401,7 +3401,10 @@ Reviewed the PR and found no vulnerabilities.
         assert!(prompt.contains("extensions` to `[\"developer\", \"summon\"]`"));
         assert!(prompt.contains("Review lane: <lane>"));
         assert!(prompt.contains("BASE_BRANCH=abc123 ./safe_diff.sh"));
+        assert!(prompt.contains("\"status\":\"candidates\""));
+        assert!(prompt.contains("\"status\":\"no_findings\""));
         assert!(prompt.contains("you are the only agent that synthesizes and submits"));
+        assert!(prompt.contains("every lane candidate has either been retained"));
         assert!(prompt.contains("lane:<name>"));
     }
 
