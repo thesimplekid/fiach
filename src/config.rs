@@ -50,6 +50,10 @@ pub struct DaemonConfig {
     pub with_skill: Option<String>,
     pub persona: Option<MultiString>,
     pub personas: Option<MultiString>,
+    pub review_lanes: Option<MultiString>,
+    #[serde(default)]
+    pub review_lane_prompts: HashMap<String, String>,
+    pub max_review_lanes: Option<usize>,
     pub max_turns: Option<u32>,
     pub timeout_mins: Option<u64>,
     pub db_path: Option<PathBuf>,
@@ -94,6 +98,10 @@ pub struct ReviewConfig {
     pub with_skill: Option<String>,
     pub persona: Option<MultiString>,
     pub personas: Option<MultiString>,
+    pub review_lanes: Option<MultiString>,
+    #[serde(default)]
+    pub review_lane_prompts: HashMap<String, String>,
+    pub max_review_lanes: Option<usize>,
     pub max_turns: Option<u32>,
     pub timeout_mins: Option<u64>,
     pub db_path: Option<PathBuf>,
@@ -127,5 +135,42 @@ impl FiachConfig {
         let config = builder.build()?;
         let fiach_config: FiachConfig = config.try_deserialize()?;
         Ok(fiach_config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_loads_custom_review_lane_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fiach.toml");
+        std::fs::write(
+            &path,
+            r#"
+[review]
+review_lanes = ["security", "cashu-mint"]
+
+[review.review_lane_prompts]
+cashu-mint = "Focus on mint quote idempotency."
+"#,
+        )
+        .unwrap();
+
+        let config = FiachConfig::load(Some(&path)).unwrap();
+        let review = config.review.unwrap();
+
+        assert_eq!(
+            review.review_lanes.unwrap().to_vec(),
+            vec!["security", "cashu-mint"]
+        );
+        assert_eq!(
+            review
+                .review_lane_prompts
+                .get("cashu-mint")
+                .map(String::as_str),
+            Some("Focus on mint quote idempotency.")
+        );
     }
 }

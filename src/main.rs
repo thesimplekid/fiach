@@ -8,6 +8,7 @@ mod server;
 mod state;
 mod workspace;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -46,6 +47,26 @@ fn resolve_personas(
         .unwrap_or_else(|| vec!["builtin:security".to_string()]);
 
     parse_persona_sources(values)
+}
+
+fn resolve_review_lanes(cli_lanes: Option<String>, cfg_lanes: Option<MultiString>) -> Vec<String> {
+    cli_lanes
+        .map(MultiString::Single)
+        .or(cfg_lanes)
+        .map(|lanes| lanes.to_vec())
+        .unwrap_or_default()
+}
+
+fn resolve_review_lane_prompts(
+    mut cfg_prompts: HashMap<String, String>,
+    json_prompts: Option<String>,
+) -> Result<HashMap<String, String>> {
+    if let Some(json) = json_prompts {
+        let prompts: HashMap<String, String> =
+            serde_json::from_str(&json).map_err(|error| anyhow::anyhow!(error))?;
+        cfg_prompts.extend(prompts);
+    }
+    Ok(cfg_prompts)
 }
 
 fn review_kind_for(persona: &persona::PersonaSource, use_persona_kind: bool) -> String {
@@ -144,6 +165,14 @@ enum Commands {
         #[arg(long)]
         persona: Option<String>,
 
+        /// Comma-separated review lanes to run as Goose subagents before the parent submits findings
+        #[arg(long)]
+        review_lanes: Option<String>,
+
+        /// Maximum review lane subagents to run concurrently
+        #[arg(long)]
+        max_review_lanes: Option<usize>,
+
         /// Maximum number of turns for the agent (prevents runaway costs)
         #[arg(long)]
         max_turns: Option<u32>,
@@ -208,6 +237,10 @@ enum Commands {
         #[arg(long, hide = true)]
         sandbox_child: bool,
 
+        /// Internal: JSON map of review lane prompts for sandbox child reviews
+        #[arg(long, hide = true)]
+        review_lane_prompts_json: Option<String>,
+
         /// Internal: write structured sandbox review result to JSON
         #[arg(long, hide = true)]
         result_json: Option<PathBuf>,
@@ -261,6 +294,14 @@ enum Commands {
         /// Path to the persona prompt file or builtin. Can be comma-separated.
         #[arg(long)]
         persona: Option<String>,
+
+        /// Comma-separated review lanes to run as Goose subagents before the parent submits findings
+        #[arg(long)]
+        review_lanes: Option<String>,
+
+        /// Maximum review lane subagents to run concurrently
+        #[arg(long)]
+        max_review_lanes: Option<usize>,
 
         /// Maximum number of turns for the agent
         #[arg(long)]
@@ -447,6 +488,8 @@ async fn main() -> Result<()> {
             output,
             with_skill,
             persona,
+            review_lanes,
+            max_review_lanes,
             max_turns,
             timeout_mins,
             db_path,
@@ -463,6 +506,7 @@ async fn main() -> Result<()> {
             input_price,
             output_price,
             sandbox_child,
+            review_lane_prompts_json,
             result_json,
             review_kind,
         } => {
@@ -482,6 +526,10 @@ async fn main() -> Result<()> {
             let dedupe_model = dedupe_model.or(rev_cfg.dedupe_model);
             let dedupe_provider = dedupe_provider.or(rev_cfg.dedupe_provider);
             let personas = resolve_personas(persona, rev_cfg.persona, rev_cfg.personas);
+            let review_lanes = resolve_review_lanes(review_lanes, rev_cfg.review_lanes);
+            let review_lane_prompts =
+                resolve_review_lane_prompts(rev_cfg.review_lane_prompts, review_lane_prompts_json)?;
+            let max_review_lanes = max_review_lanes.or(rev_cfg.max_review_lanes).unwrap_or(3);
             let use_persona_kind = personas.len() > 1;
             let report_mode_str = report_mode
                 .or(rev_cfg.report_mode)
@@ -501,6 +549,9 @@ async fn main() -> Result<()> {
                 output = ?output,
                 with_skill = ?skill,
                 personas = ?personas,
+                review_lanes = ?review_lanes,
+                review_lane_prompts = review_lane_prompts.len(),
+                max_review_lanes = max_review_lanes,
                 "Starting single PR review"
             );
 
@@ -518,6 +569,9 @@ async fn main() -> Result<()> {
                     output: output_for_persona(output.clone(), &persona, use_persona_kind),
                     skill: skill.clone(),
                     persona: persona.clone(),
+                    review_lanes: review_lanes.clone(),
+                    review_lane_prompts: review_lane_prompts.clone(),
+                    max_review_lanes,
                     max_turns: max_turns.or(rev_cfg.max_turns).unwrap_or(60),
                     timeout_mins: timeout_mins.or(rev_cfg.timeout_mins).unwrap_or(30),
                     db_path: db_path.clone(),
@@ -576,6 +630,8 @@ async fn main() -> Result<()> {
             dedupe_provider,
             with_skill,
             persona,
+            review_lanes,
+            max_review_lanes,
             max_turns,
             timeout_mins,
             db_path,
@@ -631,6 +687,11 @@ async fn main() -> Result<()> {
             let dedupe_model = dedupe_model.or(daemon_cfg.dedupe_model);
             let dedupe_provider = dedupe_provider.or(daemon_cfg.dedupe_provider);
             let personas = resolve_personas(persona, daemon_cfg.persona, daemon_cfg.personas);
+            let review_lanes = resolve_review_lanes(review_lanes, daemon_cfg.review_lanes);
+            let review_lane_prompts = daemon_cfg.review_lane_prompts;
+            let max_review_lanes = max_review_lanes
+                .or(daemon_cfg.max_review_lanes)
+                .unwrap_or(3);
             let report_mode_str = report_mode
                 .or(daemon_cfg.report_mode)
                 .unwrap_or_else(|| "local".to_string());
@@ -689,6 +750,9 @@ async fn main() -> Result<()> {
                 provider = %provider,
                 model = %model,
                 personas = ?personas,
+                review_lanes = ?review_lanes,
+                review_lane_prompts = review_lane_prompts.len(),
+                max_review_lanes = max_review_lanes,
                 pr_states = ?pr_states,
                 skip_prs = ?skip_prs_list,
                 allowed_author_associations = ?allowed_author_associations,
@@ -710,6 +774,9 @@ async fn main() -> Result<()> {
                 dedupe_model,
                 skill: with_skill.or(daemon_cfg.with_skill),
                 personas,
+                review_lanes,
+                review_lane_prompts,
+                max_review_lanes,
                 max_turns: max_turns.or(daemon_cfg.max_turns).unwrap_or(60),
                 timeout_mins: timeout_mins.or(daemon_cfg.timeout_mins).unwrap_or(30),
                 db_path: db_path

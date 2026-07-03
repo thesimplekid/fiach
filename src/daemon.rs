@@ -46,6 +46,9 @@ pub struct DaemonParams {
     pub dedupe_model: Option<String>,
     pub skill: Option<String>,
     pub personas: Vec<crate::persona::PersonaSource>,
+    pub review_lanes: Vec<String>,
+    pub review_lane_prompts: HashMap<String, String>,
+    pub max_review_lanes: usize,
     pub max_turns: u32,
     pub timeout_mins: u64,
     pub db_path: PathBuf,
@@ -861,7 +864,10 @@ async fn process_daemon_job(
     // author gate only applies when no mention trigger is in effect. This
     // lets a maintainer summon a review on e.g. a first-time contributor's PR.
     if mention_user.is_none()
-        && !is_allowed_author_association(&pr.author_association, &params.allowed_author_associations)
+        && !is_allowed_author_association(
+            &pr.author_association,
+            &params.allowed_author_associations,
+        )
     {
         tracing::info!(
             repo = %repo,
@@ -1063,6 +1069,9 @@ async fn process_daemon_job(
                 output: output_path,
                 skill: params.skill.clone(),
                 persona: job.persona.clone(),
+                review_lanes: params.review_lanes.clone(),
+                review_lane_prompts: params.review_lane_prompts.clone(),
+                max_review_lanes: params.max_review_lanes,
                 max_turns: params.max_turns,
                 timeout_mins: params.timeout_mins,
                 db_path: params.db_path.clone(),
@@ -1485,6 +1494,18 @@ async fn run_sandboxed_review(
         cmd.arg("--with-skill").arg(skill);
     }
     cmd.arg("--persona").arg(review_params.persona.to_string());
+    if !review_params.review_lanes.is_empty() {
+        cmd.arg("--review-lanes")
+            .arg(review_params.review_lanes.join(","));
+    }
+    if !review_params.review_lane_prompts.is_empty() {
+        cmd.arg("--review-lane-prompts-json").arg(
+            serde_json::to_string(&review_params.review_lane_prompts)
+                .context("Failed to serialize review lane prompts for sandbox child")?,
+        );
+    }
+    cmd.arg("--max-review-lanes")
+        .arg(review_params.max_review_lanes.to_string());
     cmd.arg("--review-kind").arg(&review_params.review_kind);
     cmd.arg("--max-turns")
         .arg(review_params.max_turns.to_string());
@@ -2091,7 +2112,12 @@ mod tests {
         );
     }
 
-    fn mention_source(login: &str, association: &str, body: &str, created_at: &str) -> MentionSource {
+    fn mention_source(
+        login: &str,
+        association: &str,
+        body: &str,
+        created_at: &str,
+    ) -> MentionSource {
         MentionSource {
             id: Some(format!("IC_{login}")),
             author: Some(MentionAuthor {
@@ -2120,8 +2146,18 @@ mod tests {
         let users = vec!["Lead-Maintainer".to_string()];
         let associations = vec!["MEMBER".to_string()];
 
-        assert!(is_allowed_mentioner("lead-maintainer", "NONE", &users, &associations));
-        assert!(!is_allowed_mentioner("drive-by", "MEMBER", &users, &associations));
+        assert!(is_allowed_mentioner(
+            "lead-maintainer",
+            "NONE",
+            &users,
+            &associations
+        ));
+        assert!(!is_allowed_mentioner(
+            "drive-by",
+            "MEMBER",
+            &users,
+            &associations
+        ));
         assert!(is_allowed_mentioner("anyone", "member", &[], &associations));
         assert!(!is_allowed_mentioner("anyone", "NONE", &[], &associations));
     }
@@ -2135,8 +2171,18 @@ mod tests {
             body: "cc @fiach-bot".to_string(),
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
             comments: vec![
-                mention_source("drive-by", "NONE", "@fiach-bot review", "2026-01-03T00:00:00Z"),
-                mention_source("maintainer", "MEMBER", "@fiach-bot review", "2026-01-02T00:00:00Z"),
+                mention_source(
+                    "drive-by",
+                    "NONE",
+                    "@fiach-bot review",
+                    "2026-01-03T00:00:00Z",
+                ),
+                mention_source(
+                    "maintainer",
+                    "MEMBER",
+                    "@fiach-bot review",
+                    "2026-01-02T00:00:00Z",
+                ),
             ],
             reviews: vec![],
         };
@@ -2146,7 +2192,10 @@ mod tests {
         // maintainer's mention counts, and it carries the comment node id.
         let mention =
             latest_valid_mention(&details, "NONE", "fiach-bot", &[], &associations).unwrap();
-        assert_eq!(Some(mention.timestamp), parse_rfc3339_unix("2026-01-02T00:00:00Z"));
+        assert_eq!(
+            Some(mention.timestamp),
+            parse_rfc3339_unix("2026-01-02T00:00:00Z")
+        );
         assert_eq!(mention.subject_node_id.as_deref(), Some("IC_maintainer"));
 
         let none = latest_valid_mention(&details, "NONE", "other-bot", &[], &associations);
@@ -2186,7 +2235,10 @@ mod tests {
         // New commit and fresh mention: review.
         assert_eq!(apply_mention_trigger(ReReview, 300, Some(200)), ReReview);
         // Failed attempts keep retrying without a new mention.
-        assert_eq!(apply_mention_trigger(RetryFailed, 100, Some(200)), RetryFailed);
+        assert_eq!(
+            apply_mention_trigger(RetryFailed, 100, Some(200)),
+            RetryFailed
+        );
     }
 
     #[test]

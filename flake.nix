@@ -391,6 +391,31 @@
               description = "Persona sources to run independently for each PR. When set, this takes precedence over services.fiach.persona.";
             };
 
+            reviewLanes = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [ "security" "correctness" "concurrency" "api-compat" "tests" ];
+              description = "Focused review lanes to run as Goose subagents inside each review before the parent finder submits one combined structured result.";
+            };
+
+            reviewLanePrompts = lib.mkOption {
+              type = lib.types.attrsOf lib.types.str;
+              default = { };
+              example = {
+                cashu-mint = ''
+                  Focus on Cashu mint correctness, blinded signature issuance,
+                  quote idempotency, and accounting invariants.
+                '';
+              };
+              description = "Custom prompt text keyed by review lane name. Keys are normalized like reviewLanes before matching.";
+            };
+
+            maxReviewLanes = lib.mkOption {
+              type = lib.types.int;
+              default = 3;
+              description = "Maximum number of review lane subagents to run concurrently inside each review.";
+            };
+
             reportMode = lib.mkOption {
               type = lib.types.enum [ "local" "pr-comment" "sync-pr" "hybrid" ];
               default = "local";
@@ -715,6 +740,9 @@
                       drafts = cfg.drafts;
                       provider = cfg.provider;
                       model = cfg.model;
+                      review_lanes = cfg.reviewLanes;
+                      review_lane_prompts = cfg.reviewLanePrompts;
+                      max_review_lanes = cfg.maxReviewLanes;
                       db_path = "${cfg.dataDir}/fiach.redb";
                       out_dir = "${cfg.dataDir}/reports";
                       report_mode = cfg.reportMode;

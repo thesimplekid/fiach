@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -294,6 +295,13 @@ pub struct ReviewParams {
     pub skill: Option<String>,
     /// Path to the persona file or builtin
     pub persona: crate::persona::PersonaSource,
+    /// Focused review lanes to run as Goose delegate subagents before the
+    /// parent finder submits the combined structured result.
+    pub review_lanes: Vec<String>,
+    /// Optional user-provided focus prompts keyed by lane name.
+    pub review_lane_prompts: HashMap<String, String>,
+    /// Maximum lane subagents the parent finder should run concurrently.
+    pub max_review_lanes: usize,
     /// Maximum number of turns for the agent
     pub max_turns: u32,
     /// Timeout in minutes for the session
@@ -327,6 +335,132 @@ pub struct ReviewParams {
 }
 
 type SharedReportingArtifact = Arc<Mutex<ReportingArtifact>>;
+
+fn normalize_review_lanes(lanes: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for lane in lanes {
+        let lane = lane.trim();
+        if lane.is_empty() {
+            continue;
+        }
+        let lane = lane
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .split('-')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        if !lane.is_empty() && !normalized.contains(&lane) {
+            normalized.push(lane);
+        }
+    }
+    normalized
+}
+
+fn normalize_review_lane_name(lane: &str) -> String {
+    normalize_review_lanes(&[lane.to_string()])
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+fn normalize_review_lane_prompts(prompts: &HashMap<String, String>) -> HashMap<String, String> {
+    prompts
+        .iter()
+        .filter_map(|(name, prompt)| {
+            let name = normalize_review_lane_name(name);
+            let prompt = prompt.trim();
+            if name.is_empty() || prompt.is_empty() {
+                None
+            } else {
+                Some((name, prompt.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn review_lane_focus(lane: &str) -> &'static str {
+    match lane {
+        "security" => {
+            "security vulnerabilities, privilege boundaries, input validation, authentication, authorization, secret handling, and exploitability"
+        }
+        "correctness" | "logic" => {
+            "logic errors, broken edge cases, incorrect state transitions, and behavior that contradicts the intended PR change"
+        }
+        "concurrency" | "state-concurrency" => {
+            "race conditions, async ordering, lock scope, shared mutable state, retries, idempotency, and crash recovery"
+        }
+        "api-compat" | "compatibility" => {
+            "public API compatibility, serialization/schema changes, migrations, configuration compatibility, and integration breakage"
+        }
+        "tests" | "test-regressions" => {
+            "missing regression coverage, changed test expectations, untested failure paths, and whether tests would catch the risky changed behavior"
+        }
+        "performance" => {
+            "performance regressions, unnecessary repeated work, memory growth, I/O amplification, and scalability limits"
+        }
+        "observability" => {
+            "logging, tracing, error context, operational visibility, and whether failures can be diagnosed safely"
+        }
+        _ => "the named focus area and any concrete PR-introduced risks in that area",
+    }
+}
+
+fn review_lane_focus_text<'a>(
+    lane: &'a str,
+    custom_prompts: &'a HashMap<String, String>,
+) -> std::borrow::Cow<'a, str> {
+    custom_prompts
+        .get(lane)
+        .map(|prompt| std::borrow::Cow::Borrowed(prompt.as_str()))
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed(review_lane_focus(lane)))
+}
+
+fn review_lane_prompt(
+    lanes: &[String],
+    custom_prompts: &HashMap<String, String>,
+    max_review_lanes: usize,
+    diff_base: &str,
+) -> String {
+    let lanes = normalize_review_lanes(lanes);
+    if lanes.is_empty() {
+        return String::new();
+    }
+    let custom_prompts = normalize_review_lane_prompts(custom_prompts);
+
+    let max_review_lanes = max_review_lanes.max(1).min(lanes.len());
+    let lane_list = lanes
+        .iter()
+        .map(|lane| {
+            format!(
+                "- `{lane}`: {}",
+                review_lane_focus_text(lane, &custom_prompts)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lane_names = lanes
+        .iter()
+        .map(|lane| format!("`{lane}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "\n\nPARALLEL REVIEW LANES:\n\
+         Run focused Goose delegate subagents for these lanes before submitting the final structured result:\n\
+         {lane_list}\n\n\
+         Use the `delegate` tool for the lane work. Start up to {max_review_lanes} lane delegates concurrently with `async: true`, then use `load(source: task_id)` to collect each result. If there are more lanes than the concurrency limit, run them in batches until every lane has returned.\n\
+         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and give it read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate should inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context, and return concise JSON-like candidate notes for its lane only.\n\
+         After all lane results are loaded, you are the only agent that synthesizes and submits. Deduplicate candidates across {lane_names}, discard weak or duplicate notes, verify every retained root cause is in `.pr_diff.txt`, add `lane:<name>` to `skills_used` for the lanes that contributed to each retained candidate, then call `submit_finding` for each candidate or `submit_no_findings` if all lanes found nothing actionable.",
+    )
+}
 
 /// Run a review of a GitHub PR using the goose agent.
 ///
@@ -657,6 +791,20 @@ pub async fn run_review(
 
     tracing::debug!("Developer extension loaded (in-process)");
 
+    let summon_ext = ExtensionConfig::Platform {
+        name: "summon".to_string(),
+        description: "Load knowledge and delegate tasks to subagents".to_string(),
+        display_name: Some("Summon".to_string()),
+        bundled: None,
+        available_tools: Vec::new(),
+    };
+    agent
+        .add_extension(summon_ext, &session.id)
+        .await
+        .context("Failed to load summon extension")?;
+
+    tracing::debug!("Summon extension loaded (in-process)");
+
     add_reporting_extension(&agent, &session.id)
         .await
         .context("Failed to load fiach-reporting extension")?;
@@ -727,6 +875,12 @@ pub async fn run_review(
     let review_target = params.persona.review_target();
     let candidate_kind = params.persona.candidate_kind();
     let methodology_hint = params.persona.methodology_hint();
+    let lane_prompt = review_lane_prompt(
+        &params.review_lanes,
+        &params.review_lane_prompts,
+        params.max_review_lanes,
+        &diff_base,
+    );
     let user_message_text = match &actual_skill {
         Some(skill_name) => format!(
             "Review PR #{pr_number} in {repo} for {review_target}. \
@@ -735,7 +889,7 @@ pub async fn run_review(
              Start by reading `.pr_diff.txt`, which contains the complete patch for this review scope. \
              Verify that any finding's root cause is in `.pr_diff.txt`. For large per-file inspection, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
              {methodology_hint}, \
-             and submit each candidate finding with `submit_finding`. If you find no {candidate_kind}, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}\n\n\
+             and submit each candidate finding with `submit_finding`. If you find no {candidate_kind}, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}{lane_prompt}\n\n\
              IMPORTANT: Use the `{skill_name}` skill to complete this review. Use the load tool to load it if you haven't already.",
             pr_number = params.pr_number,
             repo = params.repo,
@@ -745,6 +899,7 @@ pub async fn run_review(
             candidate_kind = candidate_kind,
             report_path = report_path,
             prev_review_context = prev_review_context,
+            lane_prompt = lane_prompt,
             skill_name = skill_name,
         ),
         None => format!(
@@ -754,7 +909,7 @@ pub async fn run_review(
              Start by reading `.pr_diff.txt`, which contains the complete patch for this review scope. \
              Verify that any finding's root cause is in `.pr_diff.txt`. For large per-file inspection, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>`, \
              {methodology_hint}, \
-             and submit each candidate finding with `submit_finding`. If you find no {candidate_kind}, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}",
+             and submit each candidate finding with `submit_finding`. If you find no {candidate_kind}, call `submit_no_findings`. Do not stop before using one of these reporting tools. The host will write the final Markdown report to {report_path}.{prev_review_context}{lane_prompt}",
             pr_number = params.pr_number,
             repo = params.repo,
             review_target = review_target,
@@ -763,6 +918,7 @@ pub async fn run_review(
             candidate_kind = candidate_kind,
             report_path = report_path,
             prev_review_context = prev_review_context,
+            lane_prompt = lane_prompt,
         ),
     };
 
@@ -2648,6 +2804,53 @@ Reviewed the PR and found no vulnerabilities.
             ),
             ("dedupe-p", "main-m")
         );
+    }
+
+    #[test]
+    fn review_lanes_are_normalized_and_deduplicated() {
+        let lanes = vec![
+            " Security ".to_string(),
+            "api compat".to_string(),
+            "security".to_string(),
+            "Tests/Regressions".to_string(),
+            "".to_string(),
+        ];
+
+        assert_eq!(
+            normalize_review_lanes(&lanes),
+            vec!["security", "api-compat", "tests-regressions"]
+        );
+    }
+
+    #[test]
+    fn review_lane_prompt_instructs_parent_to_submit_combined_result() {
+        let prompt = review_lane_prompt(
+            &["security".to_string(), "correctness".to_string()],
+            &HashMap::new(),
+            1,
+            "abc123",
+        );
+
+        assert!(prompt.contains("delegate"));
+        assert!(prompt.contains("async: true"));
+        assert!(prompt.contains("extensions` to `[\"developer\", \"summon\"]`"));
+        assert!(prompt.contains("BASE_BRANCH=abc123 ./safe_diff.sh"));
+        assert!(prompt.contains("you are the only agent that synthesizes and submits"));
+        assert!(prompt.contains("lane:<name>"));
+    }
+
+    #[test]
+    fn review_lane_prompt_uses_custom_prompts_by_normalized_lane_name() {
+        let mut prompts = HashMap::new();
+        prompts.insert(
+            "Cashu Mint".to_string(),
+            "Focus on quote idempotency and blinded signature accounting.".to_string(),
+        );
+
+        let prompt = review_lane_prompt(&["cashu-mint".to_string()], &prompts, 1, "abc123");
+
+        assert!(prompt.contains("Focus on quote idempotency and blinded signature accounting."));
+        assert!(!prompt.contains("the named focus area"));
     }
 
     #[test]

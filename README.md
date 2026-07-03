@@ -168,6 +168,44 @@ A custom persona file can contain these placeholders which are filled at runtime
 - `{report_path}` — The absolute path where Fiach writes the final rendered Markdown report.
 - `{skill_hint}` — Instructions for loading optional domain skills.
 
+### Review Lanes
+
+Review lanes are narrower focus prompts that run inside one persona review. Use them when you want one report and one verifier/disclosure pass, but want the finder to split its attention across several independent lenses.
+
+This differs from `personas`: multiple personas create separate review jobs, state keys, and reports; lanes feed back into the same parent finder, which submits one combined structured result.
+
+Example for a general PR review:
+
+```toml
+[daemon]
+persona = "builtin:pr-review"
+review_lanes = ["correctness", "concurrency", "api-compat", "tests"]
+max_review_lanes = 2
+```
+
+Example for a security review with a custom domain lane:
+
+```toml
+[daemon]
+persona = "builtin:security"
+review_lanes = ["input-boundaries", "cashu-mint", "state-atomicity"]
+max_review_lanes = 2
+
+[daemon.review_lane_prompts]
+cashu-mint = """
+Focus on Cashu mint correctness:
+- quote idempotency
+- blinded signature issuance
+- keyset transitions
+- accounting invariants
+Only report concrete PR-introduced issues.
+"""
+```
+
+Lane names and custom prompt keys are normalized before matching, so `Cashu Mint`, `cashu_mint`, and `cashu-mint` all refer to the same lane. If a lane has no custom prompt, Fiach uses a built-in focus prompt for known lanes such as `security`, `correctness`, `concurrency`, `api-compat`, `tests`, `performance`, and `observability`; unknown lanes get a generic focus prompt.
+
+The finder launches Goose delegate subagents for the lanes, collects their notes, deduplicates candidates, and then the parent finder is the only agent allowed to call `submit_finding` or `submit_no_findings`. The verifier, Markdown report, duplicate suppression, and PR comments remain unified.
+
 ### Structured Reporting and Verification
 
 Fiach uses structured reporting as the default review path for all personas. The finder agent does not directly post to GitHub and does not decide disclosure from Markdown frontmatter. Instead, it submits candidates through in-process reporting tools:
@@ -240,6 +278,18 @@ In your `flake.nix` or `configuration.nix`:
             # The persona to use (defaults to builtin:security if omitted)
             # Use builtin:pr-review for general non-security PR review.
             persona = "builtin:security";
+
+            # Optional focused lanes inside the persona. These feed one combined report.
+            reviewLanes = [ "input-boundaries" "cashu-mint" "state-atomicity" ];
+            maxReviewLanes = 2;
+            reviewLanePrompts.cashu-mint = ''
+              Focus on Cashu mint correctness:
+              - quote idempotency
+              - blinded signature issuance
+              - keyset transitions
+              - accounting invariants
+              Only report concrete PR-introduced issues.
+            '';
             
             # Model to use
             model = "openrouter/anthropic/claude-3-7-sonnet";
@@ -307,6 +357,9 @@ The following options are available under `services.fiach`:
 | `logFilter` | string | `"fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
 | `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |
+| `reviewLanes` | list of string | `[]` | Focused review lanes to run as Goose subagents inside each persona review before the parent finder submits one combined structured result. |
+| `reviewLanePrompts` | attrset of string | `{}` | Custom prompt text keyed by review lane name. Keys are normalized like `reviewLanes` before matching. |
+| `maxReviewLanes` | integer | `3` | Maximum number of review lane subagents to run concurrently inside each review. |
 | `withSkill` | string or null | `null` | Optional skill name to instruct the agent to use. |
 | `reportMode` | enum (`"local"`, `"pr-comment"`, `"sync-pr"`, `"hybrid"`) | `"local"` | Mode for reporting findings. `hybrid` comments on PR-introduced findings and syncs non-PR security findings. |
 | `syncRepo` | string or null | `null` | GitHub repository to sync reports to. Required if `reportMode` is `"sync-pr"`, and for non-PR security findings in `hybrid` mode. |
