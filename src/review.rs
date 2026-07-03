@@ -12,7 +12,7 @@ use goose::conversation::message::{Message, MessageContent};
 use goose::providers::canonical::maybe_get_canonical_model;
 use goose::providers::create_with_named_model;
 use goose::session::{Session, SessionType};
-use rmcp::model::{CallToolResult, Content, Role};
+use rmcp::model::{CallToolResult, Content, RawContent, Role};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -457,9 +457,328 @@ fn review_lane_prompt(
          Run focused Goose delegate subagents for these lanes before submitting the final structured result:\n\
          {lane_list}\n\n\
          Use the `delegate` tool for the lane work. Start up to {max_review_lanes} lane delegates concurrently with `async: true`, then use `load(source: task_id)` to collect each result. If there are more lanes than the concurrency limit, run them in batches until every lane has returned.\n\
-         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and give it read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate should inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context, and return concise JSON-like candidate notes for its lane only.\n\
+         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and begin its instructions with `Review lane: <lane>` so host logs can identify lane execution. Give delegates read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate should inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context, and return concise JSON-like candidate notes for its lane only.\n\
          After all lane results are loaded, you are the only agent that synthesizes and submits. Deduplicate candidates across {lane_names}, discard weak or duplicate notes, verify every retained root cause is in `.pr_diff.txt`, add `lane:<name>` to `skills_used` for the lanes that contributed to each retained candidate, then call `submit_finding` for each candidate or `submit_no_findings` if all lanes found nothing actionable.",
     )
+}
+
+fn arg_value<'a>(
+    args: Option<&'a rmcp::model::JsonObject>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    args.and_then(|args| args.get(key))
+}
+
+fn arg_str(args: Option<&rmcp::model::JsonObject>, key: &str) -> Option<String> {
+    arg_value(args, key)
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+fn arg_bool(args: Option<&rmcp::model::JsonObject>, key: &str) -> Option<bool> {
+    arg_value(args, key).and_then(|value| value.as_bool())
+}
+
+fn arg_u64(args: Option<&rmcp::model::JsonObject>, key: &str) -> Option<u64> {
+    arg_value(args, key).and_then(|value| value.as_u64())
+}
+
+fn summon_tool_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "delegate" | "subagent" => Some("delegate"),
+        "load" => Some("load"),
+        _ if name.ends_with("__delegate") || name.ends_with("__subagent") => Some("delegate"),
+        _ if name.ends_with("__load") => Some("load"),
+        _ => None,
+    }
+}
+
+fn infer_review_lane(
+    args: Option<&rmcp::model::JsonObject>,
+    review_lanes: &[String],
+) -> Option<String> {
+    let source = arg_str(args, "source");
+    if let Some(source) = source.as_deref()
+        && review_lanes.iter().any(|lane| lane == source)
+    {
+        return Some(source.to_string());
+    }
+
+    let instructions = arg_str(args, "instructions")?.to_ascii_lowercase();
+    review_lanes
+        .iter()
+        .find(|lane| instructions.contains(&lane.to_ascii_lowercase()))
+        .cloned()
+}
+
+#[derive(Debug, Clone)]
+struct PendingSummonCall {
+    source: Option<String>,
+    lane: Option<String>,
+    peek: bool,
+    cancel: bool,
+}
+
+#[derive(Default)]
+struct SummonLaneLogState {
+    delegate_calls: HashMap<String, PendingSummonCall>,
+    load_calls: HashMap<String, PendingSummonCall>,
+    task_lanes: HashMap<String, String>,
+}
+
+struct SummonLogContext<'a> {
+    repo: &'a str,
+    pr_number: u64,
+    review_kind: &'a str,
+    phase: &'a str,
+    session_id: &'a str,
+    review_lanes: &'a [String],
+}
+
+fn extract_subagent_task_id(result: &CallToolResult) -> Option<String> {
+    if let Some(task_id) = result
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.0.get("subagent_session_id"))
+        .and_then(|value| value.as_str())
+    {
+        return Some(task_id.to_string());
+    }
+
+    result.content.iter().find_map(|content| {
+        let RawContent::Text(text) = &content.raw else {
+            return None;
+        };
+        let text = text.text.trim();
+        let rest = text.strip_prefix("Task ")?;
+        let task_id = rest.split_whitespace().next()?;
+        (!task_id.is_empty()).then(|| task_id.to_string())
+    })
+}
+
+fn call_tool_result_failed(result: &CallToolResult) -> bool {
+    result.is_error.unwrap_or(false)
+}
+
+fn log_summon_tool_activity(
+    message: &Message,
+    state: &mut SummonLaneLogState,
+    context: SummonLogContext<'_>,
+) {
+    for content in &message.content {
+        let MessageContent::ToolRequest(request) = content else {
+            continue;
+        };
+        let Ok(tool_call) = &request.tool_call else {
+            tracing::warn!(
+                repo = %context.repo,
+                pr = context.pr_number,
+                review_kind = %context.review_kind,
+                phase = %context.phase,
+                session_id = %context.session_id,
+                tool_call_id = %request.id,
+                "Agent emitted invalid tool request"
+            );
+            continue;
+        };
+
+        log_summon_tool_request(state, &request.id, tool_call, &context);
+    }
+
+    for content in &message.content {
+        let MessageContent::ToolResponse(response) = content else {
+            continue;
+        };
+
+        if let Some(pending) = state.delegate_calls.remove(&response.id) {
+            match &response.tool_result {
+                Ok(result) if !call_tool_result_failed(result) => {
+                    let task_id = extract_subagent_task_id(result);
+                    if let (Some(task_id), Some(lane)) = (task_id.as_deref(), pending.lane.as_ref())
+                    {
+                        state
+                            .task_lanes
+                            .insert(task_id.to_string(), lane.to_string());
+                    }
+                    tracing::info!(
+                        repo = %context.repo,
+                        pr = context.pr_number,
+                        review_kind = %context.review_kind,
+                        phase = %context.phase,
+                        session_id = %context.session_id,
+                        tool_call_id = %response.id,
+                        lane = ?pending.lane,
+                        source = ?pending.source,
+                        task_id = ?task_id,
+                        "Summon delegate started"
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        repo = %context.repo,
+                        pr = context.pr_number,
+                        review_kind = %context.review_kind,
+                        phase = %context.phase,
+                        session_id = %context.session_id,
+                        tool_call_id = %response.id,
+                        lane = ?pending.lane,
+                        source = ?pending.source,
+                        "Summon delegate returned an error"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        repo = %context.repo,
+                        pr = context.pr_number,
+                        review_kind = %context.review_kind,
+                        phase = %context.phase,
+                        session_id = %context.session_id,
+                        tool_call_id = %response.id,
+                        lane = ?pending.lane,
+                        source = ?pending.source,
+                        error = %error,
+                        "Summon delegate failed"
+                    );
+                }
+            }
+            continue;
+        }
+
+        if let Some(pending) = state.load_calls.remove(&response.id) {
+            match &response.tool_result {
+                Ok(result) if !call_tool_result_failed(result) => {
+                    tracing::info!(
+                        repo = %context.repo,
+                        pr = context.pr_number,
+                        review_kind = %context.review_kind,
+                        phase = %context.phase,
+                        session_id = %context.session_id,
+                        tool_call_id = %response.id,
+                        lane = ?pending.lane,
+                        source = ?pending.source,
+                        peek = pending.peek,
+                        cancel = pending.cancel,
+                        "Summon load completed"
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        repo = %context.repo,
+                        pr = context.pr_number,
+                        review_kind = %context.review_kind,
+                        phase = %context.phase,
+                        session_id = %context.session_id,
+                        tool_call_id = %response.id,
+                        lane = ?pending.lane,
+                        source = ?pending.source,
+                        peek = pending.peek,
+                        cancel = pending.cancel,
+                        "Summon load returned an error"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        repo = %context.repo,
+                        pr = context.pr_number,
+                        review_kind = %context.review_kind,
+                        phase = %context.phase,
+                        session_id = %context.session_id,
+                        tool_call_id = %response.id,
+                        lane = ?pending.lane,
+                        source = ?pending.source,
+                        peek = pending.peek,
+                        cancel = pending.cancel,
+                        error = %error,
+                        "Summon load failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn log_summon_tool_request(
+    state: &mut SummonLaneLogState,
+    tool_call_id: &str,
+    tool_call: &rmcp::model::CallToolRequestParams,
+    context: &SummonLogContext<'_>,
+) {
+    let Some(kind) = summon_tool_kind(tool_call.name.as_ref()) else {
+        return;
+    };
+    let args = tool_call.arguments.as_ref();
+    match kind {
+        "delegate" => {
+            let lane = infer_review_lane(args, context.review_lanes);
+            let source = arg_str(args, "source");
+            let async_requested = arg_bool(args, "async").unwrap_or(false);
+            let max_turns = arg_u64(args, "max_turns");
+            let working_dir = arg_str(args, "working_dir");
+            let has_instructions = arg_str(args, "instructions").is_some();
+            state.delegate_calls.insert(
+                tool_call_id.to_string(),
+                PendingSummonCall {
+                    source: source.clone(),
+                    lane: lane.clone(),
+                    peek: false,
+                    cancel: false,
+                },
+            );
+            tracing::info!(
+                repo = %context.repo,
+                pr = context.pr_number,
+                review_kind = %context.review_kind,
+                phase = %context.phase,
+                session_id = %context.session_id,
+                tool_call_id = %tool_call_id,
+                tool = %tool_call.name,
+                lane = ?lane,
+                source = ?source,
+                async_requested = async_requested,
+                max_turns = ?max_turns,
+                working_dir = ?working_dir,
+                has_instructions = has_instructions,
+                "Summon delegate requested"
+            );
+        }
+        "load" => {
+            let source = arg_str(args, "source");
+            let peek = arg_bool(args, "peek").unwrap_or(false);
+            let cancel = arg_bool(args, "cancel").unwrap_or(false);
+            let lane = source.as_deref().and_then(|source| {
+                context
+                    .review_lanes
+                    .iter()
+                    .find(|lane| lane.as_str() == source)
+                    .cloned()
+                    .or_else(|| state.task_lanes.get(source).cloned())
+            });
+            state.load_calls.insert(
+                tool_call_id.to_string(),
+                PendingSummonCall {
+                    source: source.clone(),
+                    lane: lane.clone(),
+                    peek,
+                    cancel,
+                },
+            );
+            tracing::info!(
+                repo = %context.repo,
+                pr = context.pr_number,
+                review_kind = %context.review_kind,
+                phase = %context.phase,
+                session_id = %context.session_id,
+                tool_call_id = %tool_call_id,
+                tool = %tool_call.name,
+                lane = ?lane,
+                source = ?source,
+                peek = peek,
+                cancel = cancel,
+                "Summon load requested"
+            );
+        }
+        _ => {}
+    }
 }
 
 /// Run a review of a GitHub PR using the goose agent.
@@ -881,6 +1200,17 @@ pub async fn run_review(
         params.max_review_lanes,
         &diff_base,
     );
+    let normalized_review_lanes = normalize_review_lanes(&params.review_lanes);
+    if !normalized_review_lanes.is_empty() {
+        tracing::info!(
+            repo = %params.repo,
+            pr = params.pr_number,
+            review_kind = %params.review_kind,
+            review_lanes = ?normalized_review_lanes,
+            max_review_lanes = params.max_review_lanes,
+            "Review lanes requested"
+        );
+    }
     let user_message_text = match &actual_skill {
         Some(skill_name) => format!(
             "Review PR #{pr_number} in {repo} for {review_target}. \
@@ -952,6 +1282,7 @@ pub async fn run_review(
         let mut last_progress_log = Instant::now()
             .checked_sub(Duration::from_secs(30))
             .unwrap_or_else(Instant::now);
+        let mut summon_log_state = SummonLaneLogState::default();
 
         let mut stream = loop {
             let user_message_clone = user_message.clone();
@@ -996,6 +1327,18 @@ pub async fn run_review(
                 event_opt = stream.next() => {
                     match event_opt {
                         Some(Ok(AgentEvent::Message(message))) => {
+                            log_summon_tool_activity(
+                                &message,
+                                &mut summon_log_state,
+                                SummonLogContext {
+                                    repo: &params.repo,
+                                    pr_number: params.pr_number,
+                                    review_kind: &params.review_kind,
+                                    phase: "finder",
+                                    session_id: &session_config.id,
+                                    review_lanes: &normalized_review_lanes,
+                                },
+                            );
                             handle_reporting_tool_requests(
                                 &agent,
                                 &message,
@@ -2834,9 +3177,81 @@ Reviewed the PR and found no vulnerabilities.
         assert!(prompt.contains("delegate"));
         assert!(prompt.contains("async: true"));
         assert!(prompt.contains("extensions` to `[\"developer\", \"summon\"]`"));
+        assert!(prompt.contains("Review lane: <lane>"));
         assert!(prompt.contains("BASE_BRANCH=abc123 ./safe_diff.sh"));
         assert!(prompt.contains("you are the only agent that synthesizes and submits"));
         assert!(prompt.contains("lane:<name>"));
+    }
+
+    #[test]
+    fn infer_review_lane_matches_delegate_instructions() {
+        let mut args = rmcp::model::JsonObject::new();
+        args.insert(
+            "instructions".to_string(),
+            serde_json::Value::String(
+                "Review lane: public-wallet-api-ffi\nInspect the public wallet API.".to_string(),
+            ),
+        );
+
+        let lanes = vec!["public-wallet-api-ffi".to_string()];
+
+        assert_eq!(
+            infer_review_lane(Some(&args), &lanes),
+            Some("public-wallet-api-ffi".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_subagent_task_id_prefers_tool_result_metadata() {
+        let mut meta = rmcp::model::Meta::new();
+        meta.0.insert(
+            "subagent_session_id".to_string(),
+            serde_json::Value::String("20260703_2".to_string()),
+        );
+        let result = CallToolResult::success(Vec::new()).with_meta(Some(meta));
+
+        assert_eq!(
+            extract_subagent_task_id(&result),
+            Some("20260703_2".to_string())
+        );
+    }
+
+    #[test]
+    fn load_request_uses_task_lane_correlation() {
+        let mut state = SummonLaneLogState::default();
+        state.task_lanes.insert(
+            "20260703_2".to_string(),
+            "public-wallet-api-ffi".to_string(),
+        );
+        let mut args = rmcp::model::JsonObject::new();
+        args.insert(
+            "source".to_string(),
+            serde_json::Value::String("20260703_2".to_string()),
+        );
+        let tool_call = rmcp::model::CallToolRequestParams::new("load").with_arguments(args);
+        let lanes = vec!["public-wallet-api-ffi".to_string()];
+
+        log_summon_tool_request(
+            &mut state,
+            "toolu_load",
+            &tool_call,
+            &SummonLogContext {
+                repo: "cashubtc/cdk",
+                pr_number: 2185,
+                review_kind: "default",
+                phase: "finder",
+                session_id: "20260703_1",
+                review_lanes: &lanes,
+            },
+        );
+
+        assert_eq!(
+            state
+                .load_calls
+                .get("toolu_load")
+                .and_then(|call| call.lane.as_deref()),
+            Some("public-wallet-api-ffi")
+        );
     }
 
     #[test]
