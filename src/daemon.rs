@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::disclose::DiscloseConfig;
 use crate::execution::{ReviewExecutor, ReviewOutcome};
 use crate::finalizer::{FinalizationSpec, ReviewFinalizer};
+use crate::github::{DiscoveryRequest, GhCli, GitHub, PullRequestSummary};
 use crate::review::{CompletedReview, ReviewExecution, ReviewParams};
 use crate::scheduler::{
     ExecutionStatus, ReviewRequest, ReviewTarget, SchedulerHandle, SubmitError,
@@ -27,7 +28,6 @@ const VETH_SUBNET_MIN_INDEX: u8 = 1;
 const VETH_SUBNET_MAX_INDEX: u8 = 254;
 const VETH_DNS_PRIMARY: &str = "1.1.1.1";
 const VETH_DNS_SECONDARY: &str = "9.9.9.9";
-const PR_LIST_JSON_FIELDS: &str = "number,headRefOid,headRefName,title";
 
 static ACTIVE_VETH_SUBNETS: OnceLock<Mutex<HashSet<u8>>> = OnceLock::new();
 
@@ -87,17 +87,7 @@ pub struct DaemonParams {
     pub sandbox_extra_args: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct PullRequest {
-    number: u64,
-    #[serde(rename = "headRefOid")]
-    head_ref_oid: String,
-    #[serde(rename = "headRefName")]
-    head_ref_name: String,
-    #[serde(default, rename = "authorAssociation")]
-    author_association: String,
-    title: String,
-}
+type PullRequest = PullRequestSummary;
 
 #[derive(Clone)]
 pub struct ReviewJob {
@@ -711,6 +701,7 @@ pub async fn run_daemon(
     }
 
     let sleep_duration = Duration::from_secs(params.interval);
+    let github = GhCli::default();
 
     loop {
         if cancel_token.is_cancelled() {
@@ -741,35 +732,16 @@ pub async fn run_daemon(
                 );
 
                 let list_state = pr_list_state_arg(state);
-                let mut command = Command::new("gh");
-                command.args(["pr", "list", "--repo", repo, "--state", &list_state]);
-                if !search_query.is_empty() {
-                    command.args(["--search", &search_query]);
-                }
-                command.args([
-                    "--limit",
-                    &params.pr_limit.to_string(),
-                    "--json",
-                    PR_LIST_JSON_FIELDS,
-                ]);
-
-                let output = command.output().await;
-
-                match output {
-                    Ok(out) if out.status.success() => {
-                        let mut prs: Vec<PullRequest> = match serde_json::from_slice(&out.stdout) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to parse gh output for {} (state {}): {}",
-                                    repo,
-                                    state,
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-
+                match github
+                    .discover(DiscoveryRequest {
+                        repository: repo,
+                        state: &list_state,
+                        search: &search_query,
+                        limit: params.pr_limit,
+                    })
+                    .await
+                {
+                    Ok(mut prs) => {
                         if let Err(e) = populate_author_associations(repo, &mut prs).await {
                             tracing::error!(
                                 repo = %repo,
@@ -816,17 +788,8 @@ pub async fn run_daemon(
                             }
                         }
                     }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        tracing::error!(
-                            "gh cli failed for repo {} (state {}): {}",
-                            repo,
-                            state,
-                            stderr
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to execute gh cli: {}", e);
+                    Err(error) => {
+                        tracing::error!(repo = %repo, state = %state, error = %error, "Failed to discover PRs");
                     }
                 }
             }
@@ -1915,15 +1878,6 @@ mod tests {
         assert!(query.contains("repository(owner: $owner, name: $name)"));
         assert!(query.contains("pr1: pullRequest(number: 1) { authorAssociation }"));
         assert!(query.contains("pr42: pullRequest(number: 42) { authorAssociation }"));
-    }
-
-    #[test]
-    fn pr_list_json_fields_do_not_request_author_association() {
-        assert!(
-            !PR_LIST_JSON_FIELDS
-                .split(',')
-                .any(|field| field == "authorAssociation")
-        );
     }
 
     #[test]
