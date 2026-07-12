@@ -671,6 +671,7 @@ async fn main() -> Result<()> {
             port,
         } => {
             let daemon_cfg = config.daemon.unwrap_or_default();
+            let _ = fiach::config::RuntimeConfig::resolve_daemon(&daemon_cfg)?;
 
             let repos_str = repos
                 .or_else(|| daemon_cfg.repos.map(|r| r.join(",")))

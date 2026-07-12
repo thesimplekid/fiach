@@ -134,6 +134,20 @@ Set `FIACH_SERVER_TOKEN` to require `Authorization: Bearer <token>` or `X-Fiach-
        -d '{"owner":"my-org", "repo":"repo", "pr":42}' \
        http://localhost:3000/review
   ```
+  The accepted response is process-local job metadata:
+  ```json
+  {"job_id":"<opaque-id>","status":"queued"}
+  ```
+  Manual and polled reviews share one FIFO scheduler. Its queue capacity is
+  `max(2 × max_workers, 16)`; manual work does not preempt a running review.
+- **Inspect a queued or running job:**
+  ```bash
+  curl http://localhost:3000/jobs/<job_id>
+  ```
+  Jobs report `queued`, `running`, `completed`, `failed`, `skipped`, or
+  `cancelled`, along with their target and timestamps. The newest 1,000
+  terminal jobs are retained in memory. Job IDs and statuses do not survive a
+  daemon restart; an unknown or evicted ID returns `404`.
 - **Get JSON metadata for a specific review:**
   ```bash
   curl "http://localhost:3000/review?owner=my-org&repo=repo&pr=42"
@@ -142,6 +156,17 @@ Set `FIACH_SERVER_TOKEN` to require `Authorization: Bearer <token>` or `X-Fiach-
   ```bash
   curl "http://localhost:3000/review/content?owner=my-org&repo=repo&pr=42"
   ```
+  Report content is loaded from the authoritative absolute artifact path stored
+  with the review record, including reports produced by sandbox workers.
+
+### State database migration
+
+The redb schema is versioned and migrated automatically when the daemon opens
+the database. Before a legacy database is migrated, Fiach writes a sibling
+`<database>.v1.backup` file. Legacy flat reports and sandbox run artifacts are
+recorded when they can be found; missing files leave the corresponding artifact
+path empty. Migration uses one database transaction, so a failed migration does
+not replace the original records.
 
 ---
 
@@ -438,10 +463,14 @@ This lets NixOS/systemd deployments keep using bundled skills such as `rust-secu
 
 ## 🏗 Project Layout
 
-- `src/main.rs`: CLI argument parsing and orchestration.
-- `src/daemon.rs`: Polling loop, PR discovery via GitHub CLI (`updated:>=`), and deduplication.
-- `src/review.rs`: Sets up the Goose agent, injects the persona, and streams LLM output.
+- `src/main.rs`: Clap input parsing and runtime service wiring.
+- `src/scheduler.rs`: Bounded FIFO scheduling and process-local job lifecycle.
+- `src/execution.rs`: Common local/sandbox executor outcome contract.
+- `src/finalizer.rs`: Host-only rendering, disclosure, reactions, and persistence.
+- `src/github.rs`: Object-safe GitHub boundary and the production `gh` adapter.
+- `src/daemon.rs`: Polling and sandbox/nspawn orchestration.
+- `src/review.rs`: Finder, verifier, and duplicate-adjudication agent passes.
 - `src/server.rs`: Axum-based interactive web server for daemon management and reporting.
 - `src/workspace.rs`: Manages cloning the repo and checking out the PR into a temporary directory.
 - `src/disclose.rs`: Handles the `ReportMode` logic (commenting or creating Sync PRs).
-- `src/state.rs`: Manages the `redb` database for tracking reviewed commit hashes.
+- `src/state.rs`: Typed, versioned, async redb state adapter.

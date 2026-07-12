@@ -1,6 +1,8 @@
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+use anyhow::Result;
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct FiachConfig {
@@ -35,7 +37,7 @@ impl MultiString {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct DaemonConfig {
     pub repos: Option<Vec<String>>,
     pub port: Option<u16>,
@@ -85,7 +87,7 @@ pub struct DaemonConfig {
     pub sandbox_extra_args: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct ReviewConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -117,6 +119,152 @@ pub struct ReviewConfig {
     pub max_cost_usd: Option<f64>,
     pub input_price_per_m: Option<f64>,
     pub output_price_per_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentConfig {
+    pub provider: String,
+    pub model: String,
+    pub verifier_provider: Option<String>,
+    pub verifier_model: Option<String>,
+    pub max_turns: u32,
+    pub timeout_mins: u64,
+    pub verify_findings: bool,
+    pub max_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub initial_delay_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosureConfig {
+    pub mode: String,
+    pub sync_repo: Option<String>,
+    pub notify_on_empty: bool,
+    pub review_start_reaction: Option<String>,
+    pub no_findings_reaction: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerConfig {
+    pub max_workers: usize,
+    pub queue_capacity: usize,
+    pub terminal_job_limit: usize,
+}
+
+impl SchedulerConfig {
+    pub fn new(max_workers: usize) -> Self {
+        Self {
+            max_workers,
+            queue_capacity: max_workers.saturating_mul(2).max(16),
+            terminal_job_limit: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxConfig {
+    pub rootfs: Option<PathBuf>,
+    pub network: String,
+    pub extra_args: Vec<String>,
+}
+
+impl SandboxConfig {
+    pub fn new(
+        rootfs: Option<PathBuf>,
+        network: Option<String>,
+        extra_args: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let network = network.unwrap_or_else(|| "host".to_string());
+        if !matches!(network.as_str(), "host" | "bridge" | "private" | "veth") {
+            anyhow::bail!("sandbox network must be host, bridge, private, or veth");
+        }
+        Ok(Self {
+            rootfs,
+            network,
+            extra_args: extra_args.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageConfig {
+    pub database: PathBuf,
+    pub reports: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeConfig {
+    pub agent: AgentConfig,
+    pub retry: RetryPolicy,
+    pub disclosure: DisclosureConfig,
+    pub scheduler: SchedulerConfig,
+    pub sandbox: SandboxConfig,
+    pub storage: StorageConfig,
+}
+
+impl RuntimeConfig {
+    pub fn resolve_daemon(raw: &DaemonConfig) -> Result<Self> {
+        let max_workers = raw.max_workers.unwrap_or(1);
+        let sandbox = SandboxConfig::new(
+            raw.sandbox_rootfs.clone(),
+            raw.sandbox_network.clone(),
+            raw.sandbox_extra_args.clone(),
+        )?;
+        if sandbox.rootfs.is_some()
+            && sandbox.network == "veth"
+            && (max_workers == 0 || max_workers > 254)
+        {
+            anyhow::bail!("veth sandboxing requires max_workers between 1 and 254");
+        }
+        Ok(Self {
+            agent: AgentConfig {
+                provider: raw
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "openrouter".to_string()),
+                model: raw
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "google/gemini-3.1-pro-preview".to_string()),
+                verifier_provider: raw.verifier_provider.clone(),
+                verifier_model: raw.verifier_model.clone(),
+                max_turns: raw.max_turns.unwrap_or(60),
+                timeout_mins: raw.timeout_mins.unwrap_or(30),
+                verify_findings: raw.verify_findings.unwrap_or(true),
+                max_cost_usd: raw.max_cost_usd,
+            },
+            retry: RetryPolicy {
+                max_retries: raw.max_retries.unwrap_or(3),
+                initial_delay_secs: raw.retry_delay_secs.unwrap_or(10),
+            },
+            disclosure: DisclosureConfig {
+                mode: raw
+                    .report_mode
+                    .clone()
+                    .unwrap_or_else(|| "local".to_string()),
+                sync_repo: raw.sync_repo.clone(),
+                notify_on_empty: raw.notify_on_empty.unwrap_or(false),
+                review_start_reaction: raw.review_start_reaction.clone(),
+                no_findings_reaction: raw.no_findings_reaction.clone(),
+            },
+            scheduler: SchedulerConfig::new(max_workers),
+            sandbox,
+            storage: StorageConfig {
+                database: raw
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("fiach.redb")),
+                reports: raw
+                    .out_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("reports")),
+            },
+        })
+    }
 }
 
 impl FiachConfig {
@@ -172,5 +320,26 @@ cashu-mint = "Focus on mint quote idempotency."
                 .map(String::as_str),
             Some("Focus on mint quote idempotency.")
         );
+    }
+
+    #[test]
+    fn runtime_groups_apply_defaults_once() {
+        let runtime = RuntimeConfig::resolve_daemon(&DaemonConfig::default()).unwrap();
+        assert_eq!(runtime.agent.provider, "openrouter");
+        assert_eq!(runtime.retry.max_retries, 3);
+        assert_eq!(runtime.scheduler.queue_capacity, 16);
+        assert_eq!(runtime.storage.database, PathBuf::from("fiach.redb"));
+        assert_eq!(runtime.sandbox.network, "host");
+    }
+
+    #[test]
+    fn runtime_groups_reject_invalid_veth_worker_limit() {
+        let raw = DaemonConfig {
+            max_workers: Some(0),
+            sandbox_rootfs: Some(PathBuf::from("/sandbox")),
+            sandbox_network: Some("veth".to_string()),
+            ..DaemonConfig::default()
+        };
+        assert!(RuntimeConfig::resolve_daemon(&raw).is_err());
     }
 }
