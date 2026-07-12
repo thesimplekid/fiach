@@ -819,7 +819,6 @@ async fn main() -> Result<()> {
             };
 
             let port = port.or(daemon_cfg.port).unwrap_or(3000);
-            let (tx, rx) = tokio::sync::mpsc::channel(100);
             let reports_dir = params
                 .out_dir
                 .clone()
@@ -828,9 +827,14 @@ async fn main() -> Result<()> {
                 params.db_path.clone(),
                 Some(&reports_dir),
             )?);
+            let params = std::sync::Arc::new(params);
+            let scheduler = daemon::start_review_scheduler(
+                std::sync::Arc::clone(&params),
+                cancel_token.clone(),
+            );
             let app_state = server::AppState {
                 state_store,
-                daemon_tx: tx,
+                scheduler: scheduler.clone(),
                 server_token: std::env::var("FIACH_SERVER_TOKEN")
                     .ok()
                     .filter(|token| !token.trim().is_empty()),
@@ -842,7 +846,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            daemon::run_daemon(params, rx, cancel_token).await
+            daemon::run_daemon(params, scheduler, cancel_token).await
         }
         Commands::History {
             db_path,

@@ -3,19 +3,22 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use futures::{StreamExt, stream};
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description};
 use tokio::process::Command;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::disclose::DiscloseConfig;
 use crate::review::{CompletedReview, ReviewExecution, ReviewParams, run_review};
+use crate::scheduler::{
+    ExecutionStatus, ReviewRequest, ReviewTarget, SchedulerHandle, SubmitError,
+};
 
 const VETH_SUBNET_BASE_OCTETS: (u8, u8) = (10, 64);
 const VETH_SUBNET_MIN_INDEX: u8 = 1;
@@ -26,11 +29,17 @@ const PR_LIST_JSON_FIELDS: &str = "number,headRefOid,headRefName,title";
 
 static ACTIVE_VETH_SUBNETS: OnceLock<Mutex<HashSet<u8>>> = OnceLock::new();
 
-pub enum DaemonMessage {
-    TriggerReview {
+#[derive(Clone)]
+pub enum DaemonWork {
+    Manual {
         repo: String,
         pr_number: u64,
         persona: Option<String>,
+    },
+    Poll {
+        repo: String,
+        job: ReviewJob,
+        honor_mention_trigger: bool,
     },
 }
 
@@ -89,10 +98,81 @@ struct PullRequest {
 }
 
 #[derive(Clone)]
-struct ReviewJob {
+pub struct ReviewJob {
     pr: PullRequest,
     persona: crate::persona::PersonaSource,
     review_kind: String,
+}
+
+pub fn manual_request(
+    repo: String,
+    pr_number: u64,
+    persona: Option<String>,
+) -> ReviewRequest<DaemonWork> {
+    let review_kind = persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(
+            |value| match crate::persona::PersonaSource::from_str(value) {
+                Ok(source) => source.review_kind(),
+                Err(never) => match never {},
+            },
+        )
+        .unwrap_or_else(|| crate::state::DEFAULT_REVIEW_KIND.to_string());
+    ReviewRequest {
+        target: ReviewTarget {
+            repository: repo.clone(),
+            pr_number,
+            commit_hash: "pending".to_string(),
+            review_kind,
+        },
+        payload: DaemonWork::Manual {
+            repo,
+            pr_number,
+            persona,
+        },
+    }
+}
+
+pub fn start_review_scheduler(
+    params: std::sync::Arc<DaemonParams>,
+    cancel_token: CancellationToken,
+) -> SchedulerHandle<DaemonWork> {
+    let workers = params.max_workers;
+    let handler = std::sync::Arc::new(
+        move |work: DaemonWork,
+              cancel: CancellationToken|
+              -> BoxFuture<'static, Result<ExecutionStatus>> {
+            let params = std::sync::Arc::clone(&params);
+            Box::pin(async move {
+                let status = match work {
+                    DaemonWork::Manual {
+                        repo,
+                        pr_number,
+                        persona,
+                    } => {
+                        trigger_manual_review(&params, repo, pr_number, persona, cancel).await?;
+                        PrProcessStatus::Reviewed
+                    }
+                    DaemonWork::Poll {
+                        repo,
+                        job,
+                        honor_mention_trigger,
+                    } => {
+                        process_daemon_job(&params, &repo, &job, cancel, honor_mention_trigger)
+                            .await?
+                    }
+                };
+                Ok(match status {
+                    PrProcessStatus::Reviewed => ExecutionStatus::Completed,
+                    PrProcessStatus::Skipped => ExecutionStatus::Skipped,
+                    PrProcessStatus::Failed => anyhow::bail!("review execution failed"),
+                })
+            })
+        },
+    );
+    crate::scheduler::start(workers, cancel_token, handler)
 }
 
 fn is_allowed_author_association(association: &str, allowed: &[String]) -> bool {
@@ -196,16 +276,6 @@ async fn populate_author_associations(repo: &str, prs: &mut [PullRequest]) -> Re
     }
 
     Ok(())
-}
-
-fn worker_concurrency(max_workers: usize, job_count: usize) -> usize {
-    if job_count == 0 {
-        1
-    } else if max_workers == 0 {
-        job_count
-    } else {
-        max_workers.min(job_count)
-    }
 }
 
 fn is_veth_network(params: &DaemonParams) -> bool {
@@ -591,8 +661,8 @@ enum PrProcessStatus {
 }
 
 pub async fn run_daemon(
-    params: DaemonParams,
-    mut rx: mpsc::Receiver<DaemonMessage>,
+    params: std::sync::Arc<DaemonParams>,
+    scheduler: SchedulerHandle<DaemonWork>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let repo_list: Vec<String> = params
@@ -690,50 +760,39 @@ pub async fn run_daemon(
 
                         tracing::info!("Found {} recent {} PRs for {}", prs.len(), state, repo);
 
-                        let mut reviewed = 0;
-                        let mut skipped = 0;
-                        let mut failed = 0;
-
                         let jobs = review_jobs(&params.personas, &prs, params.personas.len() > 1);
-                        let concurrency = worker_concurrency(params.max_workers, jobs.len());
                         tracing::info!(
                             repo = %repo,
                             state = %state,
                             max_workers = params.max_workers,
-                            concurrency = concurrency,
                             personas = params.personas.len(),
-                            "Processing review jobs with worker limit"
+                            "Submitting discovered review jobs"
                         );
-
-                        let mut outcomes = stream::iter(jobs.iter())
-                            .map(|job| {
-                                process_daemon_job(&params, repo, job, cancel_token.clone(), true)
-                            })
-                            .buffer_unordered(concurrency);
-
-                        while let Some(outcome) = outcomes.next().await {
-                            match outcome? {
-                                PrProcessStatus::Reviewed => reviewed += 1,
-                                PrProcessStatus::Skipped => skipped += 1,
-                                PrProcessStatus::Failed => failed += 1,
-                            }
-
-                            if cancel_token.is_cancelled() {
+                        for job in jobs {
+                            let request = ReviewRequest {
+                                target: ReviewTarget {
+                                    repository: repo.clone(),
+                                    pr_number: job.pr.number,
+                                    commit_hash: job.pr.head_ref_oid.clone(),
+                                    review_kind: job.review_kind.clone(),
+                                },
+                                payload: DaemonWork::Poll {
+                                    repo: repo.clone(),
+                                    job,
+                                    honor_mention_trigger: true,
+                                },
+                            };
+                            if let Err(error) = scheduler.submit(request).await {
+                                match error {
+                                    SubmitError::Full => tracing::warn!(
+                                        repo = %repo,
+                                        "Review queue is full; remaining discoveries will be retried next poll"
+                                    ),
+                                    SubmitError::Closed => return Ok(()),
+                                }
                                 break;
                             }
                         }
-
-                        tracing::info!(
-                            repo = %repo,
-                            state = %state,
-                            total = jobs.len(),
-                            reviewed = reviewed,
-                            skipped = skipped,
-                            failed = failed,
-                            "Finished {} review job processing for {}",
-                            state,
-                            repo
-                        );
                     }
                     Ok(out) => {
                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -761,22 +820,6 @@ pub async fn run_daemon(
         );
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
-            Some(msg) = rx.recv() => {
-                match msg {
-                    DaemonMessage::TriggerReview {
-                        repo,
-                        pr_number,
-                        persona,
-                    } => {
-                        tracing::info!("Received trigger to review {}/{}", repo, pr_number);
-                        if let Err(e) =
-                            trigger_manual_review(&params, repo, pr_number, persona, cancel_token.clone()).await
-                        {
-                            tracing::error!("Failed to manually trigger review: {}", e);
-                        }
-                    }
-                }
-            }
             _ = cancel_token.cancelled() => {
                 tracing::info!("Sleep interrupted, shutting down");
             }
@@ -1242,14 +1285,9 @@ async fn trigger_manual_review(
         params.personas.len() > 1,
     );
 
-    let concurrency = worker_concurrency(params.max_workers, jobs.len());
     // Manual triggers are deliberate, so they bypass the mention gate.
-    let mut outcomes = stream::iter(jobs.iter())
-        .map(|job| process_daemon_job(params, &repo, job, cancel_token.clone(), false))
-        .buffer_unordered(concurrency);
-
-    while let Some(outcome) = outcomes.next().await {
-        outcome?;
+    for job in jobs {
+        process_daemon_job(params, &repo, &job, cancel_token.clone(), false).await?;
     }
 
     Ok(())
@@ -1998,15 +2036,6 @@ mod tests {
                 .split(',')
                 .any(|field| field == "authorAssociation")
         );
-    }
-
-    #[test]
-    fn worker_concurrency_caps_jobs_and_allows_unlimited() {
-        assert_eq!(worker_concurrency(1, 10), 1);
-        assert_eq!(worker_concurrency(3, 10), 3);
-        assert_eq!(worker_concurrency(20, 10), 10);
-        assert_eq!(worker_concurrency(0, 10), 10);
-        assert_eq!(worker_concurrency(0, 0), 1);
     }
 
     #[test]

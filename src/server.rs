@@ -5,20 +5,19 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
-use serde::Deserialize;
-use tokio::sync::mpsc;
+use serde::{Deserialize, Serialize};
 
 use crate::state::RedbStateStore;
 
 #[derive(Clone)]
 pub struct AppState {
     pub state_store: Arc<RedbStateStore>,
-    pub daemon_tx: mpsc::Sender<crate::daemon::DaemonMessage>,
+    pub scheduler: crate::scheduler::SchedulerHandle<crate::daemon::DaemonWork>,
     pub server_token: Option<String>,
 }
 
@@ -83,6 +82,7 @@ pub async fn start_server(port: u16, state: AppState) -> Result<()> {
         .route("/reviews", get(get_reviews))
         .route("/review", get(get_review).post(trigger_review))
         .route("/review/content", get(get_review_content))
+        .route("/jobs/{job_id}", get(get_job))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
@@ -205,29 +205,55 @@ async fn trigger_review(
     }
 
     let repo_full = format!("{}/{}", payload.owner, payload.repo);
-    let msg = crate::daemon::DaemonMessage::TriggerReview {
-        repo: repo_full.clone(),
-        pr_number: payload.pr,
-        persona: payload.persona.clone(),
-    };
+    let request =
+        crate::daemon::manual_request(repo_full.clone(), payload.pr, payload.persona.clone());
 
-    match state.daemon_tx.send(msg).await {
-        Ok(_) => {
+    match state.scheduler.submit(request).await {
+        Ok(job) => {
             tracing::info!("Triggered review for {}/{}", repo_full, payload.pr);
             (
                 StatusCode::ACCEPTED,
-                format!("Review triggered for {}/{}", repo_full, payload.pr),
+                Json(AcceptedJob {
+                    job_id: job.job_id,
+                    status: job.status,
+                }),
             )
                 .into_response()
         }
-        Err(_) => {
-            tracing::error!("Failed to send TriggerReview message to daemon");
+        Err(crate::scheduler::SubmitError::Full) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Review queue is full".to_string(),
+        )
+            .into_response(),
+        Err(crate::scheduler::SubmitError::Closed) => {
+            tracing::error!("Review scheduler is not reachable");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Daemon is not reachable".to_string(),
+                "Review scheduler is not reachable".to_string(),
             )
                 .into_response()
         }
+    }
+}
+
+#[derive(Serialize)]
+struct AcceptedJob {
+    job_id: String,
+    status: crate::scheduler::JobStatus,
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    if !request_authorized(&headers, state.server_token.as_deref()) {
+        return unauthorized_response();
+    }
+
+    match state.scheduler.get(&job_id).await {
+        Some(job) => (StatusCode::OK, Json(job)).into_response(),
+        None => (StatusCode::NOT_FOUND, "Job not found").into_response(),
     }
 }
 
