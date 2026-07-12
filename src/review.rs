@@ -1950,35 +1950,6 @@ pub async fn run_review(
         reporting::validate_artifact(&mut artifact)?;
         *reporting_artifact.lock().await = artifact.clone();
 
-        if let Some(dedupe_result) = apply_duplicate_suppression(DuplicateSuppressionParams {
-            artifact: &mut artifact,
-            workspace_path: &workspace.path,
-            repo: &params.repo,
-            pr_number: params.pr_number,
-            pr_context: &workspace.pr_context,
-            policy: &policy,
-            provider: &params.provider,
-            model: &params.model,
-            verifier_provider: params.verifier_provider.as_deref(),
-            verifier_model: params.verifier_model.as_deref(),
-            dedupe_existing_comments: params.dedupe_existing_comments,
-            dedupe_provider: params.dedupe_provider.as_deref(),
-            dedupe_model: params.dedupe_model.as_deref(),
-            max_retries: params.max_retries,
-            retry_delay_secs: params.retry_delay_secs,
-            timeout_mins: params.timeout_mins,
-            max_turns: params.max_turns,
-            cancel_token: cancel_token.clone(),
-        })
-        .await?
-        {
-            peak_input_tokens = peak_input_tokens.max(dedupe_result.peak_input_tokens);
-            total_output_tokens += dedupe_result.output_tokens;
-            total_processed_tokens += dedupe_result.total_tokens;
-            add_known_cost(&mut cost_usd, dedupe_result.cost_usd);
-            *reporting_artifact.lock().await = artifact.clone();
-        }
-
         let report_content =
             reporting::render_markdown(&params.repo, params.pr_number, &artifact, Some(&policy));
         fs::write(report_file, report_content).context("Failed to write rendered report")?;

@@ -1,6 +1,8 @@
 pub mod config;
 pub mod daemon;
 pub mod disclose;
+pub mod execution;
+pub mod finalizer;
 pub mod persona;
 pub mod reporting;
 pub mod review;

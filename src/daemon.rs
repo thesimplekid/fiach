@@ -15,7 +15,9 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::disclose::DiscloseConfig;
-use crate::review::{CompletedReview, ReviewExecution, ReviewParams, run_review};
+use crate::execution::{ReviewExecutor, ReviewOutcome};
+use crate::finalizer::{FinalizationSpec, ReviewFinalizer};
+use crate::review::{CompletedReview, ReviewExecution, ReviewParams};
 use crate::scheduler::{
     ExecutionStatus, ReviewRequest, ReviewTarget, SchedulerHandle, SubmitError,
 };
@@ -173,6 +175,26 @@ pub fn start_review_scheduler(
         },
     );
     crate::scheduler::start(workers, cancel_token, handler)
+}
+
+struct SandboxReviewExecutor<'a> {
+    daemon: &'a DaemonParams,
+}
+
+impl ReviewExecutor for SandboxReviewExecutor<'_> {
+    fn execute(
+        &self,
+        spec: crate::execution::ReviewSpec,
+        cancel: CancellationToken,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<ReviewOutcome>>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            run_sandboxed_review(self.daemon, &spec.params, cancel)
+                .await
+                .map(Some)
+        })
+    }
 }
 
 fn is_allowed_author_association(association: &str, allowed: &[String]) -> bool {
@@ -1139,20 +1161,48 @@ async fn process_daemon_job(
                     .and_then(|mention| mention.subject_node_id.clone()),
                 execution: ReviewExecution {
                     skip_state_check: true,
-                    persist_side_effects: true,
+                    persist_side_effects: false,
                     result_json: None,
                 },
             };
+            let finalization = FinalizationSpec::from(&review_params);
 
-            let review_result = if params.sandbox_rootfs.is_some() {
-                run_sandboxed_review(params, &review_params, cancel_token.clone()).await
-            } else {
-                run_review(review_params, cancel_token.clone())
+            if let Some(reaction) = review_params
+                .disclose_config
+                .reactions
+                .review_start
+                .as_deref()
+                && let Err(error) = crate::disclose::post_pr_reaction(
+                    &review_params.repo,
+                    review_params.pr_number,
+                    reaction,
+                )
+                .await
+            {
+                tracing::warn!(error = %error, "Failed to post review-start reaction");
+            }
+
+            let execution_result = if params.sandbox_rootfs.is_some() {
+                SandboxReviewExecutor { daemon: params }
+                    .execute(
+                        crate::execution::ReviewSpec {
+                            params: review_params,
+                        },
+                        cancel_token.clone(),
+                    )
                     .await
-                    .map(|_| ())
+            } else {
+                crate::execution::LocalReviewExecutor
+                    .execute(
+                        crate::execution::ReviewSpec {
+                            params: review_params,
+                        },
+                        cancel_token.clone(),
+                    )
+                    .await
             };
 
-            if let Err(e) = review_result {
+            let outcome = if let Err(e) = execution_result {
                 let meta = crate::state::ReviewMetadata {
                     repository: repo.to_string(),
                     pr_number: pr.number,
@@ -1193,6 +1243,29 @@ async fn process_daemon_job(
                     tracing::error!("Fatal error encountered, stopping daemon");
                     return Err(e);
                 }
+                return Ok(PrProcessStatus::Failed);
+            } else {
+                execution_result?
+            };
+
+            let Some(outcome) = outcome else {
+                return Ok(PrProcessStatus::Skipped);
+            };
+            let mut failed_finalization = outcome.completed.metadata.clone();
+            if let Err(error) = ReviewFinalizer
+                .finalize(&finalization, outcome, cancel_token.clone())
+                .await
+            {
+                failed_finalization.status = crate::state::ReviewStatus::Failed;
+                failed_finalization.failure_stage = Some("finalization".to_string());
+                failed_finalization.retry_count = retry_count_for_attempt;
+                let _ = crate::state::mark_reviewed(
+                    &params.db_path,
+                    repo,
+                    pr.number,
+                    &failed_finalization,
+                );
+                tracing::error!(repo = %repo, pr = pr.number, error = %error, "Review finalization failed");
                 return Ok(PrProcessStatus::Failed);
             }
 
@@ -1344,7 +1417,7 @@ async fn run_sandboxed_review(
     params: &DaemonParams,
     review_params: &ReviewParams,
     cancel_token: CancellationToken,
-) -> Result<()> {
+) -> Result<ReviewOutcome> {
     let rootfs = params.sandbox_rootfs.as_ref().unwrap();
 
     if !rootfs.exists() || !rootfs.is_dir() {
@@ -1603,26 +1676,6 @@ async fn run_sandboxed_review(
         "Launching sandboxed review"
     );
 
-    if let Some(reaction) = review_params
-        .disclose_config
-        .reactions
-        .review_start
-        .as_deref()
-        && let Err(error) = crate::disclose::post_pr_reaction(
-            &review_params.repo,
-            review_params.pr_number,
-            reaction,
-        )
-        .await
-    {
-        tracing::warn!(
-            repo = %review_params.repo,
-            pr = review_params.pr_number,
-            error = %error,
-            "Failed to post review start reaction"
-        );
-    }
-
     let log_file = std::fs::File::create(&nspawn_log)
         .with_context(|| format!("Failed to create sandbox log at {}", nspawn_log.display()))?;
     cmd.stdout(Stdio::from(
@@ -1685,182 +1738,23 @@ async fn run_sandboxed_review(
         }
     }
 
-    let completed = read_completed_review(&result_json)?;
+    let mut completed = read_completed_review(&result_json)?;
     let structured_path = crate::review::structured_artifact_path_for_report(&report_path);
     let policy_path = crate::review::disclosure_policy_path_for_report(&report_path);
-    let report_url = match (
-        read_json_file::<crate::reporting::ReportingArtifact>(&structured_path),
-        read_json_file::<crate::reporting::DisclosurePolicy>(&policy_path),
-    ) {
-        (Ok(mut artifact), Ok(policy)) => {
-            let workspace_path = report_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let dedupe_result = crate::review::apply_duplicate_suppression(
-                crate::review::DuplicateSuppressionParams {
-                    artifact: &mut artifact,
-                    workspace_path,
-                    repo: &review_params.repo,
-                    pr_number: review_params.pr_number,
-                    pr_context: &policy.pr_context,
-                    policy: &policy,
-                    provider: &review_params.provider,
-                    model: &review_params.model,
-                    verifier_provider: review_params.verifier_provider.as_deref(),
-                    verifier_model: review_params.verifier_model.as_deref(),
-                    dedupe_existing_comments: review_params.dedupe_existing_comments,
-                    dedupe_provider: review_params.dedupe_provider.as_deref(),
-                    dedupe_model: review_params.dedupe_model.as_deref(),
-                    max_retries: review_params.max_retries,
-                    retry_delay_secs: review_params.retry_delay_secs,
-                    timeout_mins: review_params.timeout_mins,
-                    max_turns: review_params.max_turns,
-                    cancel_token: cancel_token.clone(),
-                },
-            )
-            .await?;
-            if dedupe_result.is_some() {
-                let report_content = crate::reporting::render_markdown(
-                    &review_params.repo,
-                    review_params.pr_number,
-                    &artifact,
-                    Some(&policy),
-                );
-                std::fs::write(&report_path, report_content)
-                    .context("Failed to write host duplicate-suppressed report")?;
-                std::fs::write(&structured_path, serde_json::to_vec_pretty(&artifact)?)
-                    .context("Failed to write host duplicate-suppressed structured artifact")?;
-            }
-            crate::disclose::handle_structured_disclosure(
-                &report_path,
-                crate::disclose::DisclosureTarget {
-                    repo: &review_params.repo,
-                    pr_number: review_params.pr_number,
-                    commit_hash: completed.metadata.commit_hash.as_str(),
-                    review_kind: &review_params.review_kind,
-                },
-                &artifact,
-                &policy,
-                &review_params.disclose_config,
-            )
-            .await?
-        }
-        _ => {
-            tracing::warn!(
-                report = %report_path.display(),
-                "Sandbox child did not emit structured disclosure artifacts; suppressing PR comments"
-            );
-            crate::disclose::handle_disclosure(
-                &report_path,
-                crate::disclose::DisclosureTarget {
-                    repo: &review_params.repo,
-                    pr_number: review_params.pr_number,
-                    commit_hash: completed.metadata.commit_hash.as_str(),
-                    review_kind: &review_params.review_kind,
-                },
-                false,
-                &review_params.disclose_config,
-            )
-            .await?
-        }
+    completed.report_path.clone_from(&report_path);
+    completed.metadata.artifacts = crate::state::ArtifactPaths {
+        markdown: Some(report_path),
+        structured_json: Some(structured_path),
+        policy_json: Some(policy_path),
+        sandbox_log: Some(nspawn_log.clone()),
     };
-
-    let mut metadata = completed.metadata;
-    if let (Ok(artifact), Ok(policy)) = (
-        read_json_file::<crate::reporting::ReportingArtifact>(&structured_path),
-        read_json_file::<crate::reporting::DisclosurePolicy>(&policy_path),
-    ) {
-        let publishable = artifact.publishable_findings(&policy);
-        let already_reported = artifact.already_reported_findings(&policy);
-        metadata.findings_count = publishable.len() as u32;
-        metadata.status = if artifact.markdown_only_fallback {
-            crate::state::ReviewStatus::MarkdownOnly
-        } else if artifact.verifier_failed {
-            crate::state::ReviewStatus::Unverified
-        } else if !publishable.is_empty() {
-            crate::state::ReviewStatus::Confirmed
-        } else if !already_reported.is_empty() {
-            crate::state::ReviewStatus::AlreadyReported
-        } else if artifact.no_findings.is_some() {
-            crate::state::ReviewStatus::None
-        } else {
-            crate::state::ReviewStatus::Rejected
-        };
-        metadata.severity = publishable
-            .iter()
-            .map(|finding| finding.severity.clone())
-            .next()
-            .unwrap_or_else(|| "none".to_string());
-        metadata.pr_classification = if publishable.is_empty() {
-            "none".to_string()
-        } else {
-            review_params.pr_number.to_string()
-        };
-    }
-    metadata.retry_count = crate::state::get_pr_review(
-        &params.db_path,
-        &review_params.repo,
-        review_params.pr_number,
-        &review_params.review_kind,
+    ReviewOutcome::load(
+        completed,
+        crate::execution::ExecutionDiagnostics {
+            sandbox_log: Some(nspawn_log),
+            executor: "sandbox".to_string(),
+        },
     )
-    .ok()
-    .flatten()
-    .map(|m| m.retry_count)
-    .unwrap_or(metadata.retry_count);
-    metadata.report_url = report_url;
-    if metadata.status == "none"
-        && let Some(reaction) = review_params
-            .disclose_config
-            .reactions
-            .no_findings
-            .as_deref()
-        && let Err(error) = crate::disclose::post_pr_reaction(
-            &review_params.repo,
-            review_params.pr_number,
-            reaction,
-        )
-        .await
-    {
-        tracing::warn!(
-            repo = %review_params.repo,
-            pr = review_params.pr_number,
-            error = %error,
-            "Failed to post no-findings reaction"
-        );
-    }
-    if let Some(node_id) = review_params.trigger_mention_node_id.as_deref()
-        && crate::disclose::is_non_actionable_status(metadata.status.as_str())
-        && let Some(reaction) = review_params
-            .disclose_config
-            .reactions
-            .no_findings
-            .as_deref()
-        && let Err(error) = crate::disclose::finalize_mention_reaction(
-            node_id,
-            reaction,
-            review_params
-                .disclose_config
-                .reactions
-                .review_start
-                .as_deref(),
-        )
-        .await
-    {
-        tracing::warn!(
-            repo = %review_params.repo,
-            pr = review_params.pr_number,
-            error = %error,
-            "Failed to post no-findings reaction on trigger mention comment"
-        );
-    }
-    crate::state::mark_reviewed(
-        &params.db_path,
-        &review_params.repo,
-        review_params.pr_number,
-        &metadata,
-    )?;
-
-    Ok(())
 }
 
 async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<PathBuf> {
@@ -1966,12 +1860,6 @@ fn read_completed_review(path: &Path) -> Result<CompletedReview> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read sandbox result JSON at {}", path.display()))?;
     serde_json::from_slice(&bytes).context("Failed to parse sandbox result JSON")
-}
-
-fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Failed to read JSON file at {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
 fn tail_file(path: &Path, max_lines: usize) -> Result<String> {

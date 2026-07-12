@@ -9,6 +9,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use fiach::config::{FiachConfig, MultiString};
 use fiach::disclose::ReportMode;
+use fiach::execution::ReviewExecutor;
 use fiach::{daemon, disclose, persona, review, server, state};
 
 fn parse_report_mode(value: &str) -> Result<ReportMode> {
@@ -596,7 +597,7 @@ async fn main() -> Result<()> {
                     trigger_mention_node_id: None,
                     execution: review::ReviewExecution {
                         skip_state_check: sandbox_child,
-                        persist_side_effects: !sandbox_child,
+                        persist_side_effects: false,
                         result_json: output_for_persona(
                             result_json.clone(),
                             &persona,
@@ -605,7 +606,23 @@ async fn main() -> Result<()> {
                     },
                 };
 
-                let _ = review::run_review(params, cancel_token.clone()).await?;
+                if sandbox_child {
+                    let _ = review::run_review(params, cancel_token.clone()).await?;
+                } else {
+                    let finalization = fiach::finalizer::FinalizationSpec::from(&params);
+                    let executor = fiach::execution::LocalReviewExecutor;
+                    if let Some(outcome) = executor
+                        .execute(
+                            fiach::execution::ReviewSpec { params },
+                            cancel_token.clone(),
+                        )
+                        .await?
+                    {
+                        fiach::finalizer::ReviewFinalizer
+                            .finalize(&finalization, outcome, cancel_token.clone())
+                            .await?;
+                    }
+                }
             }
             Ok(())
         }
