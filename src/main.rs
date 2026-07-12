@@ -1,13 +1,3 @@
-mod config;
-mod daemon;
-mod disclose;
-mod persona;
-mod reporting;
-mod review;
-mod server;
-mod state;
-mod workspace;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -17,8 +7,9 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use self::config::{FiachConfig, MultiString};
-use self::disclose::ReportMode;
+use fiach::config::{FiachConfig, MultiString};
+use fiach::disclose::ReportMode;
+use fiach::{daemon, disclose, persona, review, server, state};
 
 fn parse_report_mode(value: &str) -> Result<ReportMode> {
     ReportMode::from_str(value).map_err(|error| anyhow::anyhow!(error))
@@ -829,12 +820,16 @@ async fn main() -> Result<()> {
 
             let port = port.or(daemon_cfg.port).unwrap_or(3000);
             let (tx, rx) = tokio::sync::mpsc::channel(100);
+            let reports_dir = params
+                .out_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("reports"));
+            let state_store = std::sync::Arc::new(state::RedbStateStore::open(
+                params.db_path.clone(),
+                Some(&reports_dir),
+            )?);
             let app_state = server::AppState {
-                db_path: params.db_path.clone(),
-                out_dir: params
-                    .out_dir
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("reports")),
+                state_store,
                 daemon_tx: tx,
                 server_token: std::env::var("FIACH_SERVER_TOKEN")
                     .ok()

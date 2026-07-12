@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
@@ -13,12 +13,11 @@ use axum::{
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use crate::state::{get_pr_review, list_reviews};
+use crate::state::RedbStateStore;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db_path: PathBuf,
-    pub out_dir: PathBuf,
+    pub state_store: Arc<RedbStateStore>,
     pub daemon_tx: mpsc::Sender<crate::daemon::DaemonMessage>,
     pub server_token: Option<String>,
 }
@@ -104,7 +103,7 @@ async fn get_reviews(State(state): State<AppState>, headers: HeaderMap) -> impl 
         return unauthorized_response();
     }
 
-    match list_reviews(&state.db_path) {
+    match state.state_store.list().await {
         Ok(reviews) => (StatusCode::OK, Json(reviews)).into_response(),
         Err(e) => {
             tracing::error!("Failed to list reviews: {}", e);
@@ -128,7 +127,11 @@ async fn get_review(
 
     let repo_full = format!("{}/{}", query.owner, query.repo);
     let review_kind = review_kind_from_query(query.persona.as_deref());
-    match get_pr_review(&state.db_path, &repo_full, query.pr, &review_kind) {
+    match state
+        .state_store
+        .get(&repo_full, query.pr, &review_kind)
+        .await
+    {
         Ok(Some(metadata)) => (StatusCode::OK, Json(metadata)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Review not found").into_response(),
         Err(e) => {
@@ -153,7 +156,11 @@ async fn get_review_content(
 
     let repo_full = format!("{}/{}", query.owner, query.repo);
     let review_kind = review_kind_from_query(query.persona.as_deref());
-    let metadata = match get_pr_review(&state.db_path, &repo_full, query.pr, &review_kind) {
+    let metadata = match state
+        .state_store
+        .get(&repo_full, query.pr, &review_kind)
+        .await
+    {
         Ok(Some(m)) => m,
         Ok(None) => return (StatusCode::NOT_FOUND, "Review not found").into_response(),
         Err(e) => {
@@ -166,22 +173,13 @@ async fn get_review_content(
         }
     };
 
-    let safe_repo = repo_full.replace('/', "_");
-    let hash_short = if metadata.commit_hash.len() > 7 {
-        &metadata.commit_hash[..7]
-    } else {
-        &metadata.commit_hash
-    };
-
-    let file_name = if metadata.review_kind == crate::state::DEFAULT_REVIEW_KIND {
-        format!("{}_PR{}_{}_report.md", safe_repo, query.pr, hash_short)
-    } else {
-        format!(
-            "{}_PR{}_{}_{}_report.md",
-            safe_repo, query.pr, hash_short, metadata.review_kind
+    let Some(file_path) = metadata.artifacts.markdown else {
+        return (
+            StatusCode::NOT_FOUND,
+            "Review has no recorded Markdown artifact",
         )
+            .into_response();
     };
-    let file_path = state.out_dir.join(file_name);
 
     match tokio::fs::read_to_string(&file_path).await {
         Ok(content) => (

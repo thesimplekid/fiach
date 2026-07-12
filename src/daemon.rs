@@ -799,12 +799,14 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
     ) {
         if decision != crate::state::ReviewDecision::Skip {
             let meta = crate::state::ReviewMetadata {
+                repository: repo.to_string(),
+                pr_number: job.pr.number,
                 review_kind: job.review_kind.clone(),
                 commit_hash: job.pr.head_ref_oid.clone(),
                 model: "daemon".to_string(),
                 timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
                 findings_count: 0,
-                status: "skipped".to_string(),
+                status: crate::state::ReviewStatus::Skipped,
                 severity: "none".to_string(),
                 pr_classification: "none".to_string(),
                 duration_secs: 0,
@@ -820,6 +822,9 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
                         .unwrap_or_default(),
                 ),
                 retry_count: 0,
+                artifacts: crate::state::ArtifactPaths::default(),
+                disclosure_url: None,
+                failure_stage: None,
             };
             let _ = crate::state::mark_reviewed(&params.db_path, repo, job.pr.number, &meta);
         }
@@ -1106,12 +1111,14 @@ async fn process_daemon_job(
 
             if let Err(e) = review_result {
                 let meta = crate::state::ReviewMetadata {
+                    repository: repo.to_string(),
+                    pr_number: pr.number,
                     review_kind: job.review_kind.clone(),
                     commit_hash: pr.head_ref_oid.clone(),
                     model: "daemon".to_string(),
                     timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
                     findings_count: 0,
-                    status: "failed".to_string(),
+                    status: crate::state::ReviewStatus::Failed,
                     severity: "none".to_string(),
                     pr_classification: "none".to_string(),
                     duration_secs: 0,
@@ -1127,6 +1134,9 @@ async fn process_daemon_job(
                             .unwrap_or_default(),
                     ),
                     retry_count: retry_count_for_attempt,
+                    artifacts: crate::state::ArtifactPaths::default(),
+                    disclosure_url: None,
+                    failure_stage: Some("execution".to_string()),
                 };
                 let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);
 
@@ -1726,17 +1736,17 @@ async fn run_sandboxed_review(
         let already_reported = artifact.already_reported_findings(&policy);
         metadata.findings_count = publishable.len() as u32;
         metadata.status = if artifact.markdown_only_fallback {
-            "markdown-only".to_string()
+            crate::state::ReviewStatus::MarkdownOnly
         } else if artifact.verifier_failed {
-            "unverified".to_string()
+            crate::state::ReviewStatus::Unverified
         } else if !publishable.is_empty() {
-            "confirmed".to_string()
+            crate::state::ReviewStatus::Confirmed
         } else if !already_reported.is_empty() {
-            "already-reported".to_string()
+            crate::state::ReviewStatus::AlreadyReported
         } else if artifact.no_findings.is_some() {
-            "none".to_string()
+            crate::state::ReviewStatus::None
         } else {
-            "rejected".to_string()
+            crate::state::ReviewStatus::Rejected
         };
         metadata.severity = publishable
             .iter()
@@ -1781,7 +1791,7 @@ async fn run_sandboxed_review(
         );
     }
     if let Some(node_id) = review_params.trigger_mention_node_id.as_deref()
-        && crate::disclose::is_non_actionable_status(&metadata.status)
+        && crate::disclose::is_non_actionable_status(metadata.status.as_str())
         && let Some(reaction) = review_params
             .disclose_config
             .reactions

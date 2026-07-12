@@ -2004,17 +2004,17 @@ pub async fn run_review(
         let findings_count = accepted_findings.len() as u32;
         let should_notify = findings_count > 0 && !artifact.verifier_failed;
         let status = if artifact.markdown_only_fallback {
-            "markdown-only".to_string()
+            state::ReviewStatus::MarkdownOnly
         } else if artifact.verifier_failed {
-            "unverified".to_string()
+            state::ReviewStatus::Unverified
         } else if findings_count > 0 {
-            "confirmed".to_string()
+            state::ReviewStatus::Confirmed
         } else if !already_reported_findings.is_empty() {
-            "already-reported".to_string()
+            state::ReviewStatus::AlreadyReported
         } else if artifact.no_findings.is_some() {
-            "none".to_string()
+            state::ReviewStatus::None
         } else {
-            "rejected".to_string()
+            state::ReviewStatus::Rejected
         };
         let severity = accepted_findings
             .iter()
@@ -2050,6 +2050,8 @@ pub async fn run_review(
 
         let mut completed = CompletedReview {
             metadata: state::ReviewMetadata {
+                repository: params.repo.clone(),
+                pr_number: params.pr_number,
                 review_kind: params.review_kind.clone(),
                 commit_hash: workspace.commit_hash.clone(),
                 model: params.model.clone(),
@@ -2083,6 +2085,14 @@ pub async fn run_review(
                 .flatten()
                 .map(|m| m.retry_count)
                 .unwrap_or(0),
+                artifacts: state::ArtifactPaths {
+                    markdown: Some(absolute_path(report_file)),
+                    structured_json: Some(absolute_path(&structured_path)),
+                    policy_json: Some(absolute_path(&policy_path)),
+                    sandbox_log: None,
+                },
+                disclosure_url: None,
+                failure_stage: None,
             },
             should_notify,
             report_path: report_file.to_path_buf(),
@@ -2136,7 +2146,7 @@ pub async fn run_review(
             // the mentioner's perspective, rejected or already-reported
             // findings also mean "nothing actionable".
             if let Some(node_id) = params.trigger_mention_node_id.as_deref()
-                && disclose::is_non_actionable_status(&completed.metadata.status)
+                && disclose::is_non_actionable_status(completed.metadata.status.as_str())
                 && let Some(reaction) = params.disclose_config.reactions.no_findings.as_deref()
                 && let Err(error) = disclose::finalize_mention_reaction(
                     node_id,
@@ -2388,6 +2398,16 @@ fn disclosure_policy_path(report_file: &std::path::Path) -> PathBuf {
     let mut path = report_file.to_path_buf();
     path.set_extension("policy.json");
     path
+}
+
+fn absolute_path(path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|directory| directory.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn disclosure_policy_path_for_report(report_file: &std::path::Path) -> PathBuf {

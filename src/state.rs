@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -6,17 +7,100 @@ use serde::{Deserialize, Serialize};
 
 const PR_STATE: TableDefinition<&str, &str> = TableDefinition::new("pr_state");
 const COMMIT_STATE: TableDefinition<&str, &str> = TableDefinition::new("commit_state");
+const SCHEMA_VERSION: TableDefinition<&str, u64> = TableDefinition::new("schema_version");
+const CURRENT_SCHEMA_VERSION: u64 = 2;
 pub const DEFAULT_REVIEW_KIND: &str = "default";
 
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ArtifactPaths {
+    #[serde(default)]
+    pub markdown: Option<PathBuf>,
+    #[serde(default)]
+    pub structured_json: Option<PathBuf>,
+    #[serde(default)]
+    pub policy_json: Option<PathBuf>,
+    #[serde(default)]
+    pub sandbox_log: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewStatus {
+    Queued,
+    #[serde(rename = "in_progress", alias = "in-progress")]
+    InProgress,
+    Skipped,
+    Failed,
+    None,
+    Rejected,
+    Unverified,
+    AlreadyReported,
+    Confirmed,
+    MarkdownOnly,
+}
+
+impl ReviewStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::InProgress => "in_progress",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+            Self::None => "none",
+            Self::Rejected => "rejected",
+            Self::Unverified => "unverified",
+            Self::AlreadyReported => "already-reported",
+            Self::Confirmed => "confirmed",
+            Self::MarkdownOnly => "markdown-only",
+        }
+    }
+}
+
+impl std::fmt::Display for ReviewStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReviewStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "in_progress" | "in-progress" => Ok(Self::InProgress),
+            "skipped" => Ok(Self::Skipped),
+            "failed" => Ok(Self::Failed),
+            "none" => Ok(Self::None),
+            "rejected" => Ok(Self::Rejected),
+            "unverified" => Ok(Self::Unverified),
+            "already-reported" => Ok(Self::AlreadyReported),
+            "confirmed" => Ok(Self::Confirmed),
+            "markdown-only" => Ok(Self::MarkdownOnly),
+            other => anyhow::bail!("unknown review status: {other}"),
+        }
+    }
+}
+
+impl PartialEq<&str> for ReviewStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ReviewMetadata {
+pub struct ReviewRecord {
+    #[serde(default)]
+    pub repository: String,
+    #[serde(default)]
+    pub pr_number: u64,
     #[serde(default = "default_review_kind")]
     pub review_kind: String,
     pub commit_hash: String,
     pub model: String,
     pub timestamp: i64, // Unix timestamp of when the review completed
     pub findings_count: u32,
-    pub status: String,
+    pub status: ReviewStatus,
     pub severity: String,
     pub pr_classification: String,
     #[serde(default)]
@@ -37,7 +121,16 @@ pub struct ReviewMetadata {
     pub time_reviewed: Option<String>,
     #[serde(default)]
     pub retry_count: u32,
+    #[serde(default)]
+    pub artifacts: ArtifactPaths,
+    #[serde(default)]
+    pub disclosure_url: Option<String>,
+    #[serde(default)]
+    pub failure_stage: Option<String>,
 }
+
+/// Compatibility name retained while callers migrate to the domain-oriented record.
+pub type ReviewMetadata = ReviewRecord;
 
 fn default_review_kind() -> String {
     DEFAULT_REVIEW_KIND.to_string()
@@ -382,12 +475,14 @@ pub fn lock_for_review(
             }
 
             let metadata = ReviewMetadata {
+                repository: repo.to_string(),
+                pr_number: pr,
                 review_kind: review_kind.to_string(),
                 commit_hash: commit_hash.to_string(),
                 model: "daemon".to_string(),
                 timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
                 findings_count: 0,
-                status: "in_progress".to_string(),
+                status: ReviewStatus::InProgress,
                 severity: "none".to_string(),
                 pr_classification: "none".to_string(),
                 duration_secs: 0,
@@ -403,6 +498,9 @@ pub fn lock_for_review(
                         .unwrap_or_default(),
                 ),
                 retry_count: 0,
+                artifacts: ArtifactPaths::default(),
+                disclosure_url: None,
+                failure_stage: None,
             };
 
             let metadata = if let Some(value) = pr_table.get(key.as_str())? {
@@ -531,6 +629,292 @@ pub fn list_reviews(db_path: &Path) -> Result<Vec<(String, u64, ReviewMetadata)>
     })
 }
 
+#[derive(Clone)]
+pub struct RedbStateStore {
+    database: Arc<Database>,
+    db_path: PathBuf,
+}
+
+impl RedbStateStore {
+    pub fn open(db_path: impl Into<PathBuf>, reports_dir: Option<&Path>) -> Result<Self> {
+        let db_path = db_path.into();
+        let existed = db_path.exists();
+        let database =
+            Arc::new(Database::create(&db_path).with_context(|| {
+                format!("Failed to open state database at {}", db_path.display())
+            })?);
+        let store = Self { database, db_path };
+        store.migrate_if_needed(existed, reports_dir)?;
+        Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.db_path
+    }
+
+    fn migrate_if_needed(&self, existed: bool, reports_dir: Option<&Path>) -> Result<()> {
+        let current_version = {
+            let read = self.database.begin_read()?;
+            match read.open_table(SCHEMA_VERSION) {
+                Ok(table) => table.get("schema")?.map(|value| value.value()),
+                Err(_) => None,
+            }
+        };
+        if current_version == Some(CURRENT_SCHEMA_VERSION) {
+            return Ok(());
+        }
+        if let Some(version) = current_version
+            && version > CURRENT_SCHEMA_VERSION
+        {
+            anyhow::bail!(
+                "State database schema {version} is newer than supported schema {CURRENT_SCHEMA_VERSION}"
+            );
+        }
+
+        if existed {
+            let backup = migration_backup_path(&self.db_path);
+            std::fs::copy(&self.db_path, &backup).with_context(|| {
+                format!(
+                    "Failed to back up state database to {} before migration",
+                    backup.display()
+                )
+            })?;
+        }
+
+        let write = self.database.begin_write()?;
+        migrate_table(&write, PR_STATE, reports_dir, true)?;
+        migrate_table(&write, COMMIT_STATE, reports_dir, false)?;
+        {
+            let mut schema = write.open_table(SCHEMA_VERSION)?;
+            schema.insert("schema", CURRENT_SCHEMA_VERSION)?;
+        }
+        write
+            .commit()
+            .context("Failed to commit state database migration")
+    }
+
+    pub async fn get(
+        &self,
+        repository: &str,
+        pr_number: u64,
+        review_kind: &str,
+    ) -> Result<Option<ReviewRecord>> {
+        let database = Arc::clone(&self.database);
+        let key = pr_state_key(repository, pr_number, review_kind);
+        tokio::task::spawn_blocking(move || read_record(&database, PR_STATE, &key))
+            .await
+            .context("State read task failed")?
+    }
+
+    pub async fn list(&self) -> Result<Vec<ReviewRecord>> {
+        let database = Arc::clone(&self.database);
+        tokio::task::spawn_blocking(move || {
+            let read = database.begin_read()?;
+            let table = match read.open_table(PR_STATE) {
+                Ok(table) => table,
+                Err(_) => return Ok(Vec::new()),
+            };
+            let mut records = Vec::new();
+            for item in table.iter()? {
+                let (_, value) = item?;
+                records.push(serde_json::from_str::<ReviewRecord>(value.value())?);
+            }
+            records.sort_by_key(|record| std::cmp::Reverse(record.timestamp));
+            Ok(records)
+        })
+        .await
+        .context("State list task failed")?
+    }
+
+    pub async fn try_claim(&self, mut record: ReviewRecord, timeout_mins: u64) -> Result<bool> {
+        let database = Arc::clone(&self.database);
+        tokio::task::spawn_blocking(move || {
+            let write = database.begin_write()?;
+            let key = pr_state_key(&record.repository, record.pr_number, &record.review_kind);
+            {
+                let mut table = write.open_table(PR_STATE)?;
+                if let Some(value) = table.get(key.as_str())? {
+                    let previous: ReviewRecord = serde_json::from_str(value.value())?;
+                    if previous.status == ReviewStatus::InProgress {
+                        let age = time::OffsetDateTime::now_utc()
+                            .unix_timestamp()
+                            .saturating_sub(previous.timestamp)
+                            as u64;
+                        if age <= (timeout_mins + 10) * 60 {
+                            return Ok(false);
+                        }
+                    }
+                    if previous.commit_hash == record.commit_hash
+                        && matches!(
+                            previous.status,
+                            ReviewStatus::Failed | ReviewStatus::InProgress
+                        )
+                    {
+                        record.retry_count = previous.retry_count.saturating_add(1);
+                    }
+                }
+                record.status = ReviewStatus::InProgress;
+                record.timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+                let json = serde_json::to_string(&record)?;
+                table.insert(key.as_str(), json.as_str())?;
+            }
+            write.commit()?;
+            Ok(true)
+        })
+        .await
+        .context("State claim task failed")?
+    }
+
+    pub async fn complete(&self, record: ReviewRecord) -> Result<()> {
+        self.write_terminal(record).await
+    }
+
+    pub async fn fail(&self, mut record: ReviewRecord, stage: &str) -> Result<()> {
+        record.status = ReviewStatus::Failed;
+        record.failure_stage = Some(stage.to_string());
+        self.write_terminal(record).await
+    }
+
+    async fn write_terminal(&self, record: ReviewRecord) -> Result<()> {
+        let database = Arc::clone(&self.database);
+        tokio::task::spawn_blocking(move || {
+            let write = database.begin_write()?;
+            let json = serde_json::to_string(&record)?;
+            {
+                let mut prs = write.open_table(PR_STATE)?;
+                let key = pr_state_key(&record.repository, record.pr_number, &record.review_kind);
+                prs.insert(key.as_str(), json.as_str())?;
+                let mut commits = write.open_table(COMMIT_STATE)?;
+                let key =
+                    commit_state_key(&record.repository, &record.commit_hash, &record.review_kind);
+                commits.insert(key.as_str(), json.as_str())?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+        .context("State write task failed")?
+    }
+}
+
+fn migration_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".v1.backup");
+    PathBuf::from(backup)
+}
+
+fn read_record(
+    database: &Database,
+    table: TableDefinition<&str, &str>,
+    key: &str,
+) -> Result<Option<ReviewRecord>> {
+    let read = database.begin_read()?;
+    let table = match read.open_table(table) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    Ok(table
+        .get(key)?
+        .map(|value| serde_json::from_str(value.value()))
+        .transpose()?)
+}
+
+fn migrate_table(
+    write: &redb::WriteTransaction,
+    definition: TableDefinition<&str, &str>,
+    reports_dir: Option<&Path>,
+    pr_table: bool,
+) -> Result<()> {
+    let mut table = write.open_table(definition)?;
+    let mut migrated = Vec::new();
+    for item in table.iter()? {
+        let (key, value) = item?;
+        let mut record: ReviewRecord = serde_json::from_str(value.value())
+            .with_context(|| format!("Failed to migrate state record {}", key.value()))?;
+        if pr_table && let Some((repository, pr_number)) = parse_pr_state_key(key.value()) {
+            record.repository = repository;
+            record.pr_number = pr_number;
+        }
+        if record.artifacts.markdown.is_none()
+            && let Some(root) = reports_dir
+        {
+            record.artifacts = discover_legacy_artifacts(root, &record);
+        }
+        migrated.push((key.value().to_string(), serde_json::to_string(&record)?));
+    }
+    for (key, value) in migrated {
+        table.insert(key.as_str(), value.as_str())?;
+    }
+    Ok(())
+}
+
+fn discover_legacy_artifacts(root: &Path, record: &ReviewRecord) -> ArtifactPaths {
+    let mut paths = ArtifactPaths::default();
+    let repo = record.repository.replace('/', "_");
+    let hash = record.commit_hash.chars().take(7).collect::<String>();
+    let legacy_stem = if record.review_kind == DEFAULT_REVIEW_KIND {
+        format!("{repo}_PR{}_{}_report", record.pr_number, hash)
+    } else {
+        format!(
+            "{repo}_PR{}_{}_{}_report",
+            record.pr_number, hash, record.review_kind
+        )
+    };
+    let run_prefix = format!("{repo}_PR{}_{}", record.pr_number, record.review_kind);
+    for candidate in walk_files(root) {
+        let name = candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let in_matching_run = candidate
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&run_prefix));
+        if name == format!("{legacy_stem}.md") || (in_matching_run && name == "report.md") {
+            paths.markdown = Some(to_absolute(candidate));
+        } else if name == format!("{legacy_stem}.json")
+            || (in_matching_run && name == "report.json")
+        {
+            paths.structured_json = Some(to_absolute(candidate));
+        } else if name == format!("{legacy_stem}.policy.json")
+            || (in_matching_run && name == "report.policy.json")
+        {
+            paths.policy_json = Some(to_absolute(candidate));
+        } else if in_matching_run && name == "nspawn.log" {
+            paths.sandbox_log = Some(to_absolute(candidate));
+        }
+    }
+    paths
+}
+
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn to_absolute(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map_or(path.clone(), |directory| directory.join(path))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,12 +935,14 @@ mod tests {
         timestamp: i64,
     ) -> ReviewMetadata {
         ReviewMetadata {
+            repository: "owner/repo".to_string(),
+            pr_number: 42,
             review_kind: "security".to_string(),
             commit_hash: commit_hash.to_string(),
             model: "test".to_string(),
             timestamp,
             findings_count: 0,
-            status: status.to_string(),
+            status: status.parse().unwrap_or(ReviewStatus::Failed),
             severity: "none".to_string(),
             pr_classification: "none".to_string(),
             duration_secs: 0,
@@ -568,6 +954,9 @@ mod tests {
             is_rereview: false,
             time_reviewed: None,
             retry_count,
+            artifacts: ArtifactPaths::default(),
+            disclosure_url: None,
+            failure_stage: None,
         }
     }
 
@@ -735,5 +1124,53 @@ mod tests {
             .unwrap();
         assert_eq!(locked.status, "in_progress");
         assert_eq!(locked.retry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn atomic_competing_claims_have_one_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RedbStateStore::open(temp.path().join("state.redb"), None).unwrap();
+        let mut record = metadata("abc123", "queued", 0);
+        record.repository = "owner/repo".to_string();
+        record.pr_number = 7;
+
+        let (first, second) = tokio::join!(
+            store.try_claim(record.clone(), 30),
+            store.try_claim(record, 30)
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            store
+                .get("owner/repo", 7, "security")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ReviewStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn migration_backs_up_and_discovers_legacy_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let reports = temp.path().join("reports");
+        std::fs::create_dir(&reports).unwrap();
+        let report = reports.join("owner_repo_PR42_abc1234_security_report.md");
+        std::fs::write(&report, "report").unwrap();
+        let legacy = metadata("abc1234", "confirmed", 0);
+        mark_reviewed(&db_path, "owner/repo", 42, &legacy).unwrap();
+
+        let store = RedbStateStore::open(&db_path, Some(&reports)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let migrated = runtime
+            .block_on(store.get("owner/repo", 42, "security"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(migrated.repository, "owner/repo");
+        assert_eq!(migrated.pr_number, 42);
+        assert_eq!(migrated.artifacts.markdown, Some(report));
+        assert!(migration_backup_path(&db_path).exists());
     }
 }
