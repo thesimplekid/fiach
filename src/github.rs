@@ -1,7 +1,4 @@
-use std::future::Future;
-use std::path::Path;
-use std::pin::Pin;
-use std::time::Duration;
+use std::{future::Future, path::Path, pin::Pin, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -95,11 +92,12 @@ impl GhCli {
     ) -> Result<Vec<u8>> {
         let mut command = Command::new(program);
         command.args(args);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
         if input.is_some() {
-            command.stdin(std::process::Stdio::piped());
+            command.stdin(Stdio::piped());
         }
         let mut child = command
             .spawn()
@@ -323,5 +321,38 @@ mod tests {
     fn adapter_timeout_is_configurable() {
         let adapter = GhCli::with_timeout(Duration::from_secs(3));
         assert_eq!(adapter.timeout, Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn adapter_captures_stdout() {
+        let adapter = GhCli::with_timeout(Duration::from_secs(3));
+        let output = adapter
+            .output(
+                "sh",
+                &["-c".to_string(), "printf 'captured output'".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output, b"captured output");
+    }
+
+    #[tokio::test]
+    async fn adapter_reports_captured_stderr() {
+        let adapter = GhCli::with_timeout(Duration::from_secs(3));
+        let error = adapter
+            .output(
+                "sh",
+                &[
+                    "-c".to_string(),
+                    "printf 'captured error' >&2; exit 1".to_string(),
+                ],
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "sh command failed: captured error");
     }
 }
