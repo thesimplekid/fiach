@@ -67,6 +67,7 @@ pub struct DaemonParams {
     pub retry_delay_secs: u64,
     pub out_dir: Option<PathBuf>,
     pub disclose_config: DiscloseConfig,
+    pub buzz_config: Option<crate::config::BuzzConfig>,
     pub verify_findings: bool,
     pub context_groups: std::collections::HashMap<String, crate::config::ContextGroup>,
     pub pr_states: Vec<String>,
@@ -754,7 +755,11 @@ pub async fn run_daemon(
 
                         tracing::info!("Found {} recent {} PRs for {}", prs.len(), state, repo);
 
-                        let jobs = review_jobs(&params.personas, &prs, params.personas.len() > 1);
+                        let jobs = review_jobs(
+                            &params.personas,
+                            &prs,
+                            params.personas.len() > 1 || params.buzz_config.is_some(),
+                        );
                         tracing::info!(
                             repo = %repo,
                             state = %state,
@@ -1113,6 +1118,7 @@ async fn process_daemon_job(
                 max_retries: params.max_retries,
                 retry_delay_secs: params.retry_delay_secs,
                 disclose_config: params.disclose_config.clone(),
+                buzz_config: params.buzz_config.clone(),
                 verify_findings: params.verify_findings,
                 context_groups: params.context_groups.clone(),
                 max_cost_usd: params.max_cost_usd,
@@ -1318,7 +1324,7 @@ async fn trigger_manual_review(
             author_association,
             title: pr_details.title,
         }],
-        params.personas.len() > 1,
+        params.personas.len() > 1 || params.buzz_config.is_some(),
     );
 
     // Manual triggers are deliberate, so they bypass the mention gate.
@@ -1861,6 +1867,26 @@ mod tests {
         assert!(is_allowed_author_association("collaborator", &allowed));
         assert!(is_allowed_author_association("MEMBER", &allowed));
         assert!(!is_allowed_author_association("FIRST_TIMER", &allowed));
+    }
+
+    #[test]
+    fn review_jobs_can_preserve_a_lone_security_persona_kind() {
+        let prs = vec![PullRequest {
+            number: 7,
+            head_ref_oid: "head".to_string(),
+            head_ref_name: "security-fix".to_string(),
+            author_association: "MEMBER".to_string(),
+            title: "Harden token validation".to_string(),
+        }];
+
+        let jobs = review_jobs(
+            &[crate::persona::PersonaSource::BuiltinSecurity],
+            &prs,
+            true,
+        );
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].review_kind, "security");
     }
 
     #[test]

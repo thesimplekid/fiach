@@ -114,6 +114,7 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               outputHashes = {
+                "buzz-client-0.1.0" = "sha256-qxOkoR44k3pr9+TmRSZWmRZRXt+56ohCrE4zwF+/nMM=";
                 "goose-1.39.0" = "sha256-7CXLvfY2jYUB9IG/Z1lPiqwZ7UwIypq32ZLq1SsnHQI=";
               };
             };
@@ -128,6 +129,7 @@
                 GITHUB_TOKEN=ghp_example
                 OPENROUTER_API_KEY=sk-example
                 FIACH_SERVER_TOKEN=server-example
+                FIACH_BUZZ_PRIVATE_KEY=nsec1example
               '';
               testSystem = nixpkgs.lib.nixosSystem {
                 inherit system;
@@ -152,6 +154,12 @@
                       withSkill = "cashu-security";
                       triggerMention = "fiach-bot";
                       allowedMentionUsers = [ "lead-maintainer" ];
+                      buzz = {
+                        enable = true;
+                        relayUrl = "https://buzz.example.com";
+                        publicChannel = "00000000-0000-0000-0000-000000000001";
+                        securityChannel = "00000000-0000-0000-0000-000000000002";
+                      };
                       sandbox = {
                         enable = true;
                         networkMode = "veth";
@@ -184,10 +192,15 @@
               printf '%s' "$fiach_network_name" | grep -F 've-fiach-*' >/dev/null
               test -z "$fiach_network_address"
               printf '%s' "$fiach_service_path" | grep -F 'iproute2' >/dev/null
-
               grep -F 'port = 4321' "$config_path" >/dev/null
               grep -F 'max_workers = 2' "$config_path" >/dev/null
               grep -F 'sandbox_network = "veth"' "$config_path" >/dev/null
+              grep -F '[daemon.buzz]' "$config_path" >/dev/null
+              grep -F 'relay_url = "https://buzz.example.com"' "$config_path" >/dev/null
+              grep -F 'public_channel = "00000000-0000-0000-0000-000000000001"' "$config_path" >/dev/null
+              grep -F 'security_channel = "00000000-0000-0000-0000-000000000002"' "$config_path" >/dev/null
+              grep -F 'private_key_env = "FIACH_BUZZ_PRIVATE_KEY"' "$config_path" >/dev/null
+              grep -F 'personas = ["builtin:pr-review", "builtin:security"]' "$config_path" >/dev/null
               grep -F 'sandbox_rootfs = ' "$config_path" >/dev/null
               grep -F 'skip_prs = [' "$config_path" >/dev/null
               grep -F '"123"' "$config_path" >/dev/null
@@ -370,7 +383,41 @@
 
             environmentFile = lib.mkOption {
               type = lib.types.path;
-              description = "Path to environment file containing GITHUB_TOKEN, the selected provider API key, and optionally FIACH_SERVER_TOKEN.";
+              description = "Path to environment file containing GITHUB_TOKEN, the selected provider API key, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
+            };
+
+            buzz = {
+              enable = lib.mkEnableOption "Buzz PR summary and finding threads";
+
+              relayUrl = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Optional Buzz relay URL. When unset, BUZZ_RELAY_URL or the local relay default is used.";
+              };
+
+              publicChannel = lib.mkOption {
+                type = lib.types.str;
+                default = "";
+                description = "Buzz channel UUID for public PR summary threads and general findings.";
+              };
+
+              securityChannel = lib.mkOption {
+                type = lib.types.str;
+                default = "";
+                description = "Private Buzz channel UUID for verified security finding threads.";
+              };
+
+              privateKeyEnv = lib.mkOption {
+                type = lib.types.str;
+                default = "FIACH_BUZZ_PRIVATE_KEY";
+                description = "Environment variable in environmentFile containing the Buzz private key.";
+              };
+
+              authTagEnv = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Optional environment variable in environmentFile containing a NIP-OA auth tag.";
+              };
             };
 
             logFilter = lib.mkOption {
@@ -382,7 +429,7 @@
             persona = lib.mkOption {
               type = lib.types.str;
               default = "builtin:security";
-              description = "Single persona source to use when services.fiach.personas is unset";
+              description = "Single persona source used when services.fiach.personas is unset and Buzz delivery is disabled. Buzz-enabled services default to PR-review and security personas; set services.fiach.personas to override that pair.";
             };
 
             personas = lib.mkOption {
@@ -583,6 +630,10 @@
                   assertion = !(cfg.sandbox.enable && cfg.sandbox.networkMode == "veth" && (cfg.maxWorkers == 0 || cfg.maxWorkers > 254));
                   message = "services.fiach.sandbox.networkMode = \"veth\" requires maxWorkers between 1 and 254 so each concurrent sandbox can receive a unique /30 subnet.";
                 }
+                {
+                  assertion = !cfg.buzz.enable || (cfg.buzz.publicChannel != "" && cfg.buzz.securityChannel != "");
+                  message = "services.fiach.buzz.publicChannel and securityChannel must be set when Buzz delivery is enabled.";
+                }
               ];
 
               systemd.services.fiach =
@@ -722,9 +773,22 @@
                   personaConfig =
                     if cfg.personas != null then {
                       personas = cfg.personas;
+                    } else if cfg.buzz.enable then {
+                      personas = [ "builtin:pr-review" "builtin:security" ];
                     } else {
                       persona = cfg.persona;
                     };
+                  buzzConfig = lib.optionalAttrs cfg.buzz.enable {
+                    buzz = {
+                      public_channel = cfg.buzz.publicChannel;
+                      security_channel = cfg.buzz.securityChannel;
+                      private_key_env = cfg.buzz.privateKeyEnv;
+                    } // lib.optionalAttrs (cfg.buzz.relayUrl != null) {
+                      relay_url = cfg.buzz.relayUrl;
+                    } // lib.optionalAttrs (cfg.buzz.authTagEnv != null) {
+                      auth_tag_env = cfg.buzz.authTagEnv;
+                    };
+                  };
                   configFile = tomlFormat.generate "fiach.toml" {
                     daemon = {
                       repos = cfg.repos;
@@ -752,7 +816,7 @@
                       timeout_mins = cfg.timeoutMins;
                       max_retries = cfg.maxRetries;
                       retry_delay_secs = cfg.retryDelaySecs;
-                    } // personaConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
+                    } // personaConfig // buzzConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
                       verifier_provider = cfg.verifierProvider;
                     } // lib.optionalAttrs (cfg.verifierModel != null) {
                       verifier_model = cfg.verifierModel;

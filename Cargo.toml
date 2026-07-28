@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 goose = { git = "https://github.com/aaif-goose/goose", tag = "v1.39.0", default-features = false, features = ["rustls-tls"] }
+buzz-client = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }
+buzz-sdk = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }
+nostr = "0.44"
+uuid = "1"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

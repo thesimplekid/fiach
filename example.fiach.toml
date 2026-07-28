@@ -31,6 +31,20 @@ max_turns = 300
 # sandbox_network = "bridge" # Options: host, bridge, private, veth
 # with_skill = "rust-security" # Load a specific domain skill
 
+# Post one PR-summary root message for general reviews and one reply per
+# verifier-approved finding. Security reviews with findings are routed to the
+# restricted channel as a separate thread. Configuring Buzz automatically adds
+# the built-in `summary` review lane.
+#
+# The host process must have FIACH_BUZZ_PRIVATE_KEY set. Fiach uses the
+# embedded Buzz client; the review sandbox never receives this key.
+# [daemon.buzz]
+# relay_url = "https://buzz.example.com"
+# public_channel = "00000000-0000-0000-0000-000000000001"
+# security_channel = "00000000-0000-0000-0000-000000000002"
+# private_key_env = "FIACH_BUZZ_PRIVATE_KEY"
+# auth_tag_env = "FIACH_BUZZ_AUTH_TAG"
+
 # [daemon.review_lane_prompts]
 # cashu-mint = """
 # Focus on Cashu mint correctness:
@@ -60,6 +74,11 @@ verify_findings = true
 # review_lanes = ["correctness", "concurrency", "api-compat", "tests"]
 # max_review_lanes = 2
 # max_cost_usd = 5.0
+
+# [review.buzz]
+# relay_url = "https://buzz.example.com"
+# public_channel = "00000000-0000-0000-0000-000000000001"
+# security_channel = "00000000-0000-0000-0000-000000000002"
 
 # [review.review_lane_prompts]
 # cashu-mint = "Focus on Cashu mint correctness, quote idempotency, and accounting invariants."

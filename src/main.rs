@@ -30,13 +30,23 @@ fn resolve_personas(
     cli_persona: Option<String>,
     cfg_persona: Option<MultiString>,
     cfg_personas: Option<MultiString>,
+    buzz_enabled: bool,
 ) -> Vec<persona::PersonaSource> {
     let values = cli_persona
         .map(MultiString::Single)
         .or(cfg_personas)
         .or(cfg_persona)
         .map(|personas| personas.to_vec())
-        .unwrap_or_else(|| vec!["builtin:security".to_string()]);
+        .unwrap_or_else(|| {
+            if buzz_enabled {
+                vec![
+                    "builtin:pr-review".to_string(),
+                    "builtin:security".to_string(),
+                ]
+            } else {
+                vec!["builtin:security".to_string()]
+            }
+        });
 
     parse_persona_sources(values)
 }
@@ -47,6 +57,16 @@ fn resolve_review_lanes(cli_lanes: Option<String>, cfg_lanes: Option<MultiString
         .or(cfg_lanes)
         .map(|lanes| lanes.to_vec())
         .unwrap_or_default()
+}
+
+fn ensure_summary_lane(lanes: &mut Vec<String>, buzz: Option<&fiach::config::BuzzConfig>) {
+    if buzz.is_some()
+        && !lanes
+            .iter()
+            .any(|lane| matches!(lane.trim(), "summary" | "pr-summary"))
+    {
+        lanes.insert(0, "summary".to_string());
+    }
 }
 
 fn resolve_review_lane_prompts(
@@ -503,6 +523,7 @@ async fn main() -> Result<()> {
             review_kind,
         } => {
             let rev_cfg = config.review.unwrap_or_default();
+            let buzz_config = rev_cfg.buzz.clone();
 
             let model = model
                 .or(rev_cfg.model)
@@ -517,12 +538,18 @@ async fn main() -> Result<()> {
                 .unwrap_or(true);
             let dedupe_model = dedupe_model.or(rev_cfg.dedupe_model);
             let dedupe_provider = dedupe_provider.or(rev_cfg.dedupe_provider);
-            let personas = resolve_personas(persona, rev_cfg.persona, rev_cfg.personas);
-            let review_lanes = resolve_review_lanes(review_lanes, rev_cfg.review_lanes);
+            let personas = resolve_personas(
+                persona,
+                rev_cfg.persona,
+                rev_cfg.personas,
+                buzz_config.is_some(),
+            );
+            let mut review_lanes = resolve_review_lanes(review_lanes, rev_cfg.review_lanes);
+            ensure_summary_lane(&mut review_lanes, buzz_config.as_ref());
             let review_lane_prompts =
                 resolve_review_lane_prompts(rev_cfg.review_lane_prompts, review_lane_prompts_json)?;
             let max_review_lanes = max_review_lanes.or(rev_cfg.max_review_lanes).unwrap_or(3);
-            let use_persona_kind = personas.len() > 1;
+            let use_persona_kind = personas.len() > 1 || buzz_config.is_some();
             let report_mode_str = report_mode
                 .or(rev_cfg.report_mode)
                 .unwrap_or_else(|| "local".to_string());
@@ -588,6 +615,7 @@ async fn main() -> Result<()> {
                                 .or(rev_cfg.no_findings_reaction.clone()),
                         ),
                     },
+                    buzz_config: buzz_config.clone(),
                     verify_findings: verify_findings.or(rev_cfg.verify_findings).unwrap_or(true),
                     context_groups: config.context_groups.clone(),
                     max_cost_usd: max_cost.or(rev_cfg.max_cost_usd),
@@ -672,6 +700,7 @@ async fn main() -> Result<()> {
         } => {
             let daemon_cfg = config.daemon.unwrap_or_default();
             let _ = fiach::config::RuntimeConfig::resolve_daemon(&daemon_cfg)?;
+            let buzz_config = daemon_cfg.buzz.clone();
 
             let repos_str = repos
                 .or_else(|| daemon_cfg.repos.map(|r| r.join(",")))
@@ -695,8 +724,14 @@ async fn main() -> Result<()> {
                 .unwrap_or(true);
             let dedupe_model = dedupe_model.or(daemon_cfg.dedupe_model);
             let dedupe_provider = dedupe_provider.or(daemon_cfg.dedupe_provider);
-            let personas = resolve_personas(persona, daemon_cfg.persona, daemon_cfg.personas);
-            let review_lanes = resolve_review_lanes(review_lanes, daemon_cfg.review_lanes);
+            let personas = resolve_personas(
+                persona,
+                daemon_cfg.persona,
+                daemon_cfg.personas,
+                buzz_config.is_some(),
+            );
+            let mut review_lanes = resolve_review_lanes(review_lanes, daemon_cfg.review_lanes);
+            ensure_summary_lane(&mut review_lanes, buzz_config.as_ref());
             let review_lane_prompts = daemon_cfg.review_lane_prompts;
             let max_review_lanes = max_review_lanes
                 .or(daemon_cfg.max_review_lanes)
@@ -810,6 +845,7 @@ async fn main() -> Result<()> {
                         no_findings_reaction.or(daemon_cfg.no_findings_reaction),
                     ),
                 },
+                buzz_config,
                 verify_findings: verify_findings
                     .or(daemon_cfg.verify_findings)
                     .unwrap_or(true),
@@ -922,5 +958,36 @@ async fn main() -> Result<()> {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buzz_defaults_to_public_and_security_personas() {
+        let personas = resolve_personas(None, None, None, true);
+
+        assert_eq!(personas.len(), 2);
+        assert_eq!(personas[0].review_kind(), "pr-review");
+        assert_eq!(personas[1].review_kind(), "security");
+    }
+
+    #[test]
+    fn buzz_adds_the_structured_summary_lane_once() {
+        let config = fiach::config::BuzzConfig {
+            relay_url: None,
+            public_channel: Some("public".to_string()),
+            security_channel: Some("private".to_string()),
+            private_key_env: "FIACH_BUZZ_PRIVATE_KEY".to_string(),
+            auth_tag_env: None,
+        };
+        let mut lanes = vec!["correctness".to_string()];
+
+        ensure_summary_lane(&mut lanes, Some(&config));
+        ensure_summary_lane(&mut lanes, Some(&config));
+
+        assert_eq!(lanes, vec!["summary", "correctness"]);
     }
 }

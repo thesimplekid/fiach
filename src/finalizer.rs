@@ -13,6 +13,7 @@ pub struct FinalizationSpec {
     pub repository: String,
     pub pr_number: u64,
     pub review_kind: String,
+    pub security_review: bool,
     pub provider: String,
     pub model: String,
     pub verifier_provider: Option<String>,
@@ -25,6 +26,7 @@ pub struct FinalizationSpec {
     pub timeout_mins: u64,
     pub max_turns: u32,
     pub disclose: DiscloseConfig,
+    pub buzz: Option<crate::config::BuzzConfig>,
     pub db_path: PathBuf,
     pub trigger_mention_node_id: Option<String>,
 }
@@ -35,6 +37,7 @@ impl From<&ReviewParams> for FinalizationSpec {
             repository: params.repo.clone(),
             pr_number: params.pr_number,
             review_kind: params.review_kind.clone(),
+            security_review: params.persona.is_security(),
             provider: params.provider.clone(),
             model: params.model.clone(),
             verifier_provider: params.verifier_provider.clone(),
@@ -47,6 +50,7 @@ impl From<&ReviewParams> for FinalizationSpec {
             timeout_mins: params.timeout_mins,
             max_turns: params.max_turns,
             disclose: params.disclose_config.clone(),
+            buzz: params.buzz_config.clone(),
             db_path: params.db_path.clone(),
             trigger_mention_node_id: params.trigger_mention_node_id.clone(),
         }
@@ -144,6 +148,25 @@ impl ReviewFinalizer {
             .await
         {
             tracing::warn!(error = %error, "Failed to finalize mention reaction");
+        }
+
+        if let Some(config) = &spec.buzz
+            && let Err(error) = crate::buzz::publish_review_thread(
+                config,
+                spec.security_review,
+                &metadata,
+                &outcome.artifact,
+                &outcome.policy,
+            )
+            .await
+        {
+            tracing::warn!(
+                repo = %spec.repository,
+                pr = spec.pr_number,
+                review_kind = %spec.review_kind,
+                error = %error,
+                "Failed to publish Buzz review thread"
+            );
         }
 
         state::mark_reviewed(&spec.db_path, &spec.repository, spec.pr_number, &metadata)

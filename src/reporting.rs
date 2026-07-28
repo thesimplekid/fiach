@@ -16,6 +16,8 @@ pub enum ReviewPhase {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReportingArtifact {
     #[serde(default)]
+    pub pr_summary: Option<PullRequestSummary>,
+    #[serde(default)]
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub no_findings: Option<NoFindings>,
@@ -32,6 +34,10 @@ pub struct ReportingArtifact {
 impl ReportingArtifact {
     pub fn finder_complete(&self) -> bool {
         self.no_findings.is_some() || !self.findings.is_empty()
+    }
+
+    pub fn finder_complete_with_summary(&self, require_summary: bool) -> bool {
+        self.finder_complete() && (!require_summary || self.pr_summary.is_some())
     }
 
     pub fn verifier_complete(&self) -> bool {
@@ -105,6 +111,32 @@ impl ReportingArtifact {
                 )
             })
             .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestSummary {
+    pub overview: String,
+    #[serde(default)]
+    pub key_changes: Vec<String>,
+    #[serde(default)]
+    pub affected_areas: Vec<String>,
+    #[serde(default)]
+    pub testing: Option<String>,
+}
+
+impl PullRequestSummary {
+    pub fn validate(&mut self) -> Result<()> {
+        validate_required("pr_summary.overview", &self.overview)?;
+        self.overview = self.overview.trim().to_string();
+        normalize_summary_items(&mut self.key_changes);
+        normalize_summary_items(&mut self.affected_areas);
+        self.testing = self
+            .testing
+            .take()
+            .map(|testing| testing.trim().to_string())
+            .filter(|testing| !testing.is_empty());
+        Ok(())
     }
 }
 
@@ -510,6 +542,32 @@ impl AcceptedFinding {
 pub fn reporting_tools() -> Vec<Tool> {
     vec![
         Tool::new(
+            "submit_pr_summary".to_string(),
+            "Submit a neutral summary of what the pull request changes. This is not a review verdict."
+                .to_string(),
+            object_schema(
+                vec![
+                    (
+                        "overview",
+                        string_schema("Concise neutral overview of the PR's intent and implementation"),
+                    ),
+                    (
+                        "key_changes",
+                        array_schema(string_schema("One concrete change made by the PR")),
+                    ),
+                    (
+                        "affected_areas",
+                        array_schema(string_schema("Component or subsystem affected by the PR")),
+                    ),
+                    (
+                        "testing",
+                        string_schema("Optional summary of tests added or changed by the PR"),
+                    ),
+                ],
+                vec!["overview", "key_changes"],
+            ),
+        ),
+        Tool::new(
             "submit_finding".to_string(),
             "Submit one candidate finding from the finder pass. Call this once per candidate."
                 .to_string(),
@@ -755,8 +813,32 @@ findings_count: {findings_count}
             .join(", "),
     );
 
+    if let Some(summary) = &artifact.pr_summary {
+        out.push_str("## Pull Request Summary\n\n");
+        out.push_str(summary.overview.trim());
+        out.push('\n');
+        if !summary.key_changes.is_empty() {
+            out.push_str("\n### Key Changes\n");
+            for change in &summary.key_changes {
+                out.push_str(&format!("- {change}\n"));
+            }
+        }
+        if !summary.affected_areas.is_empty() {
+            out.push_str("\n### Affected Areas\n");
+            for area in &summary.affected_areas {
+                out.push_str(&format!("- {area}\n"));
+            }
+        }
+        if let Some(testing) = &summary.testing {
+            out.push_str("\n### Testing\n");
+            out.push_str(testing);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
     if let Some(no_findings) = &artifact.no_findings {
-        out.push_str("## Summary\n");
+        out.push_str("## Review Result\n");
         out.push_str(no_findings.summary.trim());
         out.push('\n');
         return out;
@@ -901,6 +983,9 @@ pub fn review_summary_body(accepted: &[AcceptedFinding]) -> String {
 }
 
 pub fn validate_artifact(artifact: &mut ReportingArtifact) -> Result<()> {
+    if let Some(summary) = &mut artifact.pr_summary {
+        summary.validate()?;
+    }
     let mut ids = BTreeSet::new();
     for finding in &artifact.findings {
         if !ids.insert(finding.id.clone()) {
@@ -1014,6 +1099,17 @@ fn normalize_skills(skills: Vec<String>) -> Vec<String> {
     normalized.sort();
     normalized.dedup();
     normalized
+}
+
+fn normalize_summary_items(items: &mut Vec<String>) {
+    let mut normalized = Vec::new();
+    for item in std::mem::take(items) {
+        let item = item.trim();
+        if !item.is_empty() && !normalized.iter().any(|existing| existing == item) {
+            normalized.push(item.to_string());
+        }
+    }
+    *items = normalized;
 }
 
 fn collect_skills(artifact: &ReportingArtifact) -> Vec<String> {
@@ -1152,6 +1248,37 @@ mod tests {
 
         assert!(anchors["src/lib.rs"].contains(&9));
         assert!(anchors["src/lib.rs"].contains(&11));
+    }
+
+    #[test]
+    fn required_pr_summary_is_part_of_finder_completion() {
+        let mut artifact = ReportingArtifact {
+            no_findings: Some(NoFindings {
+                summary: "No actionable findings.".to_string(),
+                skills_used: Vec::new(),
+            }),
+            ..Default::default()
+        };
+
+        assert!(artifact.finder_complete());
+        assert!(!artifact.finder_complete_with_summary(true));
+
+        artifact.pr_summary = Some(PullRequestSummary {
+            overview: "Adds threaded Buzz delivery.".to_string(),
+            key_changes: vec!["  Publishes one reply per finding.  ".to_string()],
+            affected_areas: vec!["notifications".to_string(), "notifications".to_string()],
+            testing: Some("  Adds routing tests.  ".to_string()),
+        });
+        validate_artifact(&mut artifact).unwrap();
+
+        assert!(artifact.finder_complete_with_summary(true));
+        let summary = artifact.pr_summary.unwrap();
+        assert_eq!(
+            summary.key_changes,
+            vec!["Publishes one reply per finding."]
+        );
+        assert_eq!(summary.affected_areas, vec!["notifications"]);
+        assert_eq!(summary.testing.as_deref(), Some("Adds routing tests."));
     }
 
     #[test]

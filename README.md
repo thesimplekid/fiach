@@ -229,7 +229,59 @@ Only report concrete PR-introduced issues.
 
 Lane names and custom prompt keys are normalized before matching, so `Cashu Mint`, `cashu_mint`, and `cashu-mint` all refer to the same lane. If a lane has no custom prompt, Fiach uses a built-in focus prompt for known lanes such as `security`, `correctness`, `concurrency`, `api-compat`, `tests`, `performance`, and `observability`; unknown lanes get a generic focus prompt.
 
+The built-in `summary` lane produces a neutral structured description of what
+the PR changes. It does not make a review decision and is stored separately
+from findings. Buzz delivery enables this lane automatically.
+
 The finder launches Goose delegate subagents for the lanes, collects their notes, deduplicates candidates, and then the parent finder is the only agent allowed to call `submit_finding` or `submit_no_findings`. The verifier, Markdown report, duplicate suppression, and PR comments remain unified.
+
+### Buzz Review Threads
+
+Fiach can publish completed reviews to Buzz through the embedded
+`buzz-client` and `buzz-sdk` libraries in the trusted host process. General
+review personas create a root message in the public channel containing the PR
+summary, followed by one direct thread reply for each verifier-approved,
+non-duplicate finding. Security personas create a separate thread in the
+configured private channel, and only when they have verified findings.
+Security content never falls back to the public channel.
+
+```toml
+[daemon]
+personas = ["builtin:pr-review", "builtin:security"]
+
+[daemon.buzz]
+relay_url = "https://buzz.example.com"
+public_channel = "00000000-0000-0000-0000-000000000001"
+security_channel = "00000000-0000-0000-0000-000000000002"
+private_key_env = "FIACH_BUZZ_PRIVATE_KEY"
+```
+
+Set `FIACH_BUZZ_PRIVATE_KEY` in the Fiach service environment and ensure that
+identity is a member of both channels. `auth_tag_env` may name an environment
+variable containing a NIP-OA auth tag when the identity is managed. Buzz
+delivery is additive to `report_mode`; a delivery failure is logged without
+changing the completed GitHub review result.
+
+For the NixOS module, enable the dedicated Buzz options:
+
+```nix
+services.fiach = {
+  enable = true;
+  personas = [ "builtin:pr-review" "builtin:security" ];
+
+  buzz = {
+    enable = true;
+    relayUrl = "https://buzz.example.com";
+    publicChannel = "00000000-0000-0000-0000-000000000001";
+    securityChannel = "00000000-0000-0000-0000-000000000002";
+  };
+};
+```
+
+The module writes `[daemon.buzz]` and defaults Buzz-enabled services without an
+explicit `personas` list to the general PR-review and security personas. No
+Buzz CLI package is required. Put `FIACH_BUZZ_PRIVATE_KEY` (and the optional
+auth-tag variable) in `services.fiach.environmentFile`.
 
 ### Structured Reporting and Verification
 

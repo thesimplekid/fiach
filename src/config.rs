@@ -81,6 +81,7 @@ pub struct DaemonConfig {
     pub trigger_mention: Option<String>,
     pub allowed_mention_users: Option<Vec<String>>,
     pub pr_limit: Option<u32>,
+    pub buzz: Option<BuzzConfig>,
     // Sandbox options
     pub sandbox_rootfs: Option<PathBuf>,
     pub sandbox_network: Option<String>,
@@ -119,6 +120,27 @@ pub struct ReviewConfig {
     pub max_cost_usd: Option<f64>,
     pub input_price_per_m: Option<f64>,
     pub output_price_per_m: Option<f64>,
+    pub buzz: Option<BuzzConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct BuzzConfig {
+    /// Buzz relay URL. When omitted, `BUZZ_RELAY_URL` or the local relay
+    /// default is used.
+    pub relay_url: Option<String>,
+    /// Channel UUID for non-security PR summary threads.
+    pub public_channel: Option<String>,
+    /// Private channel UUID for verified security finding threads.
+    pub security_channel: Option<String>,
+    /// Environment variable containing the Buzz reviewer private key.
+    #[serde(default = "default_buzz_private_key_env")]
+    pub private_key_env: String,
+    /// Optional environment variable containing a NIP-OA auth tag.
+    pub auth_tag_env: Option<String>,
+}
+
+fn default_buzz_private_key_env() -> String {
+    "FIACH_BUZZ_PRIVATE_KEY".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,6 +342,34 @@ cashu-mint = "Focus on mint quote idempotency."
                 .map(String::as_str),
             Some("Focus on mint quote idempotency.")
         );
+    }
+
+    #[test]
+    fn config_loads_separate_public_and_security_buzz_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fiach.toml");
+        std::fs::write(
+            &path,
+            r#"
+[daemon.buzz]
+relay_url = "https://buzz.example.com"
+public_channel = "00000000-0000-0000-0000-000000000001"
+security_channel = "00000000-0000-0000-0000-000000000002"
+"#,
+        )
+        .unwrap();
+
+        let config = FiachConfig::load(Some(&path)).unwrap();
+        let buzz = config.daemon.unwrap().buzz.unwrap();
+        assert_eq!(
+            buzz.public_channel.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(
+            buzz.security_channel.as_deref(),
+            Some("00000000-0000-0000-0000-000000000002")
+        );
+        assert_eq!(buzz.private_key_env, "FIACH_BUZZ_PRIVATE_KEY");
     }
 
     #[test]

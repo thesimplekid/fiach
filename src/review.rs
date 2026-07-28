@@ -318,6 +318,8 @@ pub struct ReviewParams {
     pub retry_delay_secs: u64,
     /// Configuration for disclosing the report
     pub disclose_config: disclose::DiscloseConfig,
+    /// Optional Buzz channel thread delivery.
+    pub buzz_config: Option<crate::config::BuzzConfig>,
     /// Run a second verifier pass before disclosure when findings would notify.
     pub verify_findings: bool,
     pub context_groups: std::collections::HashMap<String, crate::config::ContextGroup>,
@@ -388,6 +390,9 @@ fn normalize_review_lane_prompts(prompts: &HashMap<String, String>) -> HashMap<S
 
 fn review_lane_focus(lane: &str) -> &'static str {
     match lane {
+        "summary" | "pr-summary" => {
+            "a neutral, reader-friendly explanation of the PR's intent, key changes, affected components, and test changes without making a review judgment"
+        }
         "security" => {
             "security vulnerabilities, privilege boundaries, input validation, authentication, authorization, secret handling, and exploitability"
         }
@@ -448,17 +453,33 @@ fn review_lane_prompt(
         .join("\n");
     let lane_names = lanes
         .iter()
+        .filter(|lane| lane.as_str() != "summary" && lane.as_str() != "pr-summary")
         .map(|lane| format!("`{lane}`"))
         .collect::<Vec<_>>()
         .join(", ");
+    let has_summary_lane = lanes
+        .iter()
+        .any(|lane| lane == "summary" || lane == "pr-summary");
+    let summary_instructions = if has_summary_lane {
+        "For the `summary`/`pr-summary` delegate, return only a concise JSON object in this shape: `{\"overview\":\"...\",\"key_changes\":[\"...\"],\"affected_areas\":[\"...\"],\"testing\":\"...\"}`. Describe what the PR changes neutrally; do not include review findings, approval language, severity, or risk judgments. After loading it, the parent must call `submit_pr_summary` exactly once with that content.\n\
+         "
+    } else {
+        ""
+    };
+    let candidate_lane_names = if lane_names.is_empty() {
+        "the non-summary lanes".to_string()
+    } else {
+        lane_names
+    };
 
     format!(
         "\n\nPARALLEL REVIEW LANES:\n\
          Run focused Goose delegate subagents for these lanes before submitting the final structured result:\n\
          {lane_list}\n\n\
          Use the `delegate` tool for the lane work. Start up to {max_review_lanes} lane delegates concurrently with `async: true`, then use `load(source: task_id)` to collect each result. If there are more lanes than the concurrency limit, run them in batches until every lane has returned.\n\
-         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and begin its instructions with `Review lane: <lane>` so host logs can identify lane execution. Give delegates read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate must inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context, and return only a concise JSON object for its lane in this shape: `{{\"status\":\"candidates\",\"candidates\":[...]}}` when it found lane candidates, or `{{\"status\":\"no_findings\",\"candidates\":[]}}` when it found none. Candidate objects must name the PR-introduced root cause, affected diff location, impact, confidence, and concrete fix.\n\
-         After all lane results are loaded, you are the only agent that synthesizes and submits. Do not call `submit_finding` or `submit_no_findings` until every lane result has been loaded and every lane candidate has either been retained as a structured finding or explicitly discarded as weak, duplicate, or not rooted in `.pr_diff.txt`. Deduplicate candidates across {lane_names}, discard weak or duplicate notes, verify every retained root cause is in `.pr_diff.txt`, add `lane:<name>` to `skills_used` for the lanes that contributed to each retained candidate, then call `submit_finding` for each candidate or `submit_no_findings` if all lanes found nothing actionable.",
+         For each delegate, set `extensions` to `[\"developer\", \"summon\"]`, keep the working directory at the checked-out PR workspace, and begin its instructions with `Review lane: <lane>` so host logs can identify lane execution. Give delegates read-only instructions. Delegates may use `load` for relevant domain knowledge, but must not call `submit_pr_summary`, `submit_finding`, `submit_no_findings`, `submit_verdict`, post comments, modify files, run tests/builds/compilers/interpreters, or disclose anything. Each delegate must inspect `.pr_diff.txt`, use `git diff {diff_base}...HEAD --name-only` and `BASE_BRANCH={diff_base} ./safe_diff.sh <single_file_path>` when it needs larger file context.\n\
+         {summary_instructions}For every non-summary delegate, return only a concise JSON object in this shape: `{{\"status\":\"candidates\",\"candidates\":[...]}}` when it found lane candidates, or `{{\"status\":\"no_findings\",\"candidates\":[]}}` when it found none. Candidate objects must name the PR-introduced root cause, affected diff location, impact, confidence, and concrete fix.\n\
+         After all lane results are loaded, you are the only agent that synthesizes and submits. Do not call `submit_finding` or `submit_no_findings` until every lane result has been loaded and every lane candidate has either been retained as a structured finding or explicitly discarded as weak, duplicate, from the summary lane, or not rooted in `.pr_diff.txt`. Deduplicate candidates across {candidate_lane_names}, discard weak or duplicate notes, verify every retained root cause is in `.pr_diff.txt`, add `lane:<name>` to `skills_used` for the lanes that contributed to each retained candidate, then call `submit_finding` for each candidate or `submit_no_findings` if all lanes found nothing actionable.",
     )
 }
 
@@ -1423,6 +1444,9 @@ pub async fn run_review(
         &diff_base,
     );
     let normalized_review_lanes = normalize_review_lanes(&params.review_lanes);
+    let require_pr_summary = normalized_review_lanes
+        .iter()
+        .any(|lane| lane == "summary" || lane == "pr-summary");
     if !normalized_review_lanes.is_empty() {
         tracing::info!(
             repo = %params.repo,
@@ -1760,7 +1784,11 @@ pub async fn run_review(
                             }
                         }
                         None => {
-                            if reporting_artifact.lock().await.finder_complete() {
+                            if reporting_artifact
+                                .lock()
+                                .await
+                                .finder_complete_with_summary(require_pr_summary)
+                            {
                                 return Ok(()); // Stream finished successfully
                             }
 
@@ -1785,11 +1813,11 @@ pub async fn run_review(
                             } else {
                                 match last_assistant_text.as_deref() {
                                     Some(text) if !text.trim().is_empty() => format!(
-                                        "You stopped before submitting a structured review result. Continue from where you left off. If you are done reviewing, call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using a reporting tool. Your last visible message was:
+                                        "You stopped before submitting a complete structured review result. Continue from where you left off. If a summary lane was requested, call `submit_pr_summary`. Then call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using the required reporting tools. Your last visible message was:
 
 {text}"
                                     ),
-                                    _ => "You stopped before submitting a structured review result. Continue the review and call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using a reporting tool.".to_string(),
+                                    _ => "You stopped before submitting a complete structured review result. Continue the review, call `submit_pr_summary` if a summary lane was requested, and call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using the required reporting tools.".to_string(),
                                 }
                             };
 
@@ -1885,6 +1913,15 @@ pub async fn run_review(
     // 10. Build structured artifact, verify candidates, and render Markdown.
     let report_file = std::path::Path::new(&report_path);
     let mut artifact = reporting_artifact.lock().await.clone();
+
+    if require_pr_summary && artifact.pr_summary.is_none() {
+        tracing::warn!(
+            repo = %params.repo,
+            pr = params.pr_number,
+            review_kind = %params.review_kind,
+            "Summary lane did not submit a structured PR summary"
+        );
+    }
 
     if !artifact.finder_complete() && report_file.exists() {
         tracing::warn!(
@@ -2193,7 +2230,7 @@ async fn add_reporting_extension(agent: &Agent, session_id: &str) -> Result<()> 
         description: "Structured Fiach review reporting tools".to_string(),
         tools: reporting::reporting_tools(),
         instructions: Some(
-            "Use these tools to submit structured review results to Fiach. Finder passes call `submit_finding` once per candidate or `submit_no_findings`. Verifier passes call `submit_verdict` once per candidate finding. These tools do not post to GitHub."
+            "Use these tools to submit structured review results to Fiach. Finder passes with a summary lane call `submit_pr_summary` once, then call `submit_finding` once per candidate or `submit_no_findings`. Verifier passes call `submit_verdict` once per candidate finding. These tools do not post to GitHub or Buzz."
                 .to_string(),
         ),
         bundled: Some(true),
@@ -2222,6 +2259,23 @@ async fn handle_reporting_tool_requests(
         };
 
         let result = match tool_call.name.as_ref() {
+            "submit_pr_summary" if phase == ReviewPhase::Finder => {
+                match parse_tool_arguments::<reporting::PullRequestSummary>(
+                    tool_call.arguments.clone(),
+                ) {
+                    Ok(mut summary) => {
+                        if let Err(error) = summary.validate() {
+                            CallToolResult::error(vec![Content::text(error.to_string())])
+                        } else {
+                            artifact.lock().await.pr_summary = Some(summary);
+                            CallToolResult::success(vec![Content::text(
+                                "accepted pull request summary",
+                            )])
+                        }
+                    }
+                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+                }
+            }
             "submit_finding" if phase == ReviewPhase::Finder => {
                 match parse_tool_arguments::<reporting::FindingInput>(tool_call.arguments.clone()) {
                     Ok(input) => {
@@ -2328,7 +2382,8 @@ async fn handle_reporting_tool_requests(
                     Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
                 }
             }
-            "submit_finding"
+            "submit_pr_summary"
+            | "submit_finding"
             | "submit_no_findings"
             | "submit_verdict"
             | "submit_duplicate_decision" => CallToolResult::error(vec![Content::text(format!(
@@ -3397,6 +3452,15 @@ Reviewed the PR and found no vulnerabilities.
         assert!(prompt.contains("you are the only agent that synthesizes and submits"));
         assert!(prompt.contains("every lane candidate has either been retained"));
         assert!(prompt.contains("lane:<name>"));
+    }
+
+    #[test]
+    fn summary_lane_requires_neutral_structured_pr_summary() {
+        let prompt = review_lane_prompt(&["summary".to_string()], &HashMap::new(), 1, "main");
+        assert!(prompt.contains("submit_pr_summary"));
+        assert!(prompt.contains("\"overview\""));
+        assert!(prompt.contains("do not include review findings"));
+        assert!(prompt.contains("neutral"));
     }
 
     #[test]

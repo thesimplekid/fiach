@@ -106,6 +106,10 @@ impl PersonaSource {
             }
         }
     }
+
+    pub fn is_security(&self) -> bool {
+        matches!(self, Self::BuiltinSecurity)
+    }
 }
 
 fn slugify(value: &str) -> String {
