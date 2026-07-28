@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -10,6 +11,49 @@ const COMMIT_STATE: TableDefinition<&str, &str> = TableDefinition::new("commit_s
 const SCHEMA_VERSION: TableDefinition<&str, u64> = TableDefinition::new("schema_version");
 const CURRENT_SCHEMA_VERSION: u64 = 2;
 pub const DEFAULT_REVIEW_KIND: &str = "default";
+
+static OPEN_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+
+fn database_registry_key(db_path: &Path) -> Result<PathBuf> {
+    if db_path.exists() {
+        return std::fs::canonicalize(db_path)
+            .with_context(|| format!("Failed to resolve database path {}", db_path.display()));
+    }
+
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = db_path.file_name().with_context(|| {
+        format!(
+            "Database path must include a file name: {}",
+            db_path.display()
+        )
+    })?;
+    Ok(std::fs::canonicalize(parent)
+        .with_context(|| format!("Failed to resolve database directory {}", parent.display()))?
+        .join(file_name))
+}
+
+fn open_database(db_path: &Path) -> Result<Arc<Database>> {
+    let key = database_registry_key(db_path)?;
+    let databases = OPEN_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut databases = databases
+        .lock()
+        .map_err(|_| anyhow::anyhow!("State database registry lock poisoned"))?;
+
+    if let Some(database) = databases.get(&key).and_then(Weak::upgrade) {
+        return Ok(database);
+    }
+
+    let database = Arc::new(
+        Database::create(db_path)
+            .with_context(|| format!("Failed to open state database at {}", db_path.display()))?,
+    );
+    databases.retain(|_, database| database.strong_count() > 0);
+    databases.insert(key, Arc::downgrade(&database));
+    Ok(database)
+}
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ArtifactPaths {
@@ -299,7 +343,7 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
     }
 
     with_retries(|| {
-        let db = Database::create(db_path).context("Failed to open redb database")?;
+        let db = open_database(db_path).context("Failed to open redb database")?;
 
         let read_txn = db.begin_read()?;
         let table = match read_txn.open_table(PR_STATE) {
@@ -417,7 +461,7 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
 /// Records the completed review metadata in the database.
 pub fn mark_reviewed(db_path: &Path, repo: &str, pr: u64, metadata: &ReviewMetadata) -> Result<()> {
     with_retries(|| {
-        let db = Database::create(db_path).context("Failed to open or create redb database")?;
+        let db = open_database(db_path).context("Failed to open or create redb database")?;
 
         let write_txn = db.begin_write()?;
         {
@@ -456,11 +500,11 @@ pub fn lock_for_review(
     timeout_mins: u64,
 ) -> Result<bool> {
     if !db_path.exists() {
-        // Proceed and let Database::create handle it
+        // Proceed and let open_database create it.
     }
 
     with_retries(|| {
-        let db = Database::create(db_path).context("Failed to open or create redb database")?;
+        let db = open_database(db_path).context("Failed to open or create redb database")?;
         let write_txn = db.begin_write()?;
 
         {
@@ -555,7 +599,7 @@ pub fn get_pr_review(
     }
 
     with_retries(|| {
-        let db = Database::create(db_path).context("Failed to open redb database")?;
+        let db = open_database(db_path).context("Failed to open redb database")?;
         let read_txn = db.begin_read()?;
 
         let table = match read_txn.open_table(PR_STATE) {
@@ -585,7 +629,7 @@ pub fn get_commit_review(
     }
 
     with_retries(|| {
-        let db = Database::create(db_path).context("Failed to open redb database")?;
+        let db = open_database(db_path).context("Failed to open redb database")?;
         let read_txn = db.begin_read()?;
 
         let table = match read_txn.open_table(COMMIT_STATE) {
@@ -611,7 +655,7 @@ pub fn list_reviews(db_path: &Path) -> Result<Vec<(String, u64, ReviewMetadata)>
     }
 
     with_retries(|| {
-        let db = Database::create(db_path).context("Failed to open redb database")?;
+        let db = open_database(db_path).context("Failed to open redb database")?;
         let read_txn = db.begin_read()?;
 
         let table = match read_txn.open_table(PR_STATE) {
@@ -649,10 +693,7 @@ impl RedbStateStore {
     pub fn open(db_path: impl Into<PathBuf>, reports_dir: Option<&Path>) -> Result<Self> {
         let db_path = db_path.into();
         let existed = db_path.exists();
-        let database =
-            Arc::new(Database::create(&db_path).with_context(|| {
-                format!("Failed to open state database at {}", db_path.display())
-            })?);
+        let database = open_database(&db_path)?;
         let store = Self { database, db_path };
         store.migrate_if_needed(existed, reports_dir)?;
         Ok(store)
@@ -991,6 +1032,14 @@ mod tests {
     }
 
     #[test]
+    fn relative_database_path_uses_current_directory_registry_key() {
+        assert_eq!(
+            database_registry_key(Path::new("state.redb")).unwrap(),
+            std::env::current_dir().unwrap().join("state.redb")
+        );
+    }
+
+    #[test]
     fn persona_review_kind_uses_scoped_keys() {
         assert_eq!(
             pr_state_key("owner/repo", 42, "security"),
@@ -1171,6 +1220,22 @@ mod tests {
             .unwrap();
         assert_eq!(locked.status, "in_progress");
         assert_eq!(locked.retry_count, 2);
+    }
+
+    #[test]
+    fn legacy_state_operations_share_database_with_open_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let _store = RedbStateStore::open(&db_path, None).unwrap();
+        let record = metadata("abcdef", "confirmed", 0);
+
+        mark_reviewed(&db_path, "owner/repo", 42, &record).unwrap();
+
+        assert_eq!(
+            should_review(&db_path, "owner/repo", 42, "abcdef", "security", false, 30,).unwrap(),
+            ReviewDecision::Skip
+        );
+        assert_eq!(list_reviews(&db_path).unwrap().len(), 1);
     }
 
     #[tokio::test]
