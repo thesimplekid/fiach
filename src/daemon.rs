@@ -857,6 +857,7 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
                 retry_count: 0,
                 artifacts: crate::state::ArtifactPaths::default(),
                 disclosure_url: None,
+                buzz_thread: None,
                 failure_stage: None,
             };
             let _ = crate::state::mark_reviewed(&params.db_path, repo, job.pr.number, &meta);
@@ -1198,6 +1199,7 @@ async fn process_daemon_job(
                     retry_count: retry_count_for_attempt,
                     artifacts: crate::state::ArtifactPaths::default(),
                     disclosure_url: None,
+                    buzz_thread: None,
                     failure_stage: Some("execution".to_string()),
                 };
                 let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);

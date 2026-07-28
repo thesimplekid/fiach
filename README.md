@@ -29,7 +29,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 
 ## 🛠 Prerequisites
 
-- **Rust:** `1.94.0` (or use the provided Nix flake: `nix develop`)
+- **Rust:** `1.94.1` (or use the provided Nix flake: `nix develop`)
 - **GitHub CLI (`gh`):** Must be installed and authenticated (`gh auth login`).
 - **Environment Variables:**
   - `OPENROUTER_API_KEY`: For default OpenRouter LLM access.
@@ -260,7 +260,10 @@ Set `FIACH_BUZZ_PRIVATE_KEY` in the Fiach service environment and ensure that
 identity is a member of both channels. `auth_tag_env` may name an environment
 variable containing a NIP-OA auth tag when the identity is managed. Buzz
 delivery is additive to `report_mode`; a delivery failure is logged without
-changing the completed GitHub review result.
+changing the completed GitHub review result. Re-reviews of the same PR and
+persona reuse the original Buzz summary thread. Fiach stores the root event and
+delivered finding identities in its review database, then appends only new
+findings after later commits.
 
 For the NixOS module, enable the dedicated Buzz options:
 

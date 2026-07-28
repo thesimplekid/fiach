@@ -40,7 +40,7 @@
 
           # Toolchains
           # latest stable
-          stable_toolchain = pkgs.rust-bin.stable."1.94.0".default.override {
+          stable_toolchain = pkgs.rust-bin.stable."1.94.1".default.override {
             targets = [
               "wasm32-unknown-unknown"
             ];
@@ -115,7 +115,7 @@
               lockFile = ./Cargo.lock;
               outputHashes = {
                 "buzz-client-0.1.0" = "sha256-qxOkoR44k3pr9+TmRSZWmRZRXt+56ohCrE4zwF+/nMM=";
-                "goose-1.39.0" = "sha256-7CXLvfY2jYUB9IG/Z1lPiqwZ7UwIypq32ZLq1SsnHQI=";
+                "goose-1.44.0" = "sha256-/UTdXth/o9IkDx2Amf645vasaknIhYpnFIuoqLfIgfU=";
               };
             };
 

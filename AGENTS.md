@@ -47,7 +47,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 
 ## Development Setup
 
-- Requires **Rust 1.94.0** stable (provided via Nix shell `nix develop`).
+- Requires **Rust 1.94.1** stable (provided via Nix shell `nix develop`).
 - Requires `gh` CLI to be authenticated (`gh auth login`).
 - Requires `.env` or service environment containing `GITHUB_TOKEN` and the selected provider API key (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`).
 

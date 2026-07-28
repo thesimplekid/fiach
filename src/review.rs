@@ -9,6 +9,7 @@ use futures::StreamExt;
 use goose::agents::{Agent, AgentEvent, ExtensionConfig, SessionConfig};
 use goose::config::GooseMode;
 use goose::conversation::message::{Message, MessageContent};
+use goose::model_config::model_config_from_user_config;
 use goose::providers::canonical::maybe_get_canonical_model;
 use goose::providers::create_with_named_model;
 use goose::session::{Session, SessionType};
@@ -1161,7 +1162,9 @@ pub async fn run_review(
     }
 
     // 2. Create the configured LLM provider
-    let provider = create_with_named_model(&params.provider, &params.model, Vec::new())
+    let model_config = model_config_from_user_config(&params.provider, &params.model)
+        .context("Failed to configure finder model")?;
+    let provider = create_with_named_model(&params.provider, Vec::new())
         .await
         .with_context(|| format!("Failed to create {} provider", params.provider))?;
     let (input_price_per_m, output_price_per_m) = resolve_price_overrides(
@@ -1189,7 +1192,7 @@ pub async fn run_review(
 
     // 4. Set provider on the session
     agent
-        .update_provider(provider.clone(), &session.id)
+        .update_provider(provider.clone(), model_config.clone(), &session.id)
         .await
         .context("Failed to update provider")?;
 
@@ -1238,11 +1241,9 @@ pub async fn run_review(
                         goose::conversation::message::Message::user().with_text(&prompt);
 
                     // Call the LLM to pick the skill
-                    let model_config = provider.get_model_config();
                     match provider
                         .complete(
                             &model_config,
-                            "skill-discovery",
                             "You are an expert system orchestrator.",
                             &[discovery_message],
                             &[],
@@ -2100,6 +2101,7 @@ pub async fn run_review(
                     sandbox_log: None,
                 },
                 disclosure_url: None,
+                buzz_thread: None,
                 failure_stage: None,
             },
             should_notify,
@@ -2647,7 +2649,9 @@ struct DedupeParams<'a> {
 }
 
 async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> {
-    let provider = create_with_named_model(params.provider_name, params.model, Vec::new())
+    let model_config = model_config_from_user_config(params.provider_name, params.model)
+        .context("Failed to configure duplicate suppression model")?;
+    let provider = create_with_named_model(params.provider_name, Vec::new())
         .await
         .with_context(|| {
             format!(
@@ -2670,7 +2674,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
         .await
         .context("Failed to create duplicate suppression session")?;
     agent
-        .update_provider(provider, &session.id)
+        .update_provider(provider, model_config, &session.id)
         .await
         .context("Failed to update duplicate suppression provider")?;
     add_reporting_extension(&agent, &session.id).await?;
@@ -2870,7 +2874,9 @@ struct VerificationParams<'a> {
 }
 
 async fn run_verification_pass(params: VerificationParams<'_>) -> Result<VerificationStats> {
-    let provider = create_with_named_model(params.provider_name, params.model, Vec::new())
+    let model_config = model_config_from_user_config(params.provider_name, params.model)
+        .context("Failed to configure verifier model")?;
+    let provider = create_with_named_model(params.provider_name, Vec::new())
         .await
         .with_context(|| {
             format!(
@@ -2893,7 +2899,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         .await
         .context("Failed to create verifier session")?;
     agent
-        .update_provider(provider, &session.id)
+        .update_provider(provider, model_config, &session.id)
         .await
         .context("Failed to update verifier provider")?;
 

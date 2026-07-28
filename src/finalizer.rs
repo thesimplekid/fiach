@@ -150,23 +150,54 @@ impl ReviewFinalizer {
             tracing::warn!(error = %error, "Failed to finalize mention reaction");
         }
 
-        if let Some(config) = &spec.buzz
-            && let Err(error) = crate::buzz::publish_review_thread(
-                config,
-                spec.security_review,
-                &metadata,
-                &outcome.artifact,
-                &outcome.policy,
-            )
-            .await
-        {
-            tracing::warn!(
-                repo = %spec.repository,
-                pr = spec.pr_number,
-                review_kind = %spec.review_kind,
-                error = %error,
-                "Failed to publish Buzz review thread"
-            );
+        if let Some(config) = &spec.buzz {
+            match state::get_pr_review(
+                &spec.db_path,
+                &spec.repository,
+                spec.pr_number,
+                &spec.review_kind,
+            ) {
+                Ok(previous) => {
+                    metadata.buzz_thread = previous.and_then(|record| record.buzz_thread);
+                    match crate::buzz::publish_review_thread(
+                        config,
+                        spec.security_review,
+                        &metadata,
+                        &outcome.artifact,
+                        &outcome.policy,
+                        metadata.buzz_thread.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(Some(receipt)) => {
+                            metadata.buzz_thread = Some(state::BuzzThreadState {
+                                channel_id: receipt.channel_id,
+                                root_event_id: receipt.root_event_id,
+                                published_finding_keys: receipt.published_finding_keys,
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                repo = %spec.repository,
+                                pr = spec.pr_number,
+                                review_kind = %spec.review_kind,
+                                error = %error,
+                                "Failed to publish Buzz review thread"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        repo = %spec.repository,
+                        pr = spec.pr_number,
+                        review_kind = %spec.review_kind,
+                        error = %error,
+                        "Skipped Buzz publication because existing thread state could not be loaded"
+                    );
+                }
+            }
         }
 
         state::mark_reviewed(&spec.db_path, &spec.repository, spec.pr_number, &metadata)

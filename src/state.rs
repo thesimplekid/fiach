@@ -126,7 +126,17 @@ pub struct ReviewRecord {
     #[serde(default)]
     pub disclosure_url: Option<String>,
     #[serde(default)]
+    pub buzz_thread: Option<BuzzThreadState>,
+    #[serde(default)]
     pub failure_stage: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct BuzzThreadState {
+    pub channel_id: String,
+    pub root_event_id: String,
+    #[serde(default)]
+    pub published_finding_keys: Vec<String>,
 }
 
 /// Compatibility name retained while callers migrate to the domain-oriented record.
@@ -413,8 +423,15 @@ pub fn mark_reviewed(db_path: &Path, repo: &str, pr: u64, metadata: &ReviewMetad
         {
             let mut pr_table = write_txn.open_table(PR_STATE)?;
             let pr_key = pr_state_key(repo, pr, &metadata.review_kind);
+            let mut metadata = metadata.clone();
+            if metadata.buzz_thread.is_none() {
+                metadata.buzz_thread = pr_table
+                    .get(pr_key.as_str())?
+                    .and_then(|value| serde_json::from_str::<ReviewMetadata>(value.value()).ok())
+                    .and_then(|previous| previous.buzz_thread);
+            }
             let json_str =
-                serde_json::to_string(metadata).context("Failed to serialize ReviewMetadata")?;
+                serde_json::to_string(&metadata).context("Failed to serialize ReviewMetadata")?;
             pr_table.insert(pr_key.as_str(), json_str.as_str())?;
 
             let mut commit_table = write_txn.open_table(COMMIT_STATE)?;
@@ -474,7 +491,7 @@ pub fn lock_for_review(
                 }
             }
 
-            let metadata = ReviewMetadata {
+            let mut metadata = ReviewMetadata {
                 repository: repo.to_string(),
                 pr_number: pr,
                 review_kind: review_kind.to_string(),
@@ -500,28 +517,21 @@ pub fn lock_for_review(
                 retry_count: 0,
                 artifacts: ArtifactPaths::default(),
                 disclosure_url: None,
+                buzz_thread: None,
                 failure_stage: None,
             };
 
-            let metadata = if let Some(value) = pr_table.get(key.as_str())? {
+            if let Some(value) = pr_table.get(key.as_str())? {
                 let json_str = value.value();
                 if let Ok(previous) = serde_json::from_str::<ReviewMetadata>(json_str) {
+                    metadata.buzz_thread = previous.buzz_thread;
                     if previous.commit_hash == commit_hash
                         && (previous.status == "failed" || previous.status == "in_progress")
                     {
-                        ReviewMetadata {
-                            retry_count: previous.retry_count.saturating_add(1),
-                            ..metadata
-                        }
-                    } else {
-                        metadata
+                        metadata.retry_count = previous.retry_count.saturating_add(1);
                     }
-                } else {
-                    metadata
                 }
-            } else {
-                metadata
-            };
+            }
 
             let json_str =
                 serde_json::to_string(&metadata).context("Failed to serialize ReviewMetadata")?;
@@ -735,6 +745,7 @@ impl RedbStateStore {
                 let mut table = write.open_table(PR_STATE)?;
                 if let Some(value) = table.get(key.as_str())? {
                     let previous: ReviewRecord = serde_json::from_str(value.value())?;
+                    record.buzz_thread = previous.buzz_thread.clone();
                     if previous.status == ReviewStatus::InProgress {
                         let age = time::OffsetDateTime::now_utc()
                             .unix_timestamp()
@@ -775,14 +786,20 @@ impl RedbStateStore {
         self.write_terminal(record).await
     }
 
-    async fn write_terminal(&self, record: ReviewRecord) -> Result<()> {
+    async fn write_terminal(&self, mut record: ReviewRecord) -> Result<()> {
         let database = Arc::clone(&self.database);
         tokio::task::spawn_blocking(move || {
             let write = database.begin_write()?;
-            let json = serde_json::to_string(&record)?;
             {
                 let mut prs = write.open_table(PR_STATE)?;
                 let key = pr_state_key(&record.repository, record.pr_number, &record.review_kind);
+                if record.buzz_thread.is_none() {
+                    record.buzz_thread = prs
+                        .get(key.as_str())?
+                        .and_then(|value| serde_json::from_str::<ReviewRecord>(value.value()).ok())
+                        .and_then(|previous| previous.buzz_thread);
+                }
+                let json = serde_json::to_string(&record)?;
                 prs.insert(key.as_str(), json.as_str())?;
                 let mut commits = write.open_table(COMMIT_STATE)?;
                 let key =
@@ -956,6 +973,7 @@ mod tests {
             retry_count,
             artifacts: ArtifactPaths::default(),
             disclosure_url: None,
+            buzz_thread: None,
             failure_stage: None,
         }
     }
@@ -1078,6 +1096,35 @@ mod tests {
             should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
             ReviewDecision::Skip
         );
+    }
+
+    #[test]
+    fn rereview_preserves_buzz_thread_delivery_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let repo = "owner/repo";
+        let pr = 42;
+        let review_kind = "security";
+        let mut first = metadata("old-commit", "confirmed", 0);
+        first.buzz_thread = Some(BuzzThreadState {
+            channel_id: "private".to_string(),
+            root_event_id: "root-event".to_string(),
+            published_finding_keys: vec!["finding-key".to_string()],
+        });
+        mark_reviewed(&db_path, repo, pr, &first).unwrap();
+
+        assert!(lock_for_review(&db_path, repo, pr, "new-commit", review_kind, 30).unwrap());
+        let locked = get_pr_review(&db_path, repo, pr, review_kind)
+            .unwrap()
+            .unwrap();
+        assert_eq!(locked.buzz_thread, first.buzz_thread);
+
+        let completed = metadata("new-commit", "confirmed", 0);
+        mark_reviewed(&db_path, repo, pr, &completed).unwrap();
+        let stored = get_pr_review(&db_path, repo, pr, review_kind)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.buzz_thread, first.buzz_thread);
     }
 
     #[test]
