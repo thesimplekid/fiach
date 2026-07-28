@@ -137,10 +137,43 @@ pub struct BuzzConfig {
     pub private_key_env: String,
     /// Optional environment variable containing a NIP-OA auth tag.
     pub auth_tag_env: Option<String>,
+    /// Optional inbound review-question listener. It uses the same Buzz
+    /// identity as outbound summaries and findings.
+    pub questions: Option<BuzzQuestionsConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct BuzzQuestionsConfig {
+    /// Whether Fiach should answer cryptographically tagged questions in
+    /// review threads.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional provider override. Defaults to the daemon finder provider.
+    pub provider: Option<String>,
+    /// Optional model override. Defaults to the daemon finder model.
+    pub model: Option<String>,
+    /// Buzz author public keys allowed to ask questions. An empty list allows
+    /// any member who can post in the configured channel.
+    #[serde(default)]
+    pub allowed_pubkeys: Vec<String>,
+    /// Maximum accepted UTF-8 question size.
+    #[serde(default = "default_buzz_question_bytes")]
+    pub max_question_bytes: usize,
+    /// Maximum duration of one model request.
+    #[serde(default = "default_buzz_question_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 fn default_buzz_private_key_env() -> String {
     "FIACH_BUZZ_PRIVATE_KEY".to_string()
+}
+
+fn default_buzz_question_bytes() -> usize {
+    4 * 1024
+}
+
+fn default_buzz_question_timeout_secs() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -355,6 +388,12 @@ cashu-mint = "Focus on mint quote idempotency."
 relay_url = "https://buzz.example.com"
 public_channel = "00000000-0000-0000-0000-000000000001"
 security_channel = "00000000-0000-0000-0000-000000000002"
+
+[daemon.buzz.questions]
+enabled = true
+provider = "openrouter"
+model = "openai/gpt-5-mini"
+allowed_pubkeys = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
 "#,
         )
         .unwrap();
@@ -370,6 +409,13 @@ security_channel = "00000000-0000-0000-0000-000000000002"
             Some("00000000-0000-0000-0000-000000000002")
         );
         assert_eq!(buzz.private_key_env, "FIACH_BUZZ_PRIVATE_KEY");
+        let questions = buzz.questions.unwrap();
+        assert!(questions.enabled);
+        assert_eq!(questions.provider.as_deref(), Some("openrouter"));
+        assert_eq!(questions.model.as_deref(), Some("openai/gpt-5-mini"));
+        assert_eq!(questions.max_question_bytes, 4 * 1024);
+        assert_eq!(questions.timeout_secs, 120);
+        assert_eq!(questions.allowed_pubkeys.len(), 1);
     }
 
     #[test]

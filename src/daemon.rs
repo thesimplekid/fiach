@@ -691,6 +691,31 @@ pub async fn run_daemon(
 
     validate_sandbox_network_capacity(&params)?;
 
+    let question_listener = params
+        .buzz_config
+        .as_ref()
+        .and_then(|config| {
+            config
+                .questions
+                .as_ref()
+                .is_some_and(|questions| questions.enabled)
+                .then(|| config.clone())
+        })
+        .map(|config| {
+            let db_path = params.db_path.clone();
+            let provider = params.provider.clone();
+            let model = params.model.clone();
+            let cancel = cancel_token.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    crate::buzz::run_question_listener(config, &db_path, &provider, &model, cancel)
+                        .await
+                {
+                    tracing::error!(error = %error, "Buzz question listener stopped");
+                }
+            })
+        });
+
     // Ensure gh is authenticated
     let gh_auth = Command::new("gh")
         .arg("auth")
@@ -814,6 +839,10 @@ pub async fn run_daemon(
                 tracing::info!("Sleep interrupted, shutting down");
             }
         }
+    }
+
+    if let Some(listener) = question_listener {
+        let _ = listener.await;
     }
 
     Ok(())

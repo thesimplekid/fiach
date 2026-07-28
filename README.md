@@ -265,6 +265,34 @@ persona reuse the original Buzz summary thread. Fiach stores the root event and
 delivered finding identities in its review database, then appends only new
 findings after later commits.
 
+The daemon can also answer questions about a completed review when its Buzz
+identity is tagged inside the corresponding review thread:
+
+```toml
+[daemon.buzz.questions]
+enabled = true
+provider = "openrouter"             # Defaults to daemon.provider
+model = "openai/gpt-5-mini"         # Defaults to daemon.model
+allowed_pubkeys = []                # Empty allows any channel member
+max_question_bytes = 4096
+timeout_secs = 120
+```
+
+For example, reply in the thread with `@Fiach why was this rated high
+severity?`. Fiach requires the cryptographic Buzz `p` tag produced by a real
+mention; matching plain text is not sufficient. It uses the same private key
+and pubkey that publish summaries and findings, and replies beneath the
+question in the same thread while mentioning the asker.
+
+Questions are matched to the persisted thread root and channel before any model
+request. Public threads receive only their public review artifact, while
+security-thread questions remain scoped to the configured private channel. The
+question model receives the persisted structured review evidence without
+shell, reporting, or GitHub disclosure tools. Processed event IDs and the relay
+cursor are stored in the review database so reconnects do not duplicate
+answers. The Buzz identity must have a profile/channel membership that lets
+clients resolve its display name into the correct pubkey.
+
 For the NixOS module, enable the dedicated Buzz options:
 
 ```nix
@@ -277,6 +305,7 @@ services.fiach = {
     relayUrl = "https://buzz.example.com";
     publicChannel = "00000000-0000-0000-0000-000000000001";
     securityChannel = "00000000-0000-0000-0000-000000000002";
+    questions.enable = true;
   };
 };
 ```

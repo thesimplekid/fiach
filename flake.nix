@@ -159,6 +159,12 @@
                         relayUrl = "https://buzz.example.com";
                         publicChannel = "00000000-0000-0000-0000-000000000001";
                         securityChannel = "00000000-0000-0000-0000-000000000002";
+                        questions = {
+                          enable = true;
+                          provider = "openrouter";
+                          model = "openai/gpt-5-mini";
+                          allowedPubkeys = [ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ];
+                        };
                       };
                       sandbox = {
                         enable = true;
@@ -200,6 +206,10 @@
               grep -F 'public_channel = "00000000-0000-0000-0000-000000000001"' "$config_path" >/dev/null
               grep -F 'security_channel = "00000000-0000-0000-0000-000000000002"' "$config_path" >/dev/null
               grep -F 'private_key_env = "FIACH_BUZZ_PRIVATE_KEY"' "$config_path" >/dev/null
+              grep -F '[daemon.buzz.questions]' "$config_path" >/dev/null
+              grep -F 'enabled = true' "$config_path" >/dev/null
+              grep -F 'model = "openai/gpt-5-mini"' "$config_path" >/dev/null
+              grep -F 'allowed_pubkeys = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]' "$config_path" >/dev/null
               grep -F 'personas = ["builtin:pr-review", "builtin:security"]' "$config_path" >/dev/null
               grep -F 'sandbox_rootfs = ' "$config_path" >/dev/null
               grep -F 'skip_prs = [' "$config_path" >/dev/null
@@ -417,6 +427,40 @@
                 type = lib.types.nullOr lib.types.str;
                 default = null;
                 description = "Optional environment variable in environmentFile containing a NIP-OA auth tag.";
+              };
+
+              questions = {
+                enable = lib.mkEnableOption "thread-scoped Buzz questions about completed reviews";
+
+                provider = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  description = "Optional provider for Buzz review questions. Defaults to services.fiach.provider.";
+                };
+
+                model = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  description = "Optional model for Buzz review questions. Defaults to services.fiach.model.";
+                };
+
+                allowedPubkeys = lib.mkOption {
+                  type = lib.types.listOf lib.types.str;
+                  default = [ ];
+                  description = "Buzz author pubkeys allowed to ask review questions. An empty list allows any member who can post in the configured channel.";
+                };
+
+                maxQuestionBytes = lib.mkOption {
+                  type = lib.types.ints.positive;
+                  default = 4096;
+                  description = "Maximum UTF-8 size of one Buzz review question.";
+                };
+
+                timeoutSecs = lib.mkOption {
+                  type = lib.types.ints.positive;
+                  default = 120;
+                  description = "Maximum duration of one Buzz review-question model request.";
+                };
               };
             };
 
@@ -787,6 +831,17 @@
                       relay_url = cfg.buzz.relayUrl;
                     } // lib.optionalAttrs (cfg.buzz.authTagEnv != null) {
                       auth_tag_env = cfg.buzz.authTagEnv;
+                    } // lib.optionalAttrs cfg.buzz.questions.enable {
+                      questions = {
+                        enabled = true;
+                        allowed_pubkeys = cfg.buzz.questions.allowedPubkeys;
+                        max_question_bytes = cfg.buzz.questions.maxQuestionBytes;
+                        timeout_secs = cfg.buzz.questions.timeoutSecs;
+                      } // lib.optionalAttrs (cfg.buzz.questions.provider != null) {
+                        provider = cfg.buzz.questions.provider;
+                      } // lib.optionalAttrs (cfg.buzz.questions.model != null) {
+                        model = cfg.buzz.questions.model;
+                      };
                     };
                   };
                   configFile = tomlFormat.generate "fiach.toml" {

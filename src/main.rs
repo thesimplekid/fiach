@@ -982,6 +982,7 @@ mod tests {
             security_channel: Some("private".to_string()),
             private_key_env: "FIACH_BUZZ_PRIVATE_KEY".to_string(),
             auth_tag_env: None,
+            questions: None,
         };
         let mut lanes = vec!["correctness".to_string()];
 

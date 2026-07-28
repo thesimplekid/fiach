@@ -8,8 +8,13 @@ use serde::{Deserialize, Serialize};
 
 const PR_STATE: TableDefinition<&str, &str> = TableDefinition::new("pr_state");
 const COMMIT_STATE: TableDefinition<&str, &str> = TableDefinition::new("commit_state");
+const BUZZ_QUESTION_STATE: TableDefinition<&str, &str> =
+    TableDefinition::new("buzz_question_state");
+const BUZZ_QUESTION_CURSOR: TableDefinition<&str, i64> =
+    TableDefinition::new("buzz_question_cursor");
 const SCHEMA_VERSION: TableDefinition<&str, u64> = TableDefinition::new("schema_version");
 const CURRENT_SCHEMA_VERSION: u64 = 2;
+const BUZZ_QUESTION_CURSOR_KEY: &str = "review_questions";
 pub const DEFAULT_REVIEW_KIND: &str = "default";
 
 static OPEN_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
@@ -181,6 +186,13 @@ pub struct BuzzThreadState {
     pub root_event_id: String,
     #[serde(default)]
     pub published_finding_keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct BuzzQuestionReceipt {
+    pub question_event_id: String,
+    pub answer_event_id: Option<String>,
+    pub timestamp: i64,
 }
 
 /// Compatibility name retained while callers migrate to the domain-oriented record.
@@ -683,6 +695,93 @@ pub fn list_reviews(db_path: &Path) -> Result<Vec<(String, u64, ReviewMetadata)>
     })
 }
 
+pub fn find_review_by_buzz_thread(
+    db_path: &Path,
+    channel_id: &str,
+    root_event_id: &str,
+) -> Result<Option<ReviewMetadata>> {
+    Ok(list_reviews(db_path)?
+        .into_iter()
+        .find_map(|(_, _, metadata)| match metadata.buzz_thread.as_ref() {
+            Some(thread)
+                if thread.channel_id == channel_id
+                    && thread.root_event_id.eq_ignore_ascii_case(root_event_id) =>
+            {
+                Some(metadata)
+            }
+            _ => None,
+        }))
+}
+
+pub fn get_or_initialize_buzz_question_cursor(db_path: &Path, now: i64) -> Result<i64> {
+    with_retries(|| {
+        let db = open_database(db_path).context("Failed to open redb database")?;
+        let write = db.begin_write()?;
+        let cursor = {
+            let mut table = write.open_table(BUZZ_QUESTION_CURSOR)?;
+            let existing = table
+                .get(BUZZ_QUESTION_CURSOR_KEY)?
+                .map(|value| value.value());
+            match existing {
+                Some(value) => value,
+                None => {
+                    table.insert(BUZZ_QUESTION_CURSOR_KEY, now)?;
+                    now
+                }
+            }
+        };
+        write.commit()?;
+        Ok(cursor)
+    })
+}
+
+pub fn buzz_question_processed(db_path: &Path, event_id: &str) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+
+    with_retries(|| {
+        let db = open_database(db_path).context("Failed to open redb database")?;
+        let read = db.begin_read()?;
+        let table = match read.open_table(BUZZ_QUESTION_STATE) {
+            Ok(table) => table,
+            Err(_) => return Ok(false),
+        };
+        Ok(table.get(event_id)?.is_some())
+    })
+}
+
+pub fn record_buzz_question(
+    db_path: &Path,
+    event_id: &str,
+    timestamp: i64,
+    answer_event_id: Option<&str>,
+) -> Result<()> {
+    with_retries(|| {
+        let db = open_database(db_path).context("Failed to open redb database")?;
+        let write = db.begin_write()?;
+        {
+            let receipt = BuzzQuestionReceipt {
+                question_event_id: event_id.to_string(),
+                answer_event_id: answer_event_id.map(str::to_string),
+                timestamp,
+            };
+            let json = serde_json::to_string(&receipt)?;
+            let mut questions = write.open_table(BUZZ_QUESTION_STATE)?;
+            questions.insert(event_id, json.as_str())?;
+
+            let mut cursors = write.open_table(BUZZ_QUESTION_CURSOR)?;
+            let current = cursors
+                .get(BUZZ_QUESTION_CURSOR_KEY)?
+                .map(|value| value.value())
+                .unwrap_or(timestamp);
+            cursors.insert(BUZZ_QUESTION_CURSOR_KEY, current.max(timestamp))?;
+        }
+        write.commit()?;
+        Ok(())
+    })
+}
+
 #[derive(Clone)]
 pub struct RedbStateStore {
     database: Arc<Database>,
@@ -1174,6 +1273,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.buzz_thread, first.buzz_thread);
+    }
+
+    #[test]
+    fn buzz_thread_lookup_is_scoped_to_channel_and_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let mut review = metadata("commit", "confirmed", 0);
+        review.buzz_thread = Some(BuzzThreadState {
+            channel_id: "private".to_string(),
+            root_event_id: "ABCDEF".to_string(),
+            published_finding_keys: Vec::new(),
+        });
+        mark_reviewed(&db_path, "owner/repo", 42, &review).unwrap();
+
+        let found = find_review_by_buzz_thread(&db_path, "private", "abcdef")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.repository, "owner/repo");
+        assert!(
+            find_review_by_buzz_thread(&db_path, "public", "abcdef")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn buzz_question_receipts_deduplicate_and_advance_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+
+        assert_eq!(
+            get_or_initialize_buzz_question_cursor(&db_path, 100).unwrap(),
+            100
+        );
+        assert!(!buzz_question_processed(&db_path, "question").unwrap());
+
+        record_buzz_question(&db_path, "question", 120, Some("answer")).unwrap();
+
+        assert!(buzz_question_processed(&db_path, "question").unwrap());
+        assert_eq!(
+            get_or_initialize_buzz_question_cursor(&db_path, 200).unwrap(),
+            120
+        );
     }
 
     #[test]
