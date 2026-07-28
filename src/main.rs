@@ -451,6 +451,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Dependency feature unification enables both built-in Rustls providers.
+    // Select one before any TLS client or server configuration is constructed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Load .env file if present (non-fatal if missing)
     let _ = dotenvy::dotenv();
 

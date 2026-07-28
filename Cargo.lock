@@ -1847,6 +1847,7 @@ dependencies = [
  "redb",
  "reqwest 0.12.28",
  "rmcp",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
