@@ -383,7 +383,7 @@ enum Commands {
         #[arg(long)]
         max_workers: Option<usize>,
 
-        /// Whether to fetch drafts (true), only ready PRs (false), or both (omitted). Default is false.
+        /// Whether to include drafts alongside ready PRs. Default is false.
         #[arg(long)]
         drafts: Option<bool>,
 

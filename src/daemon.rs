@@ -453,8 +453,8 @@ fn pr_search_query(
         parts.push(format!("updated:>={search_date}"));
     }
 
-    if let Some(drafts) = drafts {
-        parts.push(format!("draft:{drafts}"));
+    if drafts == Some(false) {
+        parts.push("draft:false".to_string());
     }
 
     if let Some(mention) = trigger_mention {
@@ -2028,6 +2028,10 @@ mod tests {
             "state:open"
         );
         assert_eq!(
+            pr_search_query("open", false, 120, Some(true), None),
+            "state:open"
+        );
+        assert_eq!(
             pr_search_query("open", false, 120, Some(false), None),
             "state:open draft:false"
         );
@@ -2044,6 +2048,7 @@ mod tests {
     #[test]
     fn pr_search_query_omits_state_filter_for_all() {
         assert_eq!(pr_search_query("all", false, 120, None, None), "");
+        assert_eq!(pr_search_query("all", false, 120, Some(true), None), "");
         assert_eq!(
             pr_search_query("all", false, 120, Some(false), None),
             "draft:false"
