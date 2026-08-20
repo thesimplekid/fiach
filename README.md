@@ -122,11 +122,19 @@ cargo run -- review \
 ### 5. Interacting with the Daemon Web Server
 
 When running the daemon, an interactive web server starts automatically on port `3000` (configurable via `--port`). This allows you to inspect the daemon's history and trigger reviews on demand.
-Set `FIACH_SERVER_TOKEN` to require `Authorization: Bearer <token>` or `X-Fiach-Token: <token>` on all endpoints except `/health`.
+Set `FIACH_SERVER_TOKEN` to require `Authorization: Bearer <token>` or `X-Fiach-Token: <token>` on review and job endpoints. Liveness, readiness, and aggregate metrics remain unauthenticated on the loopback-only listener.
 
 - **Check health:**
   ```bash
   curl http://localhost:3000/health
+  ```
+- **Check readiness:** validates both the durable state store and the in-process scheduler.
+  ```bash
+  curl http://localhost:3000/ready
+  ```
+- **Read Prometheus metrics:** exposes scheduler jobs, durable review status counts, and recorded review cost.
+  ```bash
+  curl http://localhost:3000/metrics
   ```
 - **List all reviewed PRs:**
   ```bash

@@ -58,6 +58,18 @@ pub struct JobSnapshot {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerStats {
+    pub accepting: bool,
+    pub queued: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub cancelled: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionStatus {
     Completed,
@@ -107,6 +119,26 @@ impl<T: Send + 'static> SchedulerHandle<T> {
 
     pub async fn get(&self, job_id: &str) -> Option<JobSnapshot> {
         self.jobs.lock().await.get(job_id).cloned()
+    }
+
+    pub async fn stats(&self) -> SchedulerStats {
+        let jobs = self.jobs.lock().await;
+        let mut stats = SchedulerStats {
+            accepting: !self.sender.is_closed(),
+            total: jobs.len(),
+            ..SchedulerStats::default()
+        };
+        for job in jobs.values() {
+            match job.status {
+                JobStatus::Queued => stats.queued += 1,
+                JobStatus::Running => stats.running += 1,
+                JobStatus::Completed => stats.completed += 1,
+                JobStatus::Failed => stats.failed += 1,
+                JobStatus::Skipped => stats.skipped += 1,
+                JobStatus::Cancelled => stats.cancelled += 1,
+            }
+        }
+        stats
     }
 }
 
@@ -325,6 +357,15 @@ mod tests {
         assert_eq!(
             scheduler.get(&first.job_id).await.unwrap().status,
             JobStatus::Completed
+        );
+        assert_eq!(
+            scheduler.stats().await,
+            SchedulerStats {
+                accepting: true,
+                completed: 1,
+                total: 1,
+                ..SchedulerStats::default()
+            }
         );
     }
 

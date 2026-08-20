@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -79,6 +81,8 @@ fn unauthorized_response() -> axum::response::Response {
 pub async fn start_server(port: u16, state: AppState) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/ready", get(readiness_check))
+        .route("/metrics", get(metrics))
         .route("/reviews", get(get_reviews))
         .route("/review", get(get_review).post(trigger_review))
         .route("/review/content", get(get_review_content))
@@ -96,6 +100,130 @@ pub async fn start_server(port: u16, state: AppState) -> Result<()> {
 
 async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
+}
+
+#[derive(Serialize)]
+struct ReadinessResponse {
+    status: &'static str,
+    scheduler: crate::scheduler::SchedulerStats,
+    reviews: usize,
+}
+
+async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
+    let scheduler = state.scheduler.stats().await;
+    if !scheduler.accepting {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Scheduler is not accepting work",
+        )
+            .into_response();
+    }
+
+    match state.state_store.list().await {
+        Ok(reviews) => (
+            StatusCode::OK,
+            Json(ReadinessResponse {
+                status: "ready",
+                scheduler,
+                reviews: reviews.len(),
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "Readiness check could not read review state");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Review state is unavailable",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let scheduler = state.scheduler.stats().await;
+    match state.state_store.list().await {
+        Ok(reviews) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            render_metrics(&scheduler, &reviews),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "Metrics endpoint could not read review state");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Review state is unavailable",
+            )
+                .into_response()
+        }
+    }
+}
+
+fn render_metrics(
+    scheduler: &crate::scheduler::SchedulerStats,
+    reviews: &[crate::state::ReviewRecord],
+) -> String {
+    let mut output = String::from(
+        "# HELP fiach_scheduler_accepting Whether the scheduler accepts new work.\n\
+         # TYPE fiach_scheduler_accepting gauge\n",
+    );
+    let _ = writeln!(
+        output,
+        "fiach_scheduler_accepting {}",
+        usize::from(scheduler.accepting)
+    );
+    output.push_str(
+        "# HELP fiach_scheduler_jobs Current in-memory jobs by status.\n\
+         # TYPE fiach_scheduler_jobs gauge\n",
+    );
+    for (status, value) in [
+        ("queued", scheduler.queued),
+        ("running", scheduler.running),
+        ("completed", scheduler.completed),
+        ("failed", scheduler.failed),
+        ("skipped", scheduler.skipped),
+        ("cancelled", scheduler.cancelled),
+    ] {
+        let _ = writeln!(
+            output,
+            "fiach_scheduler_jobs{{status=\"{status}\"}} {value}"
+        );
+    }
+
+    let mut review_counts = BTreeMap::from([
+        ("already-reported", 0usize),
+        ("confirmed", 0),
+        ("failed", 0),
+        ("in_progress", 0),
+        ("markdown-only", 0),
+        ("none", 0),
+        ("queued", 0),
+        ("rejected", 0),
+        ("skipped", 0),
+        ("unverified", 0),
+    ]);
+    let mut recorded_cost = 0.0;
+    for review in reviews {
+        *review_counts.entry(review.status.as_str()).or_default() += 1;
+        recorded_cost += review.cost_usd.unwrap_or(0.0);
+    }
+    output.push_str(
+        "# HELP fiach_reviews Current durable review records by status.\n\
+         # TYPE fiach_reviews gauge\n",
+    );
+    for (status, value) in review_counts {
+        let _ = writeln!(output, "fiach_reviews{{status=\"{status}\"}} {value}");
+    }
+    output.push_str(
+        "# HELP fiach_recorded_review_cost_usd Sum of cost recorded on current durable reviews.\n\
+         # TYPE fiach_recorded_review_cost_usd gauge\n",
+    );
+    let _ = writeln!(output, "fiach_recorded_review_cost_usd {recorded_cost:.6}");
+    output
 }
 
 async fn get_reviews(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -294,5 +422,22 @@ mod tests {
         headers.clear();
         headers.insert("x-fiach-token", "secret".parse().unwrap());
         assert!(request_authorized(&headers, Some("secret")));
+    }
+
+    #[test]
+    fn metrics_render_scheduler_and_cost_gauges() {
+        let scheduler = crate::scheduler::SchedulerStats {
+            accepting: true,
+            queued: 2,
+            running: 1,
+            ..crate::scheduler::SchedulerStats::default()
+        };
+
+        let metrics = render_metrics(&scheduler, &[]);
+
+        assert!(metrics.contains("fiach_scheduler_accepting 1"));
+        assert!(metrics.contains("fiach_scheduler_jobs{status=\"queued\"} 2"));
+        assert!(metrics.contains("fiach_scheduler_jobs{status=\"running\"} 1"));
+        assert!(metrics.contains("fiach_recorded_review_cost_usd 0.000000"));
     }
 }
