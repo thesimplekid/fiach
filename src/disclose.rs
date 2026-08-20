@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::process::Command;
 
+use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
 use crate::reporting::{DisclosurePolicy, InlineComment, ReportingArtifact};
 
 const PR_REACTION_TIMEOUT_SECS: u64 = 30;
@@ -348,7 +349,7 @@ async fn post_pr_review(
     let output = Command::new("gh")
         .args(["api", &endpoint, "--method", "POST", "--input"])
         .arg(input.path())
-        .output()
+        .output_bounded("posting a structured pull request review")
         .await
         .context("Failed to run `gh api` for PR review")?;
 
@@ -561,7 +562,7 @@ async fn post_pr_comment(report_path: &Path, repo: &str, pr_number: u64) -> Resu
             "--body-file",
             report_path_str,
         ])
-        .output()
+        .output_bounded("posting a pull request comment")
         .await
         .context("Failed to run `gh pr comment`")?;
 
@@ -604,7 +605,7 @@ async fn create_sync_pr(
     // Clone the sync repo
     let output = Command::new("gh")
         .args(["repo", "clone", sync_repo, repo_dir_str])
-        .output()
+        .output_with_timeout("cloning the disclosure repository", LONG_COMMAND_TIMEOUT)
         .await
         .context("Failed to run `gh repo clone`")?;
 
@@ -628,7 +629,7 @@ async fn create_sync_pr(
     let output = Command::new("git")
         .args(["ls-remote", "--heads", "origin", &branch_name])
         .current_dir(&repo_dir)
-        .output()
+        .output_bounded("checking for an existing disclosure branch")
         .await
         .context("Failed to run git ls-remote")?;
 
@@ -680,7 +681,7 @@ async fn create_sync_pr(
     let output = Command::new("git")
         .args(["add", "."])
         .current_dir(&repo_dir)
-        .output()
+        .output_bounded("staging the disclosure report")
         .await
         .context("Failed to run git add")?;
 
@@ -712,7 +713,7 @@ async fn create_sync_pr(
             &commit_msg,
         ])
         .current_dir(&repo_dir)
-        .output()
+        .output_bounded("committing the disclosure report")
         .await
         .context("Failed to run git commit")?;
 
@@ -736,7 +737,7 @@ async fn create_sync_pr(
     let output = Command::new("git")
         .args(["push", "-u", "origin", &branch_name, "--force"])
         .current_dir(&repo_dir)
-        .output()
+        .output_with_timeout("pushing the disclosure report", LONG_COMMAND_TIMEOUT)
         .await
         .context("Failed to run git push")?;
 
@@ -771,7 +772,7 @@ async fn create_sync_pr(
             &branch_name,
         ])
         .current_dir(&repo_dir)
-        .output()
+        .output_bounded("creating the disclosure pull request")
         .await
         .context("Failed to run gh pr create")?;
 
@@ -832,7 +833,7 @@ async fn current_git_branch(repo_dir: &Path) -> Result<String> {
     let output = Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(repo_dir)
-        .output()
+        .output_bounded("determining the disclosure repository branch")
         .await
         .context("Failed to determine sync repo default branch")?;
 
@@ -860,7 +861,7 @@ async fn checkout_report_branch(
         let output = Command::new("git")
             .args(["fetch", "origin", &branch_ref])
             .current_dir(repo_dir)
-            .output()
+            .output_bounded("fetching the existing disclosure branch")
             .await
             .context("Failed to fetch remote report branch")?;
 
@@ -879,7 +880,7 @@ async fn checkout_report_branch(
         let output = Command::new("git")
             .args(["fetch", "origin", &base_ref])
             .current_dir(repo_dir)
-            .output()
+            .output_bounded("fetching the disclosure base branch")
             .await
             .context("Failed to fetch sync repo base branch")?;
 
@@ -899,7 +900,7 @@ async fn checkout_report_branch(
     let output = Command::new("git")
         .args(["checkout", "-B", branch_name, &remote_ref])
         .current_dir(repo_dir)
-        .output()
+        .output_bounded("checking out the disclosure branch")
         .await
         .context("Failed to checkout report branch")?;
 
@@ -928,7 +929,7 @@ async fn find_open_sync_pr(
             "number,url,baseRefName",
         ])
         .current_dir(repo_dir)
-        .output()
+        .output_bounded("listing disclosure pull requests")
         .await
         .context("Failed to run gh pr list")?;
 
@@ -959,7 +960,7 @@ async fn find_open_sync_pr(
         let output = Command::new("gh")
             .args(["pr", "edit", &pr_number, "--base", base_branch])
             .current_dir(repo_dir)
-            .output()
+            .output_bounded("retargeting the disclosure pull request")
             .await
             .context("Failed to run gh pr edit")?;
 

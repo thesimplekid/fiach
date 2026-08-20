@@ -18,6 +18,7 @@ use crate::disclose::DiscloseConfig;
 use crate::execution::{ReviewExecutor, ReviewOutcome};
 use crate::finalizer::{FinalizationSpec, ReviewFinalizer};
 use crate::github::{DiscoveryRequest, GhCli, GitHub, PullRequestSummary};
+use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
 use crate::review::{CompletedReview, ReviewExecution, ReviewParams};
 use crate::scheduler::{
     ExecutionStatus, ReviewRequest, ReviewTarget, SchedulerHandle, SubmitError,
@@ -242,7 +243,7 @@ async fn fetch_author_associations(repo: &str, numbers: &[u64]) -> Result<HashMa
             .args(["api", "graphql", "-f", &format!("owner={owner}")])
             .args(["-f", &format!("name={name}")])
             .args(["-f", &format!("query={query}")])
-            .output()
+            .output_bounded("loading pull request author associations")
             .await
             .context("Failed to run gh api graphql")?;
 
@@ -517,7 +518,7 @@ async fn fetch_pr_mention_details(repo: &str, pr_number: u64) -> Result<PrMentio
             "--json",
             MENTION_PR_VIEW_JSON_FIELDS,
         ])
-        .output()
+        .output_bounded("loading pull request mention details")
         .await
         .context("Failed to run gh pr view for mention details")?;
 
@@ -720,7 +721,7 @@ pub async fn run_daemon(
     let gh_auth = Command::new("gh")
         .arg("auth")
         .arg("setup-git")
-        .output()
+        .output_bounded("configuring Git authentication")
         .await;
     if let Err(e) = gh_auth {
         tracing::warn!("Failed to run gh auth setup-git: {}", e);
@@ -1303,7 +1304,7 @@ async fn trigger_manual_review(
             "--json",
             "headRefOid,headRefName,title",
         ])
-        .output()
+        .output_bounded("loading a manually requested pull request")
         .await?;
 
     if !output.status.success() {
@@ -1370,7 +1371,7 @@ async fn wait_for_link(interface: &str) -> Result<()> {
     for _ in 1..=100 {
         let output = Command::new("ip")
             .args(["link", "show", "dev", interface])
-            .output()
+            .output_bounded("inspecting a sandbox veth interface")
             .await
             .with_context(|| format!("Failed to inspect sandbox veth interface {interface}"))?;
 
@@ -1387,7 +1388,7 @@ async fn wait_for_link(interface: &str) -> Result<()> {
 async fn run_ip_command(args: &[&str]) -> Result<()> {
     let output = Command::new("ip")
         .args(args)
-        .output()
+        .output_bounded("configuring sandbox networking")
         .await
         .with_context(|| format!("Failed to run ip {}", args.join(" ")))?;
 
@@ -1802,7 +1803,7 @@ async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<
         .args(["-a"])
         .arg(source_rootfs)
         .arg(&runtime_rootfs)
-        .output()
+        .output_with_timeout("materializing the sandbox rootfs", LONG_COMMAND_TIMEOUT)
         .await
         .context("Failed to spawn rootfs copy command")?;
 

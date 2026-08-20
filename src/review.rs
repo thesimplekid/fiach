@@ -20,6 +20,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::disclose;
+use crate::process::CommandExt as _;
 use crate::reporting::{self, ReportingArtifact, ReviewPhase};
 use crate::state;
 use crate::workspace;
@@ -1293,7 +1294,7 @@ pub async fn run_review(
                 "--repo",
                 &params.repo,
             ])
-            .output()
+            .output_bounded("loading pull request details for skill selection")
             .await;
 
         match pr_info_output {
@@ -1472,7 +1473,7 @@ pub async fn run_review(
             &format!("{}..HEAD", workspace.base_commit),
         ])
         .current_dir(&workspace.path)
-        .output()
+        .output_bounded("loading the pull request commit stack")
         .await;
 
     if let Ok(output) = commits_output {
@@ -2591,7 +2592,7 @@ async fn fetch_existing_pr_comments(
 async fn gh_api_paginated_array(endpoint: &str) -> Result<Vec<serde_json::Value>> {
     let output = tokio::process::Command::new("gh")
         .args(["api", "--paginate", "--slurp", endpoint])
-        .output()
+        .output_bounded("loading pull request discussion")
         .await
         .with_context(|| format!("Failed to run `gh api` for {endpoint}"))?;
 

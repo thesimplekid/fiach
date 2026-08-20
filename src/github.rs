@@ -99,6 +99,7 @@ impl GhCli {
         if input.is_some() {
             command.stdin(Stdio::piped());
         }
+        command.kill_on_drop(true);
         let mut child = command
             .spawn()
             .with_context(|| format!("Failed to start {program}"))?;

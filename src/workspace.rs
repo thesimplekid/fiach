@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::process::Command;
 
+use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
+
 const PR_CONTEXT_JSON_FIELDS: &str = "baseRefOid,baseRefName,state,mergedAt";
 
 /// A prepared workspace with the PR branch checked out, ready for the agent.
@@ -125,7 +127,7 @@ pub async fn prepare(
     let clone_output = Command::new("gh")
         .args(["repo", "clone", repo])
         .arg(&workspace_dir)
-        .output()
+        .output_with_timeout("cloning the review repository", LONG_COMMAND_TIMEOUT)
         .await
         .context("Failed to run `gh repo clone` — is `gh` installed?")?;
 
@@ -143,7 +145,7 @@ pub async fn prepare(
             let ctx_clone_output = Command::new("gh")
                 .args(["repo", "clone", ctx_repo])
                 .arg(&ctx_dir)
-                .output()
+                .output_with_timeout("cloning a context repository", LONG_COMMAND_TIMEOUT)
                 .await
                 .context("Failed to clone context repository")?;
 
@@ -159,7 +161,7 @@ pub async fn prepare(
     let checkout_output = Command::new("gh")
         .args(["pr", "checkout", &pr_number.to_string()])
         .current_dir(&workspace_dir)
-        .output()
+        .output_bounded("checking out the pull request")
         .await
         .context("Failed to run `gh pr checkout`")?;
 
@@ -179,7 +181,7 @@ pub async fn prepare(
             PR_CONTEXT_JSON_FIELDS,
         ])
         .current_dir(&workspace_dir)
-        .output()
+        .output_bounded("loading pull request context")
         .await
         .context("Failed to run `gh pr view`")?;
 
@@ -196,7 +198,7 @@ pub async fn prepare(
     let repo_context_output = Command::new("gh")
         .args(["repo", "view", repo, "--json", "defaultBranchRef"])
         .current_dir(&workspace_dir)
-        .output()
+        .output_bounded("loading repository context")
         .await
         .context("Failed to run `gh repo view`")?;
 
@@ -220,7 +222,7 @@ pub async fn prepare(
     let pr_diff_output = Command::new("git")
         .args(["diff", &format!("{base_commit}...HEAD")])
         .current_dir(&workspace_dir)
-        .output()
+        .output_bounded("generating the pull request diff")
         .await
         .context("Failed to run `git diff` for .pr_diff.txt")?;
 
@@ -288,7 +290,7 @@ fi
     let chmod_output = Command::new("chmod")
         .args(["+x", "safe_diff.sh"])
         .current_dir(&workspace_dir)
-        .output()
+        .output_bounded("making safe_diff.sh executable")
         .await
         .context("Failed to make safe_diff.sh executable")?;
 
@@ -301,7 +303,7 @@ fi
     let rev_parse_output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&workspace_dir)
-        .output()
+        .output_bounded("resolving the review commit")
         .await
         .context("Failed to run `git rev-parse HEAD`")?;
 
