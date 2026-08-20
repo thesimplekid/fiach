@@ -11,9 +11,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
+use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT, output_limited};
 
 const PR_CONTEXT_JSON_FIELDS: &str = "baseRefOid,baseRefName,state,mergedAt";
+const MAX_MATERIALIZED_DIFF_BYTES: usize = 16 * 1024 * 1024;
 
 /// A prepared workspace with the PR branch checked out, ready for the agent.
 pub struct PreparedWorkspace {
@@ -219,16 +220,33 @@ pub async fn prepare(
 
     // 4. Materialize the complete PR diff for prompts that need a single
     // source of truth for changed lines.
-    let pr_diff_output = Command::new("git")
+    let mut diff_command = Command::new("git");
+    diff_command
         .args(["diff", &format!("{base_commit}...HEAD")])
-        .current_dir(&workspace_dir)
-        .output_bounded("generating the pull request diff")
-        .await
-        .context("Failed to run `git diff` for .pr_diff.txt")?;
+        .current_dir(&workspace_dir);
+    let pr_diff_output = output_limited(
+        &mut diff_command,
+        "generating the pull request diff",
+        LONG_COMMAND_TIMEOUT,
+        MAX_MATERIALIZED_DIFF_BYTES,
+    )
+    .await
+    .context("Failed to run `git diff` for .pr_diff.txt")?;
 
     let pr_diff_path = workspace_dir.join(".pr_diff.txt");
-    if pr_diff_output.status.success() {
-        tokio::fs::write(&pr_diff_path, &pr_diff_output.stdout)
+    if pr_diff_output.status.success() || pr_diff_output.stdout_truncated {
+        let mut diff = pr_diff_output.stdout;
+        if pr_diff_output.stdout_truncated {
+            diff.extend_from_slice(
+                b"\n\n--- FIACH DIFF TRUNCATED AT 16 MIB ---\nUse git diff --name-only and ./safe_diff.sh <file> to inspect omitted files.\n",
+            );
+            tracing::warn!(
+                pr = pr_number,
+                limit_bytes = MAX_MATERIALIZED_DIFF_BYTES,
+                "Pull request diff exceeded the materialization limit"
+            );
+        }
+        tokio::fs::write(&pr_diff_path, diff)
             .await
             .context("Failed to write .pr_diff.txt")?;
     } else {
@@ -257,9 +275,11 @@ fi
 # Get the base commit we are comparing against.
 BASE_BRANCH="${BASE_BRANCH:-main}"
 
-# Generate the full diff
-FULL_DIFF=$(git diff $BASE_BRANCH...HEAD -- "$FILE")
-TOTAL_LINES=$(echo "$FULL_DIFF" | wc -l)
+# Materialize one file at a time without storing the diff in a shell variable.
+TMP_DIFF=$(mktemp)
+trap 'rm -f "$TMP_DIFF"' EXIT
+git diff "$BASE_BRANCH"...HEAD -- "$FILE" > "$TMP_DIFF"
+TOTAL_LINES=$(wc -l < "$TMP_DIFF")
 
 if [ "$TOTAL_LINES" -eq 0 ]; then
     echo "No changes found in $FILE"
@@ -267,7 +287,7 @@ if [ "$TOTAL_LINES" -eq 0 ]; then
 fi
 
 if [ "$TOTAL_LINES" -le "$LINES_PER_PAGE" ]; then
-    echo "$FULL_DIFF"
+    cat "$TMP_DIFF"
 else
     TOTAL_PAGES=$(( (TOTAL_LINES + LINES_PER_PAGE - 1) / LINES_PER_PAGE ))
     START_LINE=$(( (PAGE - 1) * LINES_PER_PAGE + 1 ))
@@ -277,7 +297,7 @@ else
     echo "Showing PAGE $PAGE of $TOTAL_PAGES (lines $START_LINE to $END_LINE)"
     echo "To see the next page, run: ./safe_diff.sh $FILE $((PAGE + 1))"
     echo "-------------------------------------------"
-    echo "$FULL_DIFF" | sed -n "${START_LINE},${END_LINE}p"
+    sed -n "${START_LINE},${END_LINE}p" "$TMP_DIFF"
 fi
 "#;
 

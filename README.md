@@ -368,6 +368,11 @@ The verifier reviews all candidates in one pass and submits one `submit_verdict`
 - `report.structured.json`
 - `report.policy.json`
 
+Workspace preparation materializes at most 16 MiB of the aggregate PR patch in
+`.pr_diff.txt`, preventing oversized PRs from consuming unbounded host memory.
+When that cap is reached the artifact contains a truncation marker; the agent
+can inspect omitted changes one file at a time with `safe_diff.sh`.
+
 For `report_mode = "pr-comment"`, Fiach posts a GitHub PR review only when all host-side policy checks pass:
 
 - the PR is still open,
