@@ -151,7 +151,9 @@ Set `FIACH_SERVER_TOKEN` to require `Authorization: Bearer <token>` or `X-Fiach-
   Jobs report `queued`, `running`, `completed`, `failed`, `skipped`, or
   `cancelled`, along with their target and timestamps. The newest 1,000
   terminal jobs are retained in memory. Job IDs and statuses do not survive a
-  daemon restart; an unknown or evicted ID returns `404`.
+  daemon restart; an unknown or evicted ID returns `404`. Durable review claims
+  left `in_progress` by a stopped daemon are marked failed during startup so
+  normal retry policy can reclaim them immediately.
 - **Get JSON metadata for a specific review:**
   ```bash
   curl "http://localhost:3000/review?owner=my-org&repo=repo&pr=42"
@@ -544,6 +546,7 @@ In daemon sandbox mode, the sandbox no longer gets write access to the whole `fi
 - The sandbox stdout/stderr stream is saved as `reports/runs/<repo>_PR<number>/nspawn.log` by default.
 - Review state in `fiach.redb` is recorded by the host daemon after the sandbox exits successfully.
 - Disclosure side effects are also performed by the host daemon after it validates the sandbox output.
+- GitHub disclosure is journaled before publication and tagged with a hidden stable marker. After an interrupted publication, the host reconciles GitHub history before retrying and reuses an existing review or comment instead of duplicating it.
 
 This reduces the impact of a malicious or prompt-injected agent: it can still produce a bad report, but it cannot directly corrupt the review database from inside the sandbox.
 

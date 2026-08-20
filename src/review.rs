@@ -2257,35 +2257,58 @@ pub async fn run_review(
         };
 
         if params.execution.persist_side_effects {
-            let report_url = if artifact.markdown_only_fallback {
-                crate::disclose::handle_disclosure(
-                    report_file,
-                    crate::disclose::DisclosureTarget {
-                        repo: &params.repo,
-                        pr_number: params.pr_number,
-                        commit_hash: workspace.commit_hash.as_str(),
-                        review_kind: &params.review_kind,
-                    },
-                    false,
-                    &params.disclose_config,
-                )
-                .await?
-            } else {
-                crate::disclose::handle_structured_disclosure(
-                    report_file,
-                    crate::disclose::DisclosureTarget {
-                        repo: &params.repo,
-                        pr_number: params.pr_number,
-                        commit_hash: workspace.commit_hash.as_str(),
-                        review_kind: &params.review_kind,
-                    },
-                    &artifact,
-                    &policy,
-                    &params.disclose_config,
-                )
-                .await?
+            let target = crate::disclose::DisclosureTarget {
+                repo: &params.repo,
+                pr_number: params.pr_number,
+                commit_hash: workspace.commit_hash.as_str(),
+                review_kind: &params.review_kind,
             };
-            completed.metadata.report_url = report_url;
+            let disclosure_scope = crate::disclose::disclosure_scope(&params.disclose_config);
+            let report_url = match state::begin_disclosure(
+                &params.db_path,
+                target.repo,
+                target.pr_number,
+                target.commit_hash,
+                target.review_kind,
+                &disclosure_scope,
+            )? {
+                state::DisclosureClaim::Published(url) => url,
+                state::DisclosureClaim::Publish { recovering } => {
+                    let url = if artifact.markdown_only_fallback {
+                        crate::disclose::handle_disclosure_idempotent(
+                            report_file,
+                            target,
+                            false,
+                            &params.disclose_config,
+                            recovering,
+                        )
+                        .await?
+                    } else {
+                        crate::disclose::handle_structured_disclosure_idempotent(
+                            report_file,
+                            target,
+                            &artifact,
+                            &policy,
+                            &params.disclose_config,
+                            recovering,
+                        )
+                        .await?
+                    };
+                    state::finish_disclosure(
+                        &params.db_path,
+                        target.repo,
+                        target.pr_number,
+                        target.commit_hash,
+                        target.review_kind,
+                        &disclosure_scope,
+                        url.as_deref(),
+                    )
+                    .context("Failed to persist disclosure receipt")?;
+                    url
+                }
+            };
+            completed.metadata.report_url.clone_from(&report_url);
+            completed.metadata.disclosure_url = report_url;
 
             if completed.metadata.status == "none"
                 && let Some(reaction) = params.disclose_config.reactions.no_findings.as_deref()

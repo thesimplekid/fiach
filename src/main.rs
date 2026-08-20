@@ -885,6 +885,13 @@ async fn main() -> Result<()> {
                 params.db_path.clone(),
                 Some(&reports_dir),
             )?);
+            let recovered = state_store.recover_interrupted().await?;
+            if recovered > 0 {
+                tracing::warn!(
+                    reviews = recovered,
+                    "Recovered reviews interrupted by the previous daemon process"
+                );
+            }
             let params = std::sync::Arc::new(params);
             let scheduler = daemon::start_review_scheduler(
                 std::sync::Arc::clone(&params),

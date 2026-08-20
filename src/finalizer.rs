@@ -128,19 +128,53 @@ impl ReviewFinalizer {
         metadata.artifacts.policy_json = Some(absolute(policy_path));
         metadata.artifacts.sandbox_log = outcome.diagnostics.sandbox_log.map(absolute);
 
-        let report_url = disclose::handle_structured_disclosure(
-            &report_path,
-            DisclosureTarget {
-                repo: &spec.repository,
-                pr_number: spec.pr_number,
-                commit_hash: &metadata.commit_hash,
-                review_kind: &spec.review_kind,
-            },
-            &outcome.artifact,
-            &outcome.policy,
-            &spec.disclose,
-        )
-        .await?;
+        let target = DisclosureTarget {
+            repo: &spec.repository,
+            pr_number: spec.pr_number,
+            commit_hash: &metadata.commit_hash,
+            review_kind: &spec.review_kind,
+        };
+        let disclosure_scope = disclose::disclosure_scope(&spec.disclose);
+        let report_url = match state::begin_disclosure(
+            &spec.db_path,
+            target.repo,
+            target.pr_number,
+            target.commit_hash,
+            target.review_kind,
+            &disclosure_scope,
+        )? {
+            state::DisclosureClaim::Published(url) => {
+                tracing::info!(
+                    repo = %target.repo,
+                    pr = target.pr_number,
+                    review_kind = %target.review_kind,
+                    "Disclosure already published; reusing persisted receipt"
+                );
+                url
+            }
+            state::DisclosureClaim::Publish { recovering } => {
+                let url = disclose::handle_structured_disclosure_idempotent(
+                    &report_path,
+                    target,
+                    &outcome.artifact,
+                    &outcome.policy,
+                    &spec.disclose,
+                    recovering,
+                )
+                .await?;
+                state::finish_disclosure(
+                    &spec.db_path,
+                    target.repo,
+                    target.pr_number,
+                    target.commit_hash,
+                    target.review_kind,
+                    &disclosure_scope,
+                    url.as_deref(),
+                )
+                .context("Failed to persist disclosure receipt")?;
+                url
+            }
+        };
         metadata.report_url.clone_from(&report_url);
         metadata.disclosure_url = report_url;
 

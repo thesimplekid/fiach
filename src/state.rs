@@ -12,8 +12,9 @@ const BUZZ_QUESTION_STATE: TableDefinition<&str, &str> =
     TableDefinition::new("buzz_question_state");
 const BUZZ_QUESTION_CURSOR: TableDefinition<&str, i64> =
     TableDefinition::new("buzz_question_cursor");
+const DISCLOSURE_STATE: TableDefinition<&str, &str> = TableDefinition::new("disclosure_state");
 const SCHEMA_VERSION: TableDefinition<&str, u64> = TableDefinition::new("schema_version");
-const CURRENT_SCHEMA_VERSION: u64 = 2;
+const CURRENT_SCHEMA_VERSION: u64 = 3;
 const BUZZ_QUESTION_CURSOR_KEY: &str = "review_questions";
 pub const DEFAULT_REVIEW_KIND: &str = "default";
 
@@ -195,6 +196,27 @@ pub struct BuzzQuestionReceipt {
     pub timestamp: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DisclosureStatus {
+    Publishing,
+    Published,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct DisclosureRecord {
+    status: DisclosureStatus,
+    #[serde(default)]
+    url: Option<String>,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisclosureClaim {
+    Publish { recovering: bool },
+    Published(Option<String>),
+}
+
 /// Compatibility name retained while callers migrate to the domain-oriented record.
 pub type ReviewMetadata = ReviewRecord;
 
@@ -235,6 +257,88 @@ fn commit_state_key(repo: &str, commit_hash: &str, review_kind: &str) -> String 
     } else {
         format!("{repo}|{commit_hash}|{review_kind}")
     }
+}
+
+pub(crate) fn disclosure_state_key(
+    repo: &str,
+    pr: u64,
+    commit_hash: &str,
+    review_kind: &str,
+    scope: &str,
+) -> String {
+    [repo, &pr.to_string(), commit_hash, review_kind, scope]
+        .into_iter()
+        .map(|part| format!("{}:{part}", part.len()))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+pub fn begin_disclosure(
+    db_path: &Path,
+    repo: &str,
+    pr: u64,
+    commit_hash: &str,
+    review_kind: &str,
+    scope: &str,
+) -> Result<DisclosureClaim> {
+    with_retries(|| {
+        let database = open_database(db_path).context("Failed to open state database")?;
+        let write = database.begin_write()?;
+        let key = disclosure_state_key(repo, pr, commit_hash, review_kind, scope);
+        let claim = {
+            let mut table = write.open_table(DISCLOSURE_STATE)?;
+            let existing = table
+                .get(key.as_str())?
+                .map(|value| serde_json::from_str::<DisclosureRecord>(value.value()))
+                .transpose()?;
+            match existing {
+                Some(record) if record.status == DisclosureStatus::Published => {
+                    DisclosureClaim::Published(record.url)
+                }
+                Some(_) => DisclosureClaim::Publish { recovering: true },
+                None => {
+                    let record = DisclosureRecord {
+                        status: DisclosureStatus::Publishing,
+                        url: None,
+                        updated_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    };
+                    let json = serde_json::to_string(&record)?;
+                    table.insert(key.as_str(), json.as_str())?;
+                    DisclosureClaim::Publish { recovering: false }
+                }
+            }
+        };
+        write.commit()?;
+        Ok(claim)
+    })
+}
+
+pub fn finish_disclosure(
+    db_path: &Path,
+    repo: &str,
+    pr: u64,
+    commit_hash: &str,
+    review_kind: &str,
+    scope: &str,
+    url: Option<&str>,
+) -> Result<()> {
+    with_retries(|| {
+        let database = open_database(db_path).context("Failed to open state database")?;
+        let write = database.begin_write()?;
+        {
+            let key = disclosure_state_key(repo, pr, commit_hash, review_kind, scope);
+            let record = DisclosureRecord {
+                status: DisclosureStatus::Published,
+                url: url.map(str::to_string),
+                updated_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            };
+            let json = serde_json::to_string(&record)?;
+            let mut table = write.open_table(DISCLOSURE_STATE)?;
+            table.insert(key.as_str(), json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    })
 }
 
 fn parse_pr_state_key(key: &str) -> Option<(String, u64)> {
@@ -876,6 +980,34 @@ impl RedbStateStore {
         .context("State list task failed")?
     }
 
+    pub async fn recover_interrupted(&self) -> Result<usize> {
+        let database = Arc::clone(&self.database);
+        tokio::task::spawn_blocking(move || {
+            let write = database.begin_write()?;
+            let mut recovered = Vec::new();
+            {
+                let mut table = write.open_table(PR_STATE)?;
+                for item in table.iter()? {
+                    let (key, value) = item?;
+                    let mut record: ReviewRecord = serde_json::from_str(value.value())?;
+                    if record.status == ReviewStatus::InProgress {
+                        record.status = ReviewStatus::Failed;
+                        record.failure_stage = Some("daemon-restarted".to_string());
+                        record.timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+                        recovered.push((key.value().to_string(), serde_json::to_string(&record)?));
+                    }
+                }
+                for (key, value) in &recovered {
+                    table.insert(key.as_str(), value.as_str())?;
+                }
+            }
+            write.commit()?;
+            Ok(recovered.len())
+        })
+        .await
+        .context("State recovery task failed")?
+    }
+
     pub async fn try_claim(&self, mut record: ReviewRecord, timeout_mins: u64) -> Result<bool> {
         let database = Arc::clone(&self.database);
         tokio::task::spawn_blocking(move || {
@@ -1401,6 +1533,76 @@ mod tests {
                 .unwrap()
                 .status,
             ReviewStatus::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_marks_interrupted_reviews_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let store = RedbStateStore::open(&db_path, None).unwrap();
+        let interrupted = metadata("interrupted", "in_progress", 1);
+        let completed = metadata("completed", "confirmed", 0);
+        mark_reviewed(&db_path, "owner/repo", 42, &interrupted).unwrap();
+        mark_reviewed(&db_path, "owner/other", 7, &completed).unwrap();
+
+        assert_eq!(store.recover_interrupted().await.unwrap(), 1);
+        let recovered = store
+            .get("owner/repo", 42, "security")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, ReviewStatus::Failed);
+        assert_eq!(recovered.failure_stage.as_deref(), Some("daemon-restarted"));
+        assert_eq!(
+            store
+                .get("owner/other", 7, "security")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ReviewStatus::Confirmed
+        );
+    }
+
+    #[test]
+    fn disclosure_journal_reuses_published_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let target = ("owner/repo", 42, "abcdef", "security", "pr-comment");
+
+        assert_eq!(
+            begin_disclosure(&db_path, target.0, target.1, target.2, target.3, target.4,).unwrap(),
+            DisclosureClaim::Publish { recovering: false }
+        );
+        assert_eq!(
+            begin_disclosure(&db_path, target.0, target.1, target.2, target.3, target.4,).unwrap(),
+            DisclosureClaim::Publish { recovering: true }
+        );
+
+        finish_disclosure(
+            &db_path,
+            target.0,
+            target.1,
+            target.2,
+            target.3,
+            target.4,
+            Some("https://github.com/owner/repo/pull/42#pullrequestreview-1"),
+        )
+        .unwrap();
+        assert_eq!(
+            begin_disclosure(&db_path, target.0, target.1, target.2, target.3, target.4,).unwrap(),
+            DisclosureClaim::Published(Some(
+                "https://github.com/owner/repo/pull/42#pullrequestreview-1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn disclosure_keys_are_unambiguous() {
+        assert_ne!(
+            disclosure_state_key("a|b", 1, "c", "d", "e"),
+            disclosure_state_key("a", 1, "b|c", "d", "e")
         );
     }
 

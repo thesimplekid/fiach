@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
@@ -85,6 +85,22 @@ struct ExistingSyncPr {
     base_ref_name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ExistingDisclosure {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingDiscussion {
+    #[serde(default)]
+    comments: Vec<ExistingDisclosure>,
+    #[serde(default)]
+    reviews: Vec<ExistingDisclosure>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DisclosureTarget<'a> {
     pub repo: &'a str,
@@ -93,11 +109,53 @@ pub struct DisclosureTarget<'a> {
     pub review_kind: &'a str,
 }
 
+pub(crate) fn disclosure_scope(config: &DiscloseConfig) -> String {
+    match config.mode {
+        ReportMode::Local => "local".to_string(),
+        ReportMode::PrComment => "pr-comment".to_string(),
+        ReportMode::SyncPr => format!(
+            "sync-pr:{}",
+            config.sync_repo.as_deref().unwrap_or("unconfigured")
+        ),
+        ReportMode::Hybrid => format!(
+            "hybrid:{}",
+            config.sync_repo.as_deref().unwrap_or("pr-only")
+        ),
+    }
+}
+
+fn disclosure_marker(target: DisclosureTarget<'_>, config: &DiscloseConfig) -> String {
+    let key = crate::state::disclosure_state_key(
+        target.repo,
+        target.pr_number,
+        target.commit_hash,
+        target.review_kind,
+        &disclosure_scope(config),
+    );
+    let mut encoded = String::with_capacity(key.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in key.bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    format!("<!-- fiach-disclosure:{encoded} -->")
+}
+
 pub async fn handle_disclosure(
     report_path: &Path,
     target: DisclosureTarget<'_>,
     findings_found: bool,
     config: &DiscloseConfig,
+) -> Result<Option<String>> {
+    handle_disclosure_idempotent(report_path, target, findings_found, config, false).await
+}
+
+pub async fn handle_disclosure_idempotent(
+    report_path: &Path,
+    target: DisclosureTarget<'_>,
+    findings_found: bool,
+    config: &DiscloseConfig,
+    recovering: bool,
 ) -> Result<Option<String>> {
     match config.mode {
         ReportMode::Local => {
@@ -111,9 +169,16 @@ pub async fn handle_disclosure(
                 );
                 return Ok(None);
             }
-            post_pr_comment(report_path, target.repo, target.pr_number)
-                .await
-                .map(Some)
+            let marker = disclosure_marker(target, config);
+            post_pr_comment(
+                report_path,
+                target.repo,
+                target.pr_number,
+                &marker,
+                recovering,
+            )
+            .await
+            .map(Some)
         }
         ReportMode::SyncPr => {
             if !findings_found && !config.notify_on_empty {
@@ -144,9 +209,16 @@ pub async fn handle_disclosure(
                 return Ok(None);
             }
             if policy_comments_allowed(target.review_kind) {
-                post_pr_comment(report_path, target.repo, target.pr_number)
-                    .await
-                    .map(Some)
+                let marker = disclosure_marker(target, config);
+                post_pr_comment(
+                    report_path,
+                    target.repo,
+                    target.pr_number,
+                    &marker,
+                    recovering,
+                )
+                .await
+                .map(Some)
             } else {
                 Ok(None)
             }
@@ -161,6 +233,18 @@ pub async fn handle_structured_disclosure(
     policy: &DisclosurePolicy,
     config: &DiscloseConfig,
 ) -> Result<Option<String>> {
+    handle_structured_disclosure_idempotent(report_path, target, artifact, policy, config, false)
+        .await
+}
+
+pub async fn handle_structured_disclosure_idempotent(
+    report_path: &Path,
+    target: DisclosureTarget<'_>,
+    artifact: &ReportingArtifact,
+    policy: &DisclosurePolicy,
+    config: &DiscloseConfig,
+    recovering: bool,
+) -> Result<Option<String>> {
     match structured_disclosure_route(target, artifact, policy, config) {
         StructuredDisclosureRoute::Local => {
             tracing::info!("ReportMode is Local. Report saved to {:?}", report_path);
@@ -173,10 +257,21 @@ pub async fn handle_structured_disclosure(
                 .iter()
                 .flat_map(|finding| finding.inline_comments.clone())
                 .collect::<Vec<_>>();
-            let body = crate::reporting::review_summary_body(&accepted);
-            post_pr_review(target.repo, target.pr_number, &body, comments)
-                .await
-                .map(Some)
+            let marker = disclosure_marker(target, config);
+            let body = format!(
+                "{}\n\n{marker}",
+                crate::reporting::review_summary_body(&accepted)
+            );
+            post_pr_review(
+                target.repo,
+                target.pr_number,
+                &body,
+                comments,
+                &marker,
+                recovering,
+            )
+            .await
+            .map(Some)
         }
         StructuredDisclosureRoute::SyncPr => {
             let sync_repo = config
@@ -299,6 +394,62 @@ fn policy_comments_allowed(review_kind: &str) -> bool {
         || review_kind == "builtin:pr-review"
 }
 
+async fn find_existing_disclosure(
+    repo: &str,
+    pr_number: u64,
+    marker: &str,
+    recovering: bool,
+) -> Result<Option<String>> {
+    let result = async {
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &pr_number.to_string(),
+                "--repo",
+                repo,
+                "--json",
+                "comments,reviews",
+            ])
+            .output_bounded("checking for an existing Fiach disclosure")
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("gh pr view failed while checking disclosure history: {stderr}");
+        }
+
+        let discussion: ExistingDiscussion = serde_json::from_slice(&output.stdout)
+            .context("Failed to parse pull request disclosure history")?;
+        Ok(discussion
+            .comments
+            .into_iter()
+            .chain(discussion.reviews)
+            .find(|entry| entry.body.contains(marker))
+            .map(|entry| {
+                entry
+                    .url
+                    .unwrap_or_else(|| format!("https://github.com/{repo}/pull/{pr_number}"))
+            }))
+    }
+    .await;
+
+    match result {
+        Ok(existing) => Ok(existing),
+        Err(error) if recovering => Err(error).context(
+            "Cannot safely resume an interrupted disclosure without checking GitHub history",
+        ),
+        Err(error) => {
+            tracing::warn!(
+                repo = %repo,
+                pr = pr_number,
+                error = %error,
+                "Could not check disclosure history before first publication"
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ReviewCommentPayload {
     path: String,
@@ -319,6 +470,8 @@ async fn post_pr_review(
     pr_number: u64,
     body: &str,
     comments: Vec<InlineComment>,
+    marker: &str,
+    recovering: bool,
 ) -> Result<String> {
     tracing::info!(
         repo = %repo,
@@ -326,6 +479,11 @@ async fn post_pr_review(
         comments = comments.len(),
         "Posting structured PR review"
     );
+
+    if let Some(url) = find_existing_disclosure(repo, pr_number, marker, recovering).await? {
+        tracing::info!(repo = %repo, pr = pr_number, url = %url, "Reusing existing structured PR review");
+        return Ok(url);
+    }
 
     let payload = ReviewPayload {
         event: "COMMENT",
@@ -541,14 +699,30 @@ fn normalize_reaction_content(reaction: &str) -> Result<&'static str> {
     }
 }
 
-async fn post_pr_comment(report_path: &Path, repo: &str, pr_number: u64) -> Result<String> {
+async fn post_pr_comment(
+    report_path: &Path,
+    repo: &str,
+    pr_number: u64,
+    marker: &str,
+    recovering: bool,
+) -> Result<String> {
     tracing::info!(
         repo = %repo,
         pr = pr_number,
         "Posting comment to PR"
     );
 
-    let report_path_str = report_path
+    if let Some(url) = find_existing_disclosure(repo, pr_number, marker, recovering).await? {
+        tracing::info!(repo = %repo, pr = pr_number, url = %url, "Reusing existing PR comment");
+        return Ok(url);
+    }
+
+    let report = std::fs::read_to_string(report_path).context("Failed to read report file")?;
+    let body = tempfile::NamedTempFile::new().context("Failed to create comment body file")?;
+    std::fs::write(body.path(), format!("{report}\n\n{marker}\n"))
+        .context("Failed to write comment body file")?;
+    let report_path_str = body
+        .path()
         .to_str()
         .context("Report path must be valid UTF-8")?;
 
@@ -1074,6 +1248,23 @@ mod tests {
             notify_on_empty: false,
             reactions: ReactionConfig::default(),
         }
+    }
+
+    #[test]
+    fn disclosure_markers_are_stable_scoped_and_html_safe() {
+        let pr_comment =
+            disclosure_marker(target("security"), &disclose_config(ReportMode::PrComment));
+        assert_eq!(
+            pr_comment,
+            disclosure_marker(target("security"), &disclose_config(ReportMode::PrComment))
+        );
+        assert_ne!(
+            pr_comment,
+            disclosure_marker(target("security"), &disclose_config(ReportMode::SyncPr))
+        );
+        assert!(pr_comment.starts_with("<!-- fiach-disclosure:"));
+        assert!(pr_comment.ends_with(" -->"));
+        assert_eq!(pr_comment.matches("-->").count(), 1);
     }
 
     fn artifact(introduced_by_pr: bool) -> ReportingArtifact {
