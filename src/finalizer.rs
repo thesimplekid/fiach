@@ -289,3 +289,121 @@ fn absolute(path: PathBuf) -> PathBuf {
         std::env::current_dir().map_or(path.clone(), |directory| directory.join(path))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+    use crate::execution::ExecutionDiagnostics;
+    use crate::reporting::{DisclosurePolicy, NoFindings, PrContext, ReportingArtifact};
+
+    fn clean_outcome(root: &std::path::Path) -> ReviewOutcome {
+        let report_path = root.join("report.md");
+        let metadata = serde_json::from_value(serde_json::json!({
+            "repository": "owner/repo",
+            "pr_number": 42,
+            "review_kind": "security",
+            "commit_hash": "abc123",
+            "model": "scripted",
+            "timestamp": 1,
+            "findings_count": 0,
+            "status": "none",
+            "severity": "none",
+            "pr_classification": "none",
+            "retry_count": 0,
+            "artifacts": {}
+        }))
+        .unwrap();
+        ReviewOutcome {
+            completed: crate::review::CompletedReview {
+                metadata,
+                should_notify: false,
+                report_path,
+            },
+            artifact: ReportingArtifact {
+                no_findings: Some(NoFindings {
+                    summary: "No actionable findings in the scripted review.".to_string(),
+                    skills_used: vec!["scripted".to_string()],
+                }),
+                ..ReportingArtifact::default()
+            },
+            policy: DisclosurePolicy {
+                pr_context: PrContext {
+                    state: "open".to_string(),
+                    merged: false,
+                    base_ref_name: "main".to_string(),
+                    default_branch: "main".to_string(),
+                    base_commit: "base".to_string(),
+                    head_commit: "abc123".to_string(),
+                },
+                diff_anchors: BTreeMap::<String, BTreeSet<u32>>::new(),
+            },
+            diagnostics: ExecutionDiagnostics {
+                sandbox_log: None,
+                executor: "scripted".to_string(),
+            },
+        }
+    }
+
+    fn local_spec(root: &std::path::Path) -> FinalizationSpec {
+        FinalizationSpec {
+            repository: "owner/repo".to_string(),
+            pr_number: 42,
+            review_kind: "security".to_string(),
+            security_review: true,
+            provider: "scripted".to_string(),
+            model: "scripted".to_string(),
+            verifier_provider: None,
+            verifier_model: None,
+            dedupe_existing_comments: false,
+            dedupe_provider: None,
+            dedupe_model: None,
+            max_retries: 0,
+            retry_delay_secs: 0,
+            timeout_mins: 1,
+            max_turns: 1,
+            max_cost_usd: Some(1.0),
+            disclose: DiscloseConfig {
+                mode: disclose::ReportMode::Local,
+                sync_repo: None,
+                notify_on_empty: false,
+                reactions: disclose::ReactionConfig {
+                    review_start: None,
+                    no_findings: None,
+                },
+            },
+            buzz: None,
+            db_path: root.join("state.redb"),
+            trigger_mention_node_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_outcome_runs_through_render_journal_and_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = local_spec(temp.path());
+        let outcome = clean_outcome(temp.path());
+        let finalizer = ReviewFinalizer;
+
+        let first = finalizer
+            .finalize(&spec, outcome.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let second = finalizer
+            .finalize(&spec, outcome, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(first.status, ReviewStatus::None);
+        assert_eq!(first.report_url, second.report_url);
+        assert!(first.artifacts.markdown.as_ref().unwrap().exists());
+        assert!(first.artifacts.structured_json.as_ref().unwrap().exists());
+        assert!(first.artifacts.policy_json.as_ref().unwrap().exists());
+        let stored = state::get_pr_review(&spec.db_path, "owner/repo", 42, "security")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, ReviewStatus::None);
+        assert_eq!(stored.commit_hash, "abc123");
+    }
+}
