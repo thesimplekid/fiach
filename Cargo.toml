@@ -2,6 +2,7 @@
 name = "fiach"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.94.1"
 
 [dependencies]
 goose = { git = "https://github.com/aaif-goose/goose", tag = "v1.46.0", default-features = false, features = ["rustls-tls"] }

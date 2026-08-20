@@ -38,12 +38,8 @@
             inherit system overlays;
           };
 
-          # Toolchains
-          # latest stable
+          # Pinned toolchain; keep in sync with rust-toolchain.toml and Cargo.toml.
           stable_toolchain = pkgs.rust-bin.stable."1.94.1".default.override {
-            targets = [
-              "wasm32-unknown-unknown"
-            ];
             extensions = [
               "rustfmt"
               "clippy"
@@ -51,21 +47,6 @@
               "llvm-tools-preview"
             ];
           };
-
-          # Nightly used for formatting
-          nightly_toolchain = pkgs.rust-bin.selectLatestNightlyWith (
-            toolchain:
-            toolchain.default.override {
-              extensions = [
-                "rustfmt"
-                "clippy"
-                "rust-analyzer"
-                "rust-src"
-                "llvm-tools-preview"
-              ];
-              targets = [ "wasm32-unknown-unknown" ];
-            }
-          );
 
           # Common inputs
           envVars = {
@@ -101,7 +82,7 @@
           ++ lib.optionals isDarwin [
           ];
         in
-        {
+        rec {
           packages.default = (pkgs.makeRustPlatform {
             cargo = stable_toolchain;
             rustc = stable_toolchain;
@@ -230,6 +211,38 @@
               touch "$out"
             '';
 
+          checks.package = packages.default;
+
+          checks.rustfmt = pkgs.runCommand "fiach-rustfmt-check"
+            {
+              nativeBuildInputs = [ stable_toolchain ];
+              src = lib.cleanSource ./.;
+            } ''
+            cp -r "$src" source
+            chmod -R u+w source
+            cd source
+            cargo fmt --all -- --check
+            touch "$out"
+          '';
+
+          checks.nixfmt = pkgs.runCommand "fiach-nixfmt-check"
+            {
+              nativeBuildInputs = [ pkgs.nixpkgs-fmt ];
+              src = ./flake.nix;
+            } ''
+            nixpkgs-fmt --check "$src"
+            touch "$out"
+          '';
+
+          checks.typos = pkgs.runCommand "fiach-typos-check"
+            {
+              nativeBuildInputs = [ pkgs.typos ];
+              src = lib.cleanSource ./.;
+            } ''
+            typos "$src"
+            touch "$out"
+          '';
+
           devShells =
             let
               stable = pkgs.mkShell (
@@ -247,22 +260,9 @@
                 // envVars
               );
 
-              nightly = pkgs.mkShell (
-                {
-                  shellHook = commonShellHook;
-                  buildInputs = baseBuildInputs ++ [
-                    nightly_toolchain
-                  ];
-                  inherit nativeBuildInputs;
-
-                  PROTOC = "${pkgs.protobuf}/bin/protoc";
-                  PROTOC_INCLUDE = "${pkgs.protobuf}/include";
-                }
-                // envVars
-              );
             in
             {
-              inherit stable nightly;
+              inherit stable;
               default = stable;
             };
         }

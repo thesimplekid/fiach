@@ -61,6 +61,22 @@ You can copy the environment template to get started:
 cp .env.example .env
 ```
 
+### Development Checks
+
+The repository pins Rust 1.94.1 in `rust-toolchain.toml`; the Nix shell uses the
+same version. Run the fast contributor checks with:
+
+```bash
+nix develop --command just check
+```
+
+Run the package, NixOS module, Rust formatting, Nix formatting, and spelling
+checks exposed by the flake with:
+
+```bash
+nix flake check --no-write-lock-file -L
+```
+
 ---
 
 ## 📖 Usage Examples
