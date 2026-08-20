@@ -150,6 +150,17 @@ fn sum_known_costs(costs: impl IntoIterator<Item = Option<f64>>) -> Option<f64> 
     total
 }
 
+fn cost_budget_reached(current_cost: Option<f64>, max_cost: Option<f64>) -> bool {
+    matches!((current_cost, max_cost), (Some(current), Some(max)) if current >= max)
+}
+
+pub(crate) fn remaining_cost_budget(
+    max_cost: Option<f64>,
+    current_cost: Option<f64>,
+) -> Option<f64> {
+    max_cost.map(|max| (max - current_cost.unwrap_or(0.0)).max(0.0))
+}
+
 fn format_cost(cost: Option<f64>) -> String {
     cost.map(|cost| format!("${cost:.4}"))
         .unwrap_or_else(|| "unknown".to_string())
@@ -1120,6 +1131,13 @@ pub async fn run_review(
     params: ReviewParams,
     cancel_token: CancellationToken,
 ) -> Result<Option<CompletedReview>> {
+    if params
+        .max_cost_usd
+        .is_some_and(|max_cost| !max_cost.is_finite() || max_cost <= 0.0)
+    {
+        bail!("Maximum review cost must be a finite positive number");
+    }
+
     let start_time = Instant::now();
     let mut peak_input_tokens = 0u64;
     let mut total_output_tokens = 0u64;
@@ -1603,10 +1621,11 @@ pub async fn run_review(
     );
 
     let phase_cancel_token = cancel_token.child_token();
+    let mut budget_exceeded = false;
     let review_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
-        let mut budget_exceeded = false;
+        let mut budget_nudged = false;
         let mut cost_unavailable_warned = false;
         let mut last_assistant_text: Option<String> = None;
         let mut last_progress_log = Instant::now()
@@ -1739,22 +1758,32 @@ pub async fn run_review(
                                         );
                                     }
 
+                                    if cost_budget_reached(current_cost, params.max_cost_usd)
+                                    {
+                                        budget_exceeded = true;
+                                        tracing::warn!(
+                                            cost = %format_cost(current_cost),
+                                            max = %format_cost(params.max_cost_usd),
+                                            "Review cost budget reached; cancelling active finder work"
+                                        );
+                                        phase_cancel_token.cancel();
+                                        return Ok(());
+                                    }
+
                                     if let Some(max_cost) = params.max_cost_usd
                                         && let Some(current_cost) = current_cost
-                                        && current_cost > max_cost
-                                        && !budget_exceeded
+                                        && current_cost >= max_cost * 0.8
+                                        && !budget_nudged
                                     {
-                                        tracing::warn!(
-                                            cost = %format_cost(Some(current_cost)),
-                                            max = %format_cost(Some(max_cost)),
-                                            "Budget exceeded! Requesting immediate report..."
-                                        );
-                                        budget_exceeded = true;
-
-                                        let budget_nudge = "BUDGET EXCEEDED! Stop analyzing and submit your current result now. Use `submit_finding` for each candidate, or `submit_no_findings` if there are no candidates. Do not do anything else.".to_string();
+                                        budget_nudged = true;
+                                        let budget_nudge = "COST BUDGET NEARLY EXHAUSTED. Stop further analysis and submit your current result now. Use `submit_finding` for each candidate, or `submit_no_findings` if there are no candidates. Do not do anything else.".to_string();
                                         let follow_up_message = Message::user().with_text(&budget_nudge);
 
-                                        tracing::info!("Nudging agent to finalize report due to budget...");
+                                        tracing::info!(
+                                            cost = %format_cost(Some(current_cost)),
+                                            max = %format_cost(Some(max_cost)),
+                                            "Nudging agent to finalize before reaching the cost budget"
+                                        );
 
                                         let mut s_opt = None;
                                         let mut last_err = None;
@@ -1888,7 +1917,7 @@ pub async fn run_review(
                                 return Ok(()); // Stream finished successfully
                             }
 
-                            if budget_exceeded && retries > 0 {
+                            if budget_nudged && retries > 0 {
                                 return Ok(());
                             }
 
@@ -1904,8 +1933,8 @@ pub async fn run_review(
                                 return Ok(());
                             }
 
-                            let follow_up_text = if budget_exceeded {
-                                "BUDGET EXCEEDED! Stop analyzing and submit your current result now. Use `submit_finding` for each candidate, or `submit_no_findings` if there are no candidates. Do not do anything else.".to_string()
+                            let follow_up_text = if budget_nudged {
+                                "COST BUDGET NEARLY EXHAUSTED. Submit your current result now with `submit_finding` or `submit_no_findings`; do not perform more analysis.".to_string()
                             } else {
                                 match last_assistant_text.as_deref() {
                                     Some(text) if !text.trim().is_empty() => format!(
@@ -2037,7 +2066,7 @@ pub async fn run_review(
     }
 
     if artifact.finder_complete() || artifact.markdown_only_fallback {
-        if params.verify_findings && !artifact.findings.is_empty() {
+        if params.verify_findings && !artifact.findings.is_empty() && !budget_exceeded {
             tracing::info!(
                 findings = artifact.findings.len(),
                 "Running structured verifier pass before disclosure"
@@ -2059,6 +2088,10 @@ pub async fn run_review(
                 retry_delay_secs: params.retry_delay_secs,
                 timeout_mins: params.timeout_mins,
                 max_turns: params.max_turns,
+                max_cost_usd: remaining_cost_budget(
+                    params.max_cost_usd,
+                    sum_known_costs([direct_call_cost_usd, main_session_cost_usd]),
+                ),
                 cancel_token: cancel_token.clone(),
             })
             .await?;
@@ -2068,6 +2101,11 @@ pub async fn run_review(
             add_known_cost(&mut main_session_cost_usd, verifier_result.cost_usd);
             artifact = reporting_artifact.lock().await.clone();
 
+            if verifier_result.budget_exceeded {
+                tracing::warn!(
+                    "Verifier cost budget reached; incomplete findings will remain undisclosed"
+                );
+            }
             if !artifact.verifier_complete() {
                 tracing::warn!(
                     "Verifier did not submit verdicts for all findings; disclosure disabled"
@@ -2075,7 +2113,13 @@ pub async fn run_review(
                 artifact.verifier_failed = true;
             }
         } else if !artifact.findings.is_empty() {
-            tracing::warn!("Verifier pass disabled; structured findings will not be disclosed");
+            if budget_exceeded {
+                tracing::warn!(
+                    "Finder cost budget reached; verifier skipped and findings will not be disclosed"
+                );
+            } else {
+                tracing::warn!("Verifier pass disabled; structured findings will not be disclosed");
+            }
             artifact.verifier_failed = true;
         }
 
@@ -2619,6 +2663,7 @@ pub struct VerificationStats {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: Option<f64>,
+    pub budget_exceeded: bool,
 }
 
 pub struct DuplicateSuppressionParams<'a> {
@@ -2639,6 +2684,7 @@ pub struct DuplicateSuppressionParams<'a> {
     pub retry_delay_secs: u64,
     pub timeout_mins: u64,
     pub max_turns: u32,
+    pub max_cost_usd: Option<f64>,
     pub cancel_token: CancellationToken,
 }
 
@@ -2650,6 +2696,13 @@ pub async fn apply_duplicate_suppression(
         || params.artifact.markdown_only_fallback
         || params.artifact.verifier_failed
     {
+        return Ok(None);
+    }
+
+    if params.max_cost_usd.is_some_and(|budget| budget <= 0.0) {
+        tracing::warn!(
+            "Skipping duplicate suppression because the review cost budget is exhausted"
+        );
         return Ok(None);
     }
 
@@ -2708,6 +2761,7 @@ pub async fn apply_duplicate_suppression(
         retry_delay_secs: params.retry_delay_secs,
         timeout_mins: params.timeout_mins,
         max_turns: params.max_turns,
+        max_cost_usd: params.max_cost_usd,
         cancel_token: params.cancel_token,
     })
     .await
@@ -2749,6 +2803,7 @@ struct DedupeParams<'a> {
     retry_delay_secs: u64,
     timeout_mins: u64,
     max_turns: u32,
+    max_cost_usd: Option<f64>,
     cancel_token: CancellationToken,
 }
 
@@ -2818,6 +2873,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
     };
 
     let phase_cancel_token = params.cancel_token.child_token();
+    let mut budget_exceeded = false;
     let dedupe_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
@@ -2871,6 +2927,31 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
                                 params.artifact.clone(),
                             )
                             .await?;
+                            let current_cost = agent
+                                .config
+                                .session_manager
+                                .get_session_usage_totals(&session_config.id)
+                                .await
+                                .ok()
+                                .and_then(|totals| {
+                                    cost_from_session_totals(
+                                        &totals,
+                                        params.provider_name,
+                                        params.model,
+                                        input_price_per_m,
+                                        output_price_per_m,
+                                    )
+                                });
+                            if cost_budget_reached(current_cost, params.max_cost_usd) {
+                                budget_exceeded = true;
+                                tracing::warn!(
+                                    cost = %format_cost(current_cost),
+                                    max = %format_cost(params.max_cost_usd),
+                                    "Duplicate-suppression cost budget reached; cancelling the phase"
+                                );
+                                phase_cancel_token.cancel();
+                                return Ok(());
+                            }
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
@@ -2929,7 +3010,10 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
     phase_cancel_token.cancel();
     dedupe_result.context("Duplicate suppression pass timed out")??;
 
-    let mut stats = VerificationStats::default();
+    let mut stats = VerificationStats {
+        budget_exceeded,
+        ..VerificationStats::default()
+    };
     if let Ok(session_totals) = agent
         .config
         .session_manager
@@ -2975,6 +3059,7 @@ struct VerificationParams<'a> {
     retry_delay_secs: u64,
     timeout_mins: u64,
     max_turns: u32,
+    max_cost_usd: Option<f64>,
     cancel_token: CancellationToken,
 }
 
@@ -3052,6 +3137,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     };
 
     let phase_cancel_token = params.cancel_token.child_token();
+    let mut budget_exceeded = false;
     let verifier_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
@@ -3105,6 +3191,31 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                                 params.artifact.clone(),
                             )
                             .await?;
+                            let current_cost = agent
+                                .config
+                                .session_manager
+                                .get_session_usage_totals(&session_config.id)
+                                .await
+                                .ok()
+                                .and_then(|totals| {
+                                    cost_from_session_totals(
+                                        &totals,
+                                        params.provider_name,
+                                        params.model,
+                                        input_price_per_m,
+                                        output_price_per_m,
+                                    )
+                                });
+                            if cost_budget_reached(current_cost, params.max_cost_usd) {
+                                budget_exceeded = true;
+                                tracing::warn!(
+                                    cost = %format_cost(current_cost),
+                                    max = %format_cost(params.max_cost_usd),
+                                    "Verifier cost budget reached; cancelling the phase"
+                                );
+                                phase_cancel_token.cancel();
+                                return Ok(());
+                            }
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
@@ -3167,7 +3278,10 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     phase_cancel_token.cancel();
     verifier_result.context("Verifier pass timed out")??;
 
-    let mut stats = VerificationStats::default();
+    let mut stats = VerificationStats {
+        budget_exceeded,
+        ..VerificationStats::default()
+    };
     if let Ok(session_totals) = agent
         .config
         .session_manager
@@ -3553,6 +3667,23 @@ Reviewed the PR and found no vulnerabilities.
     fn sum_known_costs_ignores_unknown_components() {
         assert_eq!(sum_known_costs([Some(1.25), None, Some(0.75)]), Some(2.0));
         assert_eq!(sum_known_costs([None, None]), None);
+    }
+
+    #[test]
+    fn cost_budget_stops_at_the_limit() {
+        assert!(!cost_budget_reached(Some(0.99), Some(1.0)));
+        assert!(cost_budget_reached(Some(1.0), Some(1.0)));
+        assert!(cost_budget_reached(Some(1.01), Some(1.0)));
+        assert!(!cost_budget_reached(None, Some(1.0)));
+        assert!(!cost_budget_reached(Some(1.0), None));
+    }
+
+    #[test]
+    fn remaining_cost_budget_is_saturating() {
+        assert_eq!(remaining_cost_budget(Some(2.0), Some(0.75)), Some(1.25));
+        assert_eq!(remaining_cost_budget(Some(2.0), Some(3.0)), Some(0.0));
+        assert_eq!(remaining_cost_budget(Some(2.0), None), Some(2.0));
+        assert_eq!(remaining_cost_budget(None, Some(3.0)), None);
     }
 
     #[test]

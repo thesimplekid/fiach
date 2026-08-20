@@ -482,7 +482,7 @@ The following options are available under `services.fiach`:
 | `timeoutMins` | integer | `30` | Timeout in minutes for each review session. |
 | `maxRetries` | integer | `3` | Maximum number of retries for LLM provider failures and failed review attempts. |
 | `retryDelaySecs` | integer | `10` | Initial delay in seconds before retrying an LLM failure. |
-| `maxCostUsd` | float or null | `null` | Maximum budget in USD for each review. |
+| `maxCostUsd` | float or null | `null` | Maximum observed budget in USD for each review. Cancels finder, verifier, and duplicate-suppression work at the limit. |
 | `inputPricePerM` | float or null | `null` | Override input token price per 1M tokens in USD. |
 | `outputPricePerM` | float or null | `null` | Override output token price per 1M tokens in USD. |
 | `dataDir` | string | `"/var/lib/fiach"` | Directory to store state database and reports. |
@@ -490,6 +490,11 @@ The following options are available under `services.fiach`:
 | `sandbox.enable` | boolean | `false` | Enable Sandboxed PR reviews via systemd-nspawn. |
 | `sandbox.networkMode`| enum (`"host"`, `"bridge"`, `"private"`, `"veth"`) | `"host"` | Network mode for the sandbox. |
 | `sandbox.extraArgs` | list of string | `[]` | Extra arguments to pass to `systemd-nspawn`. |
+
+Cost limits are enforced from provider-reported usage or configured token prices. Because usage is
+reported after a model response, a single in-flight response can overshoot the limit. If neither
+provider cost nor model pricing is available, Fiach logs that it cannot enforce the limit; set
+`inputPricePerM` and `outputPricePerM` to make enforcement deterministic.
 
 ### NixOS Sandbox Network Examples
 

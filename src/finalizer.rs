@@ -25,6 +25,7 @@ pub struct FinalizationSpec {
     pub retry_delay_secs: u64,
     pub timeout_mins: u64,
     pub max_turns: u32,
+    pub max_cost_usd: Option<f64>,
     pub disclose: DiscloseConfig,
     pub buzz: Option<crate::config::BuzzConfig>,
     pub db_path: PathBuf,
@@ -49,6 +50,7 @@ impl From<&ReviewParams> for FinalizationSpec {
             retry_delay_secs: params.retry_delay_secs,
             timeout_mins: params.timeout_mins,
             max_turns: params.max_turns,
+            max_cost_usd: params.max_cost_usd,
             disclose: params.disclose_config.clone(),
             buzz: params.buzz_config.clone(),
             db_path: params.db_path.clone(),
@@ -71,7 +73,7 @@ impl ReviewFinalizer {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
 
-        crate::review::apply_duplicate_suppression(DuplicateSuppressionParams {
+        let dedupe_stats = crate::review::apply_duplicate_suppression(DuplicateSuppressionParams {
             artifact: &mut outcome.artifact,
             workspace_path,
             repo: &spec.repository,
@@ -89,6 +91,10 @@ impl ReviewFinalizer {
             retry_delay_secs: spec.retry_delay_secs,
             timeout_mins: spec.timeout_mins,
             max_turns: spec.max_turns,
+            max_cost_usd: crate::review::remaining_cost_budget(
+                spec.max_cost_usd,
+                outcome.completed.metadata.cost_usd,
+            ),
             cancel_token: cancel,
         })
         .await?;
@@ -108,6 +114,14 @@ impl ReviewFinalizer {
             .context("Failed to write finalized disclosure policy")?;
 
         let mut metadata = outcome.completed.metadata.clone();
+        if let Some(stats) = dedupe_stats {
+            metadata.input_tokens = metadata.input_tokens.max(stats.peak_input_tokens);
+            metadata.output_tokens += stats.output_tokens;
+            metadata.total_tokens += stats.total_tokens;
+            if let Some(cost) = stats.cost_usd {
+                metadata.cost_usd = Some(metadata.cost_usd.unwrap_or(0.0) + cost);
+            }
+        }
         update_metadata(&mut metadata, &outcome, spec.pr_number);
         metadata.artifacts.markdown = Some(absolute(report_path.clone()));
         metadata.artifacts.structured_json = Some(absolute(structured));

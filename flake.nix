@@ -541,7 +541,7 @@
             maxCostUsd = lib.mkOption {
               type = lib.types.nullOr lib.types.float;
               default = null;
-              description = "Maximum budget in USD for each review.";
+              description = "Maximum observed cost in USD for each review; active model work is cancelled when the limit is reached.";
             };
 
             inputPricePerM = lib.mkOption {
