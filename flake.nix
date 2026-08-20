@@ -115,7 +115,7 @@
               lockFile = ./Cargo.lock;
               outputHashes = {
                 "buzz-client-0.1.0" = "sha256-qxOkoR44k3pr9+TmRSZWmRZRXt+56ohCrE4zwF+/nMM=";
-                "goose-1.44.0" = "sha256-/UTdXth/o9IkDx2Amf645vasaknIhYpnFIuoqLfIgfU=";
+                "goose-1.46.0" = "sha256-SRBz4vv5w0gFyWL5rN2Ml9z0h2EIR9/c8t72my/NcdU=";
               };
             };
 
@@ -127,6 +127,7 @@
             let
               envFile = pkgs.writeText "fiach-env" ''
                 GITHUB_TOKEN=ghp_example
+                FIACH_REVIEW_GITHUB_TOKEN=github_pat_read_only_example
                 OPENROUTER_API_KEY=sk-example
                 FIACH_SERVER_TOKEN=server-example
                 FIACH_BUZZ_PRIVATE_KEY=nsec1example
@@ -393,7 +394,7 @@
 
             environmentFile = lib.mkOption {
               type = lib.types.path;
-              description = "Path to environment file containing GITHUB_TOKEN, the selected provider API key, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
+              description = "Path to environment file containing GITHUB_TOKEN, FIACH_REVIEW_GITHUB_TOKEN when sandboxing is enabled, the selected provider API key, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
             };
 
             buzz = {

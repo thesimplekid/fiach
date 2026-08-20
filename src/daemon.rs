@@ -1413,6 +1413,20 @@ async fn configure_sandbox_veth_host(
     Ok(())
 }
 
+fn validate_sandbox_review_token<'a>(
+    review_token: &'a str,
+    host_token: Option<&str>,
+) -> Result<&'a str> {
+    if review_token.trim().is_empty() {
+        anyhow::bail!("FIACH_REVIEW_GITHUB_TOKEN must not be empty");
+    }
+    if host_token == Some(review_token) {
+        anyhow::bail!("FIACH_REVIEW_GITHUB_TOKEN must be distinct from the host GITHUB_TOKEN");
+    }
+
+    Ok(review_token)
+}
+
 async fn run_sandboxed_review(
     params: &DaemonParams,
     review_params: &ReviewParams,
@@ -1531,7 +1545,7 @@ async fn run_sandboxed_review(
         cmd.arg("--bind-ro=/nix/store");
     }
 
-    // Ensure API keys are forwarded securely
+    // Provider credentials are required by Goose inside the review sandbox.
     if let Ok(val) = std::env::var("OPENROUTER_API_KEY") {
         cmd.arg(format!("--setenv=OPENROUTER_API_KEY={}", val));
     }
@@ -1544,9 +1558,16 @@ async fn run_sandboxed_review(
     if let Ok(val) = std::env::var("GOOGLE_API_KEY") {
         cmd.arg(format!("--setenv=GOOGLE_API_KEY={}", val));
     }
-    if let Ok(val) = std::env::var("GITHUB_TOKEN") {
-        cmd.arg(format!("--setenv=GITHUB_TOKEN={}", val));
-    }
+    // Never expose the host disclosure token to the model-controlled review
+    // process. This token must be separately provisioned with read-only access
+    // sufficient for cloning repositories and reading pull-request metadata.
+    let review_github_token = std::env::var("FIACH_REVIEW_GITHUB_TOKEN").context(
+        "Sandboxed reviews require FIACH_REVIEW_GITHUB_TOKEN; configure a read-only GitHub token distinct from GITHUB_TOKEN",
+    )?;
+    let host_github_token = std::env::var("GITHUB_TOKEN").ok();
+    let review_github_token =
+        validate_sandbox_review_token(&review_github_token, host_github_token.as_deref())?;
+    cmd.arg(format!("--setenv=GITHUB_TOKEN={review_github_token}"));
     if let Ok(val) = std::env::var("RUST_LOG") {
         cmd.arg(format!("--setenv=RUST_LOG={}", val));
     }
@@ -2207,5 +2228,15 @@ mod tests {
         assert_eq!(pr_list_state_arg("merged"), "merged");
         assert_eq!(pr_list_state_arg("all"), "all");
         assert_eq!(pr_list_state_arg("unexpected"), "all");
+    }
+
+    #[test]
+    fn sandbox_review_token_must_be_nonempty_and_distinct() {
+        assert_eq!(
+            validate_sandbox_review_token("review-read-only", Some("host-write")).unwrap(),
+            "review-read-only"
+        );
+        assert!(validate_sandbox_review_token("", Some("host-write")).is_err());
+        assert!(validate_sandbox_review_token("shared-token", Some("shared-token")).is_err());
     }
 }

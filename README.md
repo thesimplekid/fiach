@@ -34,19 +34,23 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 - **Environment Variables:**
   - `OPENROUTER_API_KEY`: For default OpenRouter LLM access.
   - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`: Required only when using the matching direct provider.
-  - `GITHUB_TOKEN`: For repository cloning and PR interaction.
+  - `GITHUB_TOKEN`: Host-only token for PR discovery and permitted disclosure actions.
+  - `FIACH_REVIEW_GITHUB_TOKEN`: Separate read-only token used inside review sandboxes for cloning repositories and reading PR metadata.
 
 ### Credential Scope
 
-The review agent can execute shell commands. In sandbox mode, `fiach` forwards configured provider API keys and `GITHUB_TOKEN` into the `systemd-nspawn` container so the review can reach the selected LLM provider and GitHub.
+The review agent can execute shell commands. In sandbox mode, `fiach` forwards configured provider API keys and maps `FIACH_REVIEW_GITHUB_TOKEN` to `GITHUB_TOKEN` inside the `systemd-nspawn` container so the review can reach the selected LLM provider and read GitHub data. The host `GITHUB_TOKEN` is never forwarded to the model-controlled process.
+
+Non-sandboxed reviews share the host process environment and do not provide this credential boundary. Use sandbox mode whenever the host token can perform write or disclosure actions.
 
 The sandbox also bootstraps its own runtime environment for service deployments:
 - a CA bundle path for `git` and `gh`
 - writable Goose state and log directories
 - packaged domain skills for environments where the review workspace does not contain `.agents/skills`
 
-Treat both credentials as readable by the agent during a review. Use least-privilege credentials:
-- Prefer a fine-grained `GITHUB_TOKEN` scoped only to the repositories `fiach` must review and disclose to.
+Treat every credential forwarded into the review sandbox—the read-only review token and provider keys—as readable by the agent. Use least-privilege credentials:
+- Scope the host `GITHUB_TOKEN` only to the repositories and disclosure actions `fiach` needs.
+- Configure `FIACH_REVIEW_GITHUB_TOKEN` as a distinct fine-grained token with read-only repository contents, metadata, and pull-request access. Sandboxed reviews fail closed when it is absent; do not reuse the host disclosure token.
 - Avoid broad write access, org-wide scopes, or access to unrelated private repositories.
 - Use an `OPENROUTER_API_KEY` with the smallest practical billing and account exposure.
 - If using a direct provider, apply the same least-privilege and billing limits to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`.
@@ -411,7 +415,8 @@ In your `flake.nix` or `configuration.nix`:
             reportMode = "sync-pr";
             syncRepo = "my-org/security-audits";
             
-            # Environment file containing GITHUB_TOKEN and the selected provider API key.
+            # Environment file containing host-only GITHUB_TOKEN,
+            # read-only FIACH_REVIEW_GITHUB_TOKEN, and the selected provider API key.
             # FIACH_SERVER_TOKEN is optional and protects the local web control API.
             environmentFile = "/run/secrets/fiach-env";
 
@@ -462,7 +467,7 @@ The following options are available under `services.fiach`:
 | `model` | string | `"google/gemini-3.1-pro-preview"` | Model to use with the selected provider. |
 | `verifierProvider` | string or null | `null` | Provider to use for the verifier pass. Defaults to `provider` when unset. |
 | `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
-| `environmentFile` | path | *none* | Path to environment file containing `GITHUB_TOKEN`, the selected provider API key, and optionally `FIACH_SERVER_TOKEN`. |
+| `environmentFile` | path | *none* | Path to an environment file containing host-only `GITHUB_TOKEN`, read-only `FIACH_REVIEW_GITHUB_TOKEN` when sandboxing is enabled, the selected provider API key, and optionally `FIACH_SERVER_TOKEN`. |
 | `logFilter` | string | `"fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
 | `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |

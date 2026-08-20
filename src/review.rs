@@ -12,8 +12,9 @@ use goose::conversation::message::{Message, MessageContent};
 use goose::model_config::model_config_from_user_config;
 use goose::providers::canonical::maybe_get_canonical_model;
 use goose::providers::create_with_named_model;
-use goose::session::{Session, SessionType};
-use rmcp::model::{CallToolResult, Content, RawContent, Role};
+use goose::session::SessionType;
+use goose::session::session_manager::SessionUsageTotals;
+use rmcp::model::{CallToolResult, ContentBlock as Content, Role};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -90,26 +91,11 @@ struct SessionUsageSnapshot {
 }
 
 impl SessionUsageSnapshot {
-    fn from_session(session: &Session) -> Self {
-        let input_tokens = nonnegative_token_count(
-            session
-                .accumulated_usage
-                .input_tokens
-                .or(session.usage.input_tokens),
-        );
-        let output_tokens = nonnegative_token_count(
-            session
-                .accumulated_usage
-                .output_tokens
-                .or(session.usage.output_tokens),
-        );
-        let total_tokens = nonnegative_token_count(
-            session
-                .accumulated_usage
-                .total_tokens
-                .or(session.usage.total_tokens),
-        )
-        .max(input_tokens + output_tokens);
+    fn from_totals(totals: &SessionUsageTotals) -> Self {
+        let input_tokens = nonnegative_token_count(totals.accumulated_usage.input_tokens);
+        let output_tokens = nonnegative_token_count(totals.accumulated_usage.output_tokens);
+        let total_tokens = nonnegative_token_count(totals.accumulated_usage.total_tokens)
+            .max(input_tokens + output_tokens);
 
         Self {
             input_tokens,
@@ -119,13 +105,13 @@ impl SessionUsageSnapshot {
     }
 }
 
-fn session_accumulated_tokens(session: &Session) -> (u64, u64) {
-    let snapshot = SessionUsageSnapshot::from_session(session);
+fn session_accumulated_tokens(totals: &SessionUsageTotals) -> (u64, u64) {
+    let snapshot = SessionUsageSnapshot::from_totals(totals);
     (snapshot.input_tokens, snapshot.output_tokens)
 }
 
-fn cost_from_session(
-    session: &Session,
+fn cost_from_session_totals(
+    totals: &SessionUsageTotals,
     provider: &str,
     model: &str,
     input_override: Option<f64>,
@@ -133,12 +119,12 @@ fn cost_from_session(
 ) -> Option<f64> {
     if input_override.is_none()
         && output_override.is_none()
-        && let Some(cost) = session.accumulated_cost
+        && let Some(cost) = totals.accumulated_cost
     {
         return Some(cost.max(0.0));
     }
 
-    let (input, output) = session_accumulated_tokens(session);
+    let (input, output) = session_accumulated_tokens(totals);
     estimate_cost(
         provider,
         model,
@@ -663,7 +649,7 @@ fn extract_subagent_task_id(result: &CallToolResult) -> Option<String> {
     }
 
     result.content.iter().find_map(|content| {
-        let RawContent::Text(text) = &content.raw else {
+        let Content::Text(text) = content else {
             return None;
         };
         let text = text.text.trim();
@@ -704,8 +690,8 @@ fn summarize_lane_load_findings(result: &CallToolResult) -> LaneLoadFindingSumma
     let text = result
         .content
         .iter()
-        .filter_map(|content| match &content.raw {
-            RawContent::Text(text) => Some(text.text.as_str()),
+        .filter_map(|content| match content {
+            Content::Text(text) => Some(text.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1615,6 +1601,7 @@ pub async fn run_review(
         "Sending review request to agent..."
     );
 
+    let phase_cancel_token = cancel_token.child_token();
     let review_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
@@ -1631,7 +1618,11 @@ pub async fn run_review(
             let session_config_clone = session_config.clone();
 
             match agent
-                .reply(user_message_clone, session_config_clone, None)
+                .reply(
+                    user_message_clone,
+                    session_config_clone,
+                    Some(phase_cancel_token.clone()),
+                )
                 .await
             {
                 Ok(s) => break s,
@@ -1662,7 +1653,7 @@ pub async fn run_review(
 
         loop {
             tokio::select! {
-                _ = cancel_token.cancelled() => {
+                _ = phase_cancel_token.cancelled() => {
                     tracing::warn!("Review cancelled by user (Ctrl+C)");
                     bail!("Review cancelled by user");
                 }
@@ -1700,19 +1691,20 @@ pub async fn run_review(
                                     last_assistant_text = Some(text);
                                 }
 
-                                let session = agent
+                                let session_totals = agent
                                     .config
                                     .session_manager
-                                    .get_session(&session_config.id, false)
+                                    .get_session_usage_totals(&session_config.id)
                                     .await
                                     .ok();
 
-                                if let Some(session) = session.as_ref() {
-                                    let (current_input, _) = session_accumulated_tokens(session);
+                                if let Some(session_totals) = session_totals.as_ref() {
+                                    let (current_input, _) =
+                                        session_accumulated_tokens(session_totals);
                                     peak_input_tokens = peak_input_tokens.max(current_input);
 
-                                    let session_cost = cost_from_session(
-                                        session,
+                                    let session_cost = cost_from_session_totals(
+                                        session_totals,
                                         &params.provider,
                                         &params.model,
                                         input_price_per_m,
@@ -1770,7 +1762,7 @@ pub async fn run_review(
                                                 .reply(
                                                     follow_up_message.clone(),
                                                     session_config.clone(),
-                                                    None,
+                                                    Some(phase_cancel_token.clone()),
                                                 )
                                                 .await
                                             {
@@ -1851,7 +1843,14 @@ pub async fn run_review(
                             let mut s_opt = None;
                             let mut last_err = None;
                             while retries <= params.max_retries {
-                                match agent.reply(follow_up_message.clone(), session_config.clone(), None).await {
+                                match agent
+                                    .reply(
+                                        follow_up_message.clone(),
+                                        session_config.clone(),
+                                        Some(phase_cancel_token.clone()),
+                                    )
+                                    .await
+                                {
                                     Ok(s) => {
                                         s_opt = Some(s);
                                         break;
@@ -1937,7 +1936,14 @@ pub async fn run_review(
                             let mut s_opt = None;
                             let mut last_err = None;
                             while retries <= params.max_retries {
-                                match agent.reply(follow_up_message.clone(), session_config.clone(), None).await {
+                                match agent
+                                    .reply(
+                                        follow_up_message.clone(),
+                                        session_config.clone(),
+                                        Some(phase_cancel_token.clone()),
+                                    )
+                                    .await
+                                {
                                     Ok(s) => {
                                         s_opt = Some(s);
                                         break;
@@ -1970,7 +1976,9 @@ pub async fn run_review(
             }
         }
     };
-    match timeout(Duration::from_secs(params.timeout_mins * 60), review_future).await {
+    let review_result = timeout(Duration::from_secs(params.timeout_mins * 60), review_future).await;
+    phase_cancel_token.cancel();
+    match review_result {
         Ok(result) => result?,
         Err(_) => {
             tracing::warn!(
@@ -1985,19 +1993,19 @@ pub async fn run_review(
     };
 
     // 9. Collect final session metrics before cleaning up
-    if let Ok(session) = agent
+    if let Ok(session_totals) = agent
         .config
         .session_manager
-        .get_session(&session_config.id, false)
+        .get_session_usage_totals(&session_config.id)
         .await
     {
-        let (input, output) = session_accumulated_tokens(&session);
+        let (input, output) = session_accumulated_tokens(&session_totals);
 
         peak_input_tokens = peak_input_tokens.max(input);
         total_output_tokens += output;
         total_processed_tokens += input + output;
-        main_session_cost_usd = cost_from_session(
-            &session,
+        main_session_cost_usd = cost_from_session_totals(
+            &session_totals,
             &params.provider,
             &params.model,
             input_price_per_m,
@@ -2808,6 +2816,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
         retry_config: None,
     };
 
+    let phase_cancel_token = params.cancel_token.child_token();
     let dedupe_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
@@ -2816,7 +2825,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
                 .reply(
                     Message::user().with_text(&dedupe_prompt),
                     session_config.clone(),
-                    None,
+                    Some(phase_cancel_token.clone()),
                 )
                 .await
             {
@@ -2848,7 +2857,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
 
         loop {
             tokio::select! {
-                _ = params.cancel_token.cancelled() => {
+                _ = phase_cancel_token.cancelled() => {
                     bail!("Duplicate suppression pass cancelled by user");
                 }
                 event = stream.next() => {
@@ -2884,7 +2893,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
                                 .reply(
                                     Message::user().with_text(&retry_prompt),
                                     session_config.clone(),
-                                    None,
+                                    Some(phase_cancel_token.clone()),
                                 )
                                 .await
                                 .context("Failed to restart duplicate suppression stream")?;
@@ -2904,7 +2913,7 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
                                 .reply(
                                     Message::user().with_text(&retry_prompt),
                                     session_config.clone(),
-                                    None,
+                                    Some(phase_cancel_token.clone()),
                                 )
                                 .await
                                 .context("Failed to restart duplicate suppression stream")?;
@@ -2915,23 +2924,23 @@ async fn run_dedupe_pass(params: DedupeParams<'_>) -> Result<VerificationStats> 
         }
     };
 
-    timeout(Duration::from_secs(params.timeout_mins * 60), dedupe_future)
-        .await
-        .context("Duplicate suppression pass timed out")??;
+    let dedupe_result = timeout(Duration::from_secs(params.timeout_mins * 60), dedupe_future).await;
+    phase_cancel_token.cancel();
+    dedupe_result.context("Duplicate suppression pass timed out")??;
 
     let mut stats = VerificationStats::default();
-    if let Ok(session) = agent
+    if let Ok(session_totals) = agent
         .config
         .session_manager
-        .get_session(&session_config.id, false)
+        .get_session_usage_totals(&session_config.id)
         .await
     {
-        let (input, output) = session_accumulated_tokens(&session);
+        let (input, output) = session_accumulated_tokens(&session_totals);
         stats.peak_input_tokens = input;
         stats.output_tokens = output;
         stats.total_tokens = input + output;
-        stats.cost_usd = cost_from_session(
-            &session,
+        stats.cost_usd = cost_from_session_totals(
+            &session_totals,
             params.provider_name,
             params.model,
             input_price_per_m,
@@ -3041,6 +3050,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         retry_config: None,
     };
 
+    let phase_cancel_token = params.cancel_token.child_token();
     let verifier_future = async {
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
@@ -3049,7 +3059,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                 .reply(
                     Message::user().with_text(&verifier_prompt),
                     session_config.clone(),
-                    None,
+                    Some(phase_cancel_token.clone()),
                 )
                 .await
             {
@@ -3081,7 +3091,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
 
         loop {
             tokio::select! {
-                _ = params.cancel_token.cancelled() => {
+                _ = phase_cancel_token.cancelled() => {
                     bail!("Verifier pass cancelled by user");
                 }
                 event = stream.next() => {
@@ -3117,7 +3127,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                                 .reply(
                                     Message::user().with_text(&retry_prompt),
                                     session_config.clone(),
-                                    None,
+                                    Some(phase_cancel_token.clone()),
                                 )
                                 .await
                                 .context("Failed to restart verifier stream")?;
@@ -3137,7 +3147,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                                 .reply(
                                     Message::user().with_text(&retry_prompt),
                                     session_config.clone(),
-                                    None,
+                                    Some(phase_cancel_token.clone()),
                                 )
                                 .await
                                 .context("Failed to restart verifier stream")?;
@@ -3148,26 +3158,27 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         }
     };
 
-    timeout(
+    let verifier_result = timeout(
         Duration::from_secs(params.timeout_mins * 60),
         verifier_future,
     )
-    .await
-    .context("Verifier pass timed out")??;
+    .await;
+    phase_cancel_token.cancel();
+    verifier_result.context("Verifier pass timed out")??;
 
     let mut stats = VerificationStats::default();
-    if let Ok(session) = agent
+    if let Ok(session_totals) = agent
         .config
         .session_manager
-        .get_session(&session_config.id, false)
+        .get_session_usage_totals(&session_config.id)
         .await
     {
-        let (input, output) = session_accumulated_tokens(&session);
+        let (input, output) = session_accumulated_tokens(&session_totals);
         stats.peak_input_tokens = input;
         stats.output_tokens = output;
         stats.total_tokens = input + output;
-        stats.cost_usd = cost_from_session(
-            &session,
+        stats.cost_usd = cost_from_session_totals(
+            &session_totals,
             params.provider_name,
             params.model,
             input_price_per_m,
@@ -3242,17 +3253,38 @@ fn estimate_cost(
     Some(input_cost + output_cost)
 }
 
+fn contains_http_status(msg: &str, status: u16) -> bool {
+    let status = status.to_string();
+    [
+        format!("http {status}"),
+        format!("status {status}"),
+        format!("status: {status}"),
+        format!("({status})"),
+    ]
+    .iter()
+    .any(|marker| msg.contains(marker))
+}
+
+fn transient_error_message(msg: &str) -> bool {
+    msg.contains("rate limit")
+        || msg.contains("too many requests")
+        || contains_http_status(msg, 429)
+}
+
 fn fatal_error_message(msg: &str) -> bool {
+    if transient_error_message(msg) {
+        return false;
+    }
+
     msg.contains("credits exhausted")
         || msg.contains("payment required")
-        || msg.contains("402")
+        || contains_http_status(msg, 402)
         || msg.contains("insufficient credits")
-        || msg.contains("limit exceeded")
         || msg.contains("quota exceeded")
         || msg.contains("unauthorized")
-        || msg.contains("401")
+        || contains_http_status(msg, 401)
         || msg.contains("forbidden")
-        || msg.contains("403")
+        || contains_http_status(msg, 403)
 }
 
 /// Returns true for agent completion failures that should fail one review attempt,
@@ -3419,6 +3451,31 @@ Reviewed the PR and found no vulnerabilities.
     }
 
     #[test]
+    fn transient_rate_limit_errors_are_retried() {
+        for message in [
+            "Rate limit exceeded",
+            "HTTP 429 Too Many Requests",
+            "provider returned status: 429",
+        ] {
+            let error = anyhow::anyhow!(message);
+
+            assert!(!is_fatal_error(&error), "unexpected fatal error: {message}");
+        }
+    }
+
+    #[test]
+    fn unrelated_numbers_and_context_limits_are_not_auth_failures() {
+        for message in [
+            "request 40123 failed during transport",
+            "context length limit exceeded",
+        ] {
+            let error = anyhow::anyhow!(message);
+
+            assert!(!is_fatal_error(&error), "unexpected fatal error: {message}");
+        }
+    }
+
+    #[test]
     fn fatal_provider_marker_wins_over_structured_result_missing_text() {
         let error = anyhow::anyhow!(
             "Sandboxed review failed with status: exit status: 1; recent output:\n\
@@ -3450,6 +3507,39 @@ Reviewed the PR and found no vulnerabilities.
         );
 
         assert_eq!(cost, Some(5.0));
+    }
+
+    #[test]
+    fn session_usage_snapshot_uses_recursive_totals_and_normalizes_values() {
+        let mut totals = SessionUsageTotals::default();
+        totals.accumulated_usage.input_tokens = Some(1_200);
+        totals.accumulated_usage.output_tokens = Some(300);
+        totals.accumulated_usage.total_tokens = Some(1_000);
+
+        assert_eq!(
+            SessionUsageSnapshot::from_totals(&totals),
+            SessionUsageSnapshot {
+                input_tokens: 1_200,
+                output_tokens: 300,
+                total_tokens: 1_500,
+            }
+        );
+
+        totals.accumulated_usage.input_tokens = Some(-1);
+        assert_eq!(SessionUsageSnapshot::from_totals(&totals).input_tokens, 0);
+    }
+
+    #[test]
+    fn session_cost_prefers_recursive_provider_cost_without_overrides() {
+        let totals = SessionUsageTotals {
+            accumulated_cost: Some(1.75),
+            ..SessionUsageTotals::default()
+        };
+
+        assert_eq!(
+            cost_from_session_totals(&totals, "unknown", "unknown", None, None),
+            Some(1.75)
+        );
     }
 
     #[test]
@@ -3584,7 +3674,7 @@ Reviewed the PR and found no vulnerabilities.
 
     #[test]
     fn extract_subagent_task_id_prefers_tool_result_metadata() {
-        let mut meta = rmcp::model::Meta::new();
+        let mut meta = rmcp::model::MetaObject::new();
         meta.0.insert(
             "subagent_session_id".to_string(),
             serde_json::Value::String("20260703_2".to_string()),
