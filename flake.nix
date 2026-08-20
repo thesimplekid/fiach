@@ -627,7 +627,7 @@
               enable = lib.mkEnableOption "Sandboxed PR reviews via systemd-nspawn";
               networkMode = lib.mkOption {
                 type = lib.types.enum [ "host" "bridge" "private" "veth" ];
-                default = "host";
+                default = "veth";
                 description = ''
                   Network mode for the sandbox.
 
@@ -641,8 +641,8 @@
                   automatically configures the host's systemd-networkd, IP
                   forwarding, and firewall to make this work.
 
-                  "host" (default) shares the host's network namespace -- the simplest
-                  escape hatch if veth-based NAT cannot be used. The container
+                  "host" shares the host's network namespace and should be used
+                  only as an explicit compatibility escape hatch. The container
                   then has full access to all host network interfaces.
 
                   "private" gives the container only loopback (no internet); only
@@ -653,6 +653,21 @@
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
                 description = "Extra arguments to pass to systemd-nspawn";
+              };
+              memoryMax = lib.mkOption {
+                type = lib.types.str;
+                default = "8G";
+                description = "Aggregate systemd MemoryMax for the daemon and all sandbox workers.";
+              };
+              cpuQuota = lib.mkOption {
+                type = lib.types.str;
+                default = "400%";
+                description = "Aggregate systemd CPUQuota for the daemon and all sandbox workers.";
+              };
+              tasksMax = lib.mkOption {
+                type = lib.types.ints.positive;
+                default = 4096;
+                description = "Aggregate systemd TasksMax for the daemon and all sandbox workers.";
               };
             };
           };
@@ -926,9 +941,15 @@
                     ];
                     Restart = "always";
                     RestartSec = "10s";
+                    UMask = "0077";
+                    TimeoutStopSec = "90s";
                   } // (if cfg.sandbox.enable then {
                     # systemd-nspawn needs real root to create namespaces and mounts.
                     # DynamicUser's transient UID with ambient caps is insufficient.
+                    MemoryMax = cfg.sandbox.memoryMax;
+                    CPUQuota = cfg.sandbox.cpuQuota;
+                    TasksMax = cfg.sandbox.tasksMax;
+                    OOMPolicy = "stop";
                   } else {
                     DynamicUser = true;
                     User = "fiach";

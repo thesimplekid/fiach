@@ -293,7 +293,11 @@ async fn populate_author_associations(repo: &str, prs: &mut [PullRequest]) -> Re
 }
 
 fn is_veth_network(params: &DaemonParams) -> bool {
-    params.sandbox_rootfs.is_some() && params.sandbox_network.as_deref() == Some("veth")
+    params.sandbox_rootfs.is_some() && effective_sandbox_network(params) == "veth"
+}
+
+fn effective_sandbox_network(params: &DaemonParams) -> &str {
+    params.sandbox_network.as_deref().unwrap_or("veth")
 }
 
 fn validate_sandbox_network_capacity(params: &DaemonParams) -> Result<()> {
@@ -1433,7 +1437,11 @@ async fn run_sandboxed_review(
     review_params: &ReviewParams,
     cancel_token: CancellationToken,
 ) -> Result<ReviewOutcome> {
-    let rootfs = params.sandbox_rootfs.as_ref().unwrap();
+    let rootfs = params
+        .sandbox_rootfs
+        .as_ref()
+        .context("Sandbox rootfs is required for sandboxed review execution")?;
+    let network_mode = effective_sandbox_network(params);
 
     if !rootfs.exists() || !rootfs.is_dir() {
         anyhow::bail!(
@@ -1443,13 +1451,11 @@ async fn run_sandboxed_review(
     }
 
     #[allow(clippy::collapsible_if)]
-    if let Some(net) = &params.sandbox_network {
-        if net != "bridge" && net != "veth" && net != "private" && net != "host" {
-            anyhow::bail!(
-                "Invalid sandbox network mode: {}. Must be host, bridge, private, or veth.",
-                net
-            );
-        }
+    if !matches!(network_mode, "bridge" | "veth" | "private" | "host") {
+        anyhow::bail!(
+            "Invalid sandbox network mode: {}. Must be host, bridge, private, or veth.",
+            network_mode
+        );
     }
 
     let run_dir = sandbox_run_dir(
@@ -1468,6 +1474,7 @@ async fn run_sandboxed_review(
     let result_json = run_dir.join("result.json");
     let nspawn_log = run_dir.join("nspawn.log");
     let runtime_rootfs = prepare_runtime_rootfs(rootfs, &run_dir).await?;
+    let _runtime_rootfs_guard = RuntimeRootfsGuard::new(runtime_rootfs.clone());
     let sandbox_home = "/tmp";
     let sandbox_xdg_state_home = "/tmp/.local/state";
 
@@ -1494,7 +1501,7 @@ async fn run_sandboxed_review(
         review_params.pr_number,
         &review_params.review_kind,
     );
-    let veth_network = if params.sandbox_network.as_deref() == Some("veth") {
+    let veth_network = if network_mode == "veth" {
         Some(SandboxVethReservation::reserve(&machine_name)?)
     } else {
         None
@@ -1507,6 +1514,9 @@ async fn run_sandboxed_review(
     // which requires privileges a service unit doesn't have.
     cmd.arg("--private-users=no");
     cmd.arg("--keep-unit");
+    cmd.arg("--settings=no");
+    cmd.arg("--register=no");
+    cmd.arg("--no-new-privileges");
     // Set PATH inside the sandbox so the child fiach process can find git, gh, etc.
     // in /bin (populated by the Nix-built rootfs's pathsToLink = [ "/bin" ... ]).
     cmd.arg("--setenv=PATH=/bin");
@@ -1587,19 +1597,20 @@ async fn run_sandboxed_review(
     // container to configure host0 -- which needs CAP_NET_ADMIN inside the
     // container's net namespace.  "host" shares the host network and needs
     // no extra capabilities.  "private" gives loopback only.
-    #[allow(clippy::collapsible_if)]
-    if let Some(net) = &params.sandbox_network {
-        if net == "bridge" {
+    match network_mode {
+        "bridge" => {
             cmd.arg("--network-bridge=br-nspawn");
             cmd.arg("--capability=CAP_NET_ADMIN"); // Required for dhcpcd to set IP/routes
-        } else if net == "veth" {
+        }
+        "veth" => {
             cmd.arg("--network-veth");
             cmd.arg("--capability=CAP_NET_ADMIN");
-        } else if net == "private" {
-            cmd.arg("--private-network");
-        } else if net != "host" {
-            tracing::warn!("Unknown network mode {}, defaulting to host", net);
         }
+        "private" => {
+            cmd.arg("--private-network");
+        }
+        "host" => {}
+        other => anyhow::bail!("Unsupported sandbox network mode: {other}"),
     }
 
     if let Some(extra_args) = &params.sandbox_extra_args {
@@ -1694,7 +1705,7 @@ async fn run_sandboxed_review(
         machine = %machine_name,
         veth_subnet = veth_network.as_ref().map(|network| network.index),
         log = %nspawn_log.display(),
-        network = ?params.sandbox_network,
+        network = network_mode,
         "Launching sandboxed review"
     );
 
@@ -1707,6 +1718,7 @@ async fn run_sandboxed_review(
     ));
     cmd.stderr(Stdio::from(log_file));
 
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("Failed to spawn systemd-nspawn")?;
 
     if let Some(network) = &veth_network
@@ -1777,6 +1789,31 @@ async fn run_sandboxed_review(
             executor: "sandbox".to_string(),
         },
     )
+}
+
+struct RuntimeRootfsGuard {
+    path: PathBuf,
+}
+
+impl RuntimeRootfsGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for RuntimeRootfsGuard {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            tracing::debug!(path = %self.path.display(), "Removing sandbox runtime rootfs");
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %error,
+                    "Failed to remove sandbox runtime rootfs"
+                );
+            }
+        }
+    }
 }
 
 async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<PathBuf> {
@@ -1912,6 +1949,20 @@ fn tail_file(path: &Path, max_lines: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_rootfs_guard_removes_materialized_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_rootfs = temp.path().join("rootfs");
+        std::fs::create_dir(&runtime_rootfs).unwrap();
+
+        {
+            let _guard = RuntimeRootfsGuard::new(runtime_rootfs.clone());
+            assert!(runtime_rootfs.exists());
+        }
+
+        assert!(!runtime_rootfs.exists());
+    }
 
     #[test]
     fn author_association_filter_is_case_insensitive() {

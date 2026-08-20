@@ -233,7 +233,13 @@ impl SandboxConfig {
         network: Option<String>,
         extra_args: Option<Vec<String>>,
     ) -> Result<Self> {
-        let network = network.unwrap_or_else(|| "host".to_string());
+        let network = network.unwrap_or_else(|| {
+            if rootfs.is_some() {
+                "veth".to_string()
+            } else {
+                "host".to_string()
+            }
+        });
         if !matches!(network.as_str(), "host" | "bridge" | "private" | "veth") {
             anyhow::bail!("sandbox network must be host, bridge, private, or veth");
         }
@@ -426,6 +432,16 @@ allowed_pubkeys = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         assert_eq!(runtime.scheduler.queue_capacity, 16);
         assert_eq!(runtime.storage.database, PathBuf::from("fiach.redb"));
         assert_eq!(runtime.sandbox.network, "host");
+    }
+
+    #[test]
+    fn sandboxed_runtime_defaults_to_veth_networking() {
+        let raw = DaemonConfig {
+            sandbox_rootfs: Some(PathBuf::from("/sandbox")),
+            ..DaemonConfig::default()
+        };
+        let runtime = RuntimeConfig::resolve_daemon(&raw).unwrap();
+        assert_eq!(runtime.sandbox.network, "veth");
     }
 
     #[test]

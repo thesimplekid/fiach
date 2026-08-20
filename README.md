@@ -437,7 +437,7 @@ In your `flake.nix` or `configuration.nix`:
               #   host-local services. This is namespace isolation, not egress filtering, and it does
               #   NOT restrict the sandbox to GitHub/OpenRouter only.
               # - "private": Fully offline.
-              networkMode = "host";
+              networkMode = "veth";
             };
           };
         }
@@ -490,8 +490,11 @@ The following options are available under `services.fiach`:
 | `dataDir` | string | `"/var/lib/fiach"` | Directory to store state database and reports. |
 | `contextGroups` | attrset | `{}` | Context groups mapped by target repo (contains `repos` list). |
 | `sandbox.enable` | boolean | `false` | Enable Sandboxed PR reviews via systemd-nspawn. |
-| `sandbox.networkMode`| enum (`"host"`, `"bridge"`, `"private"`, `"veth"`) | `"host"` | Network mode for the sandbox. |
+| `sandbox.networkMode`| enum (`"host"`, `"bridge"`, `"private"`, `"veth"`) | `"veth"` | Network mode for the sandbox. `veth` isolates host-local services while retaining outbound NAT. |
 | `sandbox.extraArgs` | list of string | `[]` | Extra arguments to pass to `systemd-nspawn`. |
+| `sandbox.memoryMax` | systemd size | `"8G"` | Aggregate memory limit for the daemon and all sandbox workers. |
+| `sandbox.cpuQuota` | systemd percent | `"400%"` | Aggregate CPU quota for the daemon and all sandbox workers. |
+| `sandbox.tasksMax` | positive integer | `4096` | Aggregate task limit for the daemon and all sandbox workers. |
 
 Cost limits are enforced from provider-reported usage or configured token prices. Because usage is
 reported after a model response, a single in-flight response can overshoot the limit. If neither
@@ -500,13 +503,13 @@ provider cost nor model pricing is available, Fiach logs that it cannot enforce 
 
 ### NixOS Sandbox Network Examples
 
-Default host networking:
+Default isolated veth networking:
 
 ```nix
 services.fiach = {
   sandbox = {
     enable = true;
-    networkMode = "host";
+    networkMode = "veth";
   };
 };
 ```
@@ -528,9 +531,9 @@ When using `bridge`, the host must create and maintain `br-nspawn`, addressing, 
 
 `systemd-nspawn` can isolate the sandbox from the host network namespace, but it does not provide destination allowlisting such as "only GitHub and OpenRouter".
 
-- `sandbox.networkMode = "host"` is the current default because it is the most reliable option for service deployments.
+- `sandbox.networkMode = "host"` is an explicit compatibility escape hatch that shares host networking.
 - `sandbox.networkMode = "bridge"` attaches each sandbox to an existing `br-nspawn` bridge.
-- `sandbox.networkMode = "veth"` gives each sandbox its own `10.64.<index>.0/30` veth subnet, blocks access to host-local services, and configures NixOS NAT for outbound internet access from the `10.64.0.0/16` sandbox pool.
+- `sandbox.networkMode = "veth"` is the default. It gives each sandbox its own `10.64.<index>.0/30` veth subnet, blocks access to host-local services, and configures NixOS NAT for outbound internet access from the `10.64.0.0/16` sandbox pool.
 - `sandbox.networkMode = "private"` disables all network access, which also prevents GitHub and OpenRouter access.
 - Restricting outbound traffic to specific destinations requires host-side enforcement such as `nftables`/`iptables` rules on the `ve-*` interfaces, or a proxy-based egress policy.
 - IP allowlists can be managed in NixOS firewall configuration, but they are brittle for CDN-backed services.
