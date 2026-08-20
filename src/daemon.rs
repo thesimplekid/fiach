@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use serde::Deserialize;
-use time::{OffsetDateTime, format_description};
+use time::OffsetDateTime;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -453,8 +453,13 @@ fn pr_search_query(
 
     if filter_by_updated {
         let time_ago = OffsetDateTime::now_utc() - time::Duration::days(updated_within_days.into());
-        let format = format_description::parse("[year]-[month]-[day]").unwrap();
-        let search_date = time_ago.format(&format).unwrap();
+        let date = time_ago.date();
+        let search_date = format!(
+            "{:04}-{:02}-{:02}",
+            date.year(),
+            u8::from(date.month()),
+            date.day()
+        );
         parts.push(format!("updated:>={search_date}"));
     }
 
