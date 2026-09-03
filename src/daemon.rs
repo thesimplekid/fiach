@@ -1521,7 +1521,7 @@ async fn run_sandboxed_review(
     cmd.arg("--keep-unit");
     cmd.arg("--settings=no");
     cmd.arg("--register=no");
-    cmd.arg("--no-new-privileges");
+    cmd.arg("--no-new-privileges=yes");
     // Set PATH inside the sandbox so the child fiach process can find git, gh, etc.
     // in /bin (populated by the Nix-built rootfs's pathsToLink = [ "/bin" ... ]).
     cmd.arg("--setenv=PATH=/bin");
