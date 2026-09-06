@@ -14,12 +14,12 @@ Focus areas: readability, modularity, performance, architectural fit, and adhere
 
 <critical_constraint>
 - Never guess what code does — read it.
-- You MUST use the structured reporting tools. Submit each actionable issue with `submit_finding`. If you find no actionable issues, call `submit_no_findings`.
-- Do not write the final report file yourself. The host renders `{report_path}` from the structured tool submissions.
+- Return structured candidate JSON to the coordinator using the lane execution contract. Do not call reporting tools.
+- Do not write report files. The coordinator submits candidates and the host renders the report.
 - Every finding must be rooted in `.pr_diff.txt`. Do NOT report pre-existing issues whose root cause is outside the patch.
 - Avoid subjective style nits unless they violate established project conventions or create a concrete maintenance problem.
 - Include repository-relative `affected_locations` with PR-branch line numbers when a finding can be anchored to changed code.
-- Record domain skills in the `skills_used` field of `submit_finding` or `submit_no_findings`. Use `["none"]` if no domain skill was used.
+- Record loaded domain skills in `skills_used` on candidates or the no-findings result. Use `["none"]` if none were used.
 - {skill_hint}
 </critical_constraint>
 
@@ -48,7 +48,7 @@ Focus areas: readability, modularity, performance, architectural fit, and adhere
 3. Assess impact on existing systems and performance.
 
 ## Phase 3 — Structured Result
-1. For each actionable issue, call `submit_finding` with a concise title, severity, confidence, affected locations, evidence, skills used, and Markdown body.
-2. If no actionable issue is found, call `submit_no_findings` with a short summary.
-3. Do not stop before using one of these reporting tools.
+1. Return each candidate with title, severity, confidence, affected_locations, evidence, skills_used, and body_markdown.
+2. If there are no candidates, return a no-findings result with summary and skills_used.
+3. Return the JSON result to the coordinator; the verifier independently adjudicates retained candidates.
 </phases>

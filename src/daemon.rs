@@ -54,8 +54,6 @@ pub struct DaemonParams {
     pub verifier_provider: Option<String>,
     pub verifier_model: Option<String>,
     pub dedupe_existing_comments: bool,
-    pub dedupe_provider: Option<String>,
-    pub dedupe_model: Option<String>,
     pub skill: Option<String>,
     pub personas: Vec<crate::persona::PersonaSource>,
     pub review_lanes: Vec<String>,
@@ -1142,8 +1140,6 @@ async fn process_daemon_job(
                 verifier_provider: params.verifier_provider.clone(),
                 verifier_model: params.verifier_model.clone(),
                 dedupe_existing_comments: params.dedupe_existing_comments,
-                dedupe_provider: params.dedupe_provider.clone(),
-                dedupe_model: params.dedupe_model.clone(),
                 output: output_path,
                 skill: params.skill.clone(),
                 persona: job.persona.clone(),
@@ -1639,13 +1635,8 @@ async fn run_sandboxed_review(
     if let Some(model) = &review_params.verifier_model {
         cmd.arg("--verifier-model").arg(model);
     }
-    cmd.arg("--dedupe-existing-comments").arg("false");
-    if let Some(provider) = &review_params.dedupe_provider {
-        cmd.arg("--dedupe-provider").arg(provider);
-    }
-    if let Some(model) = &review_params.dedupe_model {
-        cmd.arg("--dedupe-model").arg(model);
-    }
+    cmd.arg("--dedupe-existing-comments")
+        .arg(review_params.dedupe_existing_comments.to_string());
 
     let _ = &review_params.output;
     cmd.arg("--output").arg("/sandbox-output/report.md");
@@ -1738,7 +1729,18 @@ async fn run_sandboxed_review(
         );
     }
 
-    let timeout_duration = std::time::Duration::from_secs(review_params.timeout_mins * 60 + 300);
+    // The child now includes coordinator duplicate adjudication as well as finding
+    // and verification. Allow each enabled phase its configured timeout plus setup.
+    let phase_count = 1
+        + u64::from(review_params.verify_findings)
+        + u64::from(review_params.verify_findings && review_params.dedupe_existing_comments);
+    let timeout_duration = std::time::Duration::from_secs(
+        review_params
+            .timeout_mins
+            .saturating_mul(60)
+            .saturating_mul(phase_count)
+            .saturating_add(300),
+    );
 
     tokio::select! {
         status_res = tokio::time::timeout(timeout_duration, child.wait()) => {
@@ -1762,8 +1764,8 @@ async fn run_sandboxed_review(
                     tracing::warn!(
                         repo = %review_params.repo,
                         pr = review_params.pr_number,
-                        "Sandboxed review exceeded hard timeout of {} minutes, killing process",
-                        review_params.timeout_mins + 5
+                        timeout_secs = timeout_duration.as_secs(),
+                        "Sandboxed review exceeded hard timeout, killing process"
                     );
                     let _ = child.kill().await;
                     anyhow::bail!("Sandboxed review timed out");

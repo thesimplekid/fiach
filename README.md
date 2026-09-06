@@ -202,7 +202,7 @@ not replace the original records.
 
 ## 📝 Crafting a Persona
 
-Fiach is entirely prompt-driven. You can configure the daemon to use different personas via the `--persona` flag.
+Fiach uses a small coordinator prompt to manage review lanes and structured results. You can configure the daemon to use different personas via the `--persona` flag.
 
 If omitted, it defaults to `--persona builtin:security`. You can also pass `--persona builtin:pr-review`, `--persona builtin:code-quality`, or an absolute path to a custom Markdown file.
 
@@ -225,7 +225,7 @@ A custom persona file can contain these placeholders which are filled at runtime
 
 ### Review Lanes
 
-Review lanes are narrower focus prompts that run inside one persona review. Use them when you want one report and one verifier/disclosure pass, but want the finder to split its attention across several independent lenses.
+Every review runs the configured persona as a mandatory `persona` lane, even when `review_lanes` is empty. The parent uses a small coordinator prompt and delegates code inspection to that lane. Additional review lanes provide narrower lenses within the same review, sharing one report and verifier/disclosure flow. The `persona` lane name is reserved; configure its methodology through `persona`, not `review_lane_prompts`.
 
 This differs from `personas`: multiple personas create separate review jobs, state keys, and reports; lanes feed back into the same parent finder, which submits one combined structured result.
 
@@ -263,7 +263,11 @@ The built-in `summary` lane produces a neutral structured description of what
 the PR changes. It does not make a review decision and is stored separately
 from findings. Buzz delivery enables this lane automatically.
 
-The finder launches Goose delegate subagents for the lanes, collects their notes, deduplicates candidates, and then the parent finder is the only agent allowed to call `submit_finding` or `submit_no_findings`. The verifier, Markdown report, duplicate suppression, and PR comments remain unified.
+The coordinator launches Goose delegate subagents, collects all lane results, merges candidates describing the same root cause, and submits `submit_finding` or `submit_no_findings`. `max_review_lanes` includes the mandatory persona lane and any summary lane. Lanes return candidate JSON and do not call reporting tools; custom persona files keep their methodology and placeholders, but the appended lane execution contract overrides old instructions to submit findings or write reports.
+
+After the independent verifier finishes, Fiach fetches current PR discussion and resumes the same coordinator session to decide which verified findings were already reported. That continuation has only reporting tools and records matching comment IDs and reasons. There is no separate deduplication model session or model work in host finalization. Both sandboxed and local execution complete this step before returning artifacts for publication. If discussion cannot be fetched or adjudication fails, verified findings remain eligible for publication.
+
+`dedupe_existing_comments = false` disables the discussion comparison. The resumed coordinator uses the finder provider/model. Verifier provider/model settings remain independent. `timeout_mins` applies separately to the initial coordinator/lane phase, verifier phase, and duplicate-decision continuation. The sandbox hard limit allows those enabled phases plus five minutes for setup.
 
 ### Buzz Review Threads
 

@@ -380,18 +380,6 @@
               description = "Run duplicate suppression against existing PR discussion before posting verified findings.";
             };
 
-            dedupeModel = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = null;
-              description = "Model to use for duplicate suppression. Defaults through verifierModel then model when unset.";
-            };
-
-            dedupeProvider = lib.mkOption {
-              type = lib.types.nullOr (lib.types.enum [ "openrouter" "anthropic" "openai" "google" ]);
-              default = null;
-              description = "Goose provider to use for duplicate suppression. Defaults through verifierProvider then provider when unset.";
-            };
-
             environmentFile = lib.mkOption {
               type = lib.types.path;
               description = "Path to environment file containing GITHUB_TOKEN, FIACH_REVIEW_GITHUB_TOKEN when sandboxing is enabled, the selected provider API key, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
@@ -891,10 +879,6 @@
                       verifier_provider = cfg.verifierProvider;
                     } // lib.optionalAttrs (cfg.verifierModel != null) {
                       verifier_model = cfg.verifierModel;
-                    } // lib.optionalAttrs (cfg.dedupeProvider != null) {
-                      dedupe_provider = cfg.dedupeProvider;
-                    } // lib.optionalAttrs (cfg.dedupeModel != null) {
-                      dedupe_model = cfg.dedupeModel;
                     } // lib.optionalAttrs (cfg.withSkill != null) {
                       with_skill = cfg.withSkill;
                     } // lib.optionalAttrs (cfg.triggerMention != null) {

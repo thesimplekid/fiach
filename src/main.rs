@@ -156,14 +156,6 @@ enum Commands {
         #[arg(long)]
         dedupe_existing_comments: Option<bool>,
 
-        /// Model to use for duplicate suppression. Defaults through verifier then main model.
-        #[arg(long)]
-        dedupe_model: Option<String>,
-
-        /// Provider to use for duplicate suppression. Defaults through verifier then main provider.
-        #[arg(long)]
-        dedupe_provider: Option<String>,
-
         /// Path to write the review report. If not provided, defaults to
         /// "./reports/PR{pr_number}_{commit_hash}.md" in the current working directory.
         #[arg(long)]
@@ -181,7 +173,7 @@ enum Commands {
         #[arg(long)]
         review_lanes: Option<String>,
 
-        /// Maximum review lane subagents to run concurrently
+        /// Maximum concurrent lanes, including the mandatory persona and optional summary
         #[arg(long)]
         max_review_lanes: Option<usize>,
 
@@ -189,7 +181,7 @@ enum Commands {
         #[arg(long)]
         max_turns: Option<u32>,
 
-        /// Timeout in minutes for the entire review session
+        /// Timeout in minutes for each review phase (lanes, verifier, duplicate decisions)
         #[arg(long)]
         timeout_mins: Option<u64>,
 
@@ -291,14 +283,6 @@ enum Commands {
         #[arg(long)]
         dedupe_existing_comments: Option<bool>,
 
-        /// Model to use for duplicate suppression. Defaults through verifier then main model.
-        #[arg(long)]
-        dedupe_model: Option<String>,
-
-        /// Provider to use for duplicate suppression. Defaults through verifier then main provider.
-        #[arg(long)]
-        dedupe_provider: Option<String>,
-
         /// Explicitly instruct the agent to use a specific skill.
         #[arg(long)]
         with_skill: Option<String>,
@@ -311,7 +295,7 @@ enum Commands {
         #[arg(long)]
         review_lanes: Option<String>,
 
-        /// Maximum review lane subagents to run concurrently
+        /// Maximum concurrent lanes, including the mandatory persona and optional summary
         #[arg(long)]
         max_review_lanes: Option<usize>,
 
@@ -499,8 +483,6 @@ async fn main() -> Result<()> {
             verifier_model,
             verifier_provider,
             dedupe_existing_comments,
-            dedupe_model,
-            dedupe_provider,
             output,
             with_skill,
             persona,
@@ -540,8 +522,6 @@ async fn main() -> Result<()> {
             let dedupe_existing_comments = dedupe_existing_comments
                 .or(rev_cfg.dedupe_existing_comments)
                 .unwrap_or(true);
-            let dedupe_model = dedupe_model.or(rev_cfg.dedupe_model);
-            let dedupe_provider = dedupe_provider.or(rev_cfg.dedupe_provider);
             let personas = resolve_personas(
                 persona,
                 rev_cfg.persona,
@@ -587,8 +567,6 @@ async fn main() -> Result<()> {
                     verifier_model: verifier_model.clone(),
                     verifier_provider: verifier_provider.clone(),
                     dedupe_existing_comments,
-                    dedupe_model: dedupe_model.clone(),
-                    dedupe_provider: dedupe_provider.clone(),
                     output: output_for_persona(output.clone(), &persona, use_persona_kind),
                     skill: skill.clone(),
                     persona: persona.clone(),
@@ -666,8 +644,6 @@ async fn main() -> Result<()> {
             verifier_model,
             verifier_provider,
             dedupe_existing_comments,
-            dedupe_model,
-            dedupe_provider,
             with_skill,
             persona,
             review_lanes,
@@ -726,8 +702,6 @@ async fn main() -> Result<()> {
             let dedupe_existing_comments = dedupe_existing_comments
                 .or(daemon_cfg.dedupe_existing_comments)
                 .unwrap_or(true);
-            let dedupe_model = dedupe_model.or(daemon_cfg.dedupe_model);
-            let dedupe_provider = dedupe_provider.or(daemon_cfg.dedupe_provider);
             let personas = resolve_personas(
                 persona,
                 daemon_cfg.persona,
@@ -818,8 +792,6 @@ async fn main() -> Result<()> {
                 verifier_provider,
                 verifier_model,
                 dedupe_existing_comments,
-                dedupe_provider,
-                dedupe_model,
                 skill: with_skill.or(daemon_cfg.with_skill),
                 personas,
                 review_lanes,

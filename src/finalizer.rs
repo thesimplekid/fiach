@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::disclose::{self, DiscloseConfig, DisclosureTarget};
 use crate::execution::ReviewOutcome;
-use crate::review::{DuplicateSuppressionParams, ReviewParams};
+use crate::review::ReviewParams;
 use crate::state::{self, ReviewRecord, ReviewStatus};
 
 #[derive(Clone)]
@@ -14,18 +14,6 @@ pub struct FinalizationSpec {
     pub pr_number: u64,
     pub review_kind: String,
     pub security_review: bool,
-    pub provider: String,
-    pub model: String,
-    pub verifier_provider: Option<String>,
-    pub verifier_model: Option<String>,
-    pub dedupe_existing_comments: bool,
-    pub dedupe_provider: Option<String>,
-    pub dedupe_model: Option<String>,
-    pub max_retries: u32,
-    pub retry_delay_secs: u64,
-    pub timeout_mins: u64,
-    pub max_turns: u32,
-    pub max_cost_usd: Option<f64>,
     pub disclose: DiscloseConfig,
     pub buzz: Option<crate::config::BuzzConfig>,
     pub db_path: PathBuf,
@@ -39,18 +27,6 @@ impl From<&ReviewParams> for FinalizationSpec {
             pr_number: params.pr_number,
             review_kind: params.review_kind.clone(),
             security_review: params.persona.is_security(),
-            provider: params.provider.clone(),
-            model: params.model.clone(),
-            verifier_provider: params.verifier_provider.clone(),
-            verifier_model: params.verifier_model.clone(),
-            dedupe_existing_comments: params.dedupe_existing_comments,
-            dedupe_provider: params.dedupe_provider.clone(),
-            dedupe_model: params.dedupe_model.clone(),
-            max_retries: params.max_retries,
-            retry_delay_secs: params.retry_delay_secs,
-            timeout_mins: params.timeout_mins,
-            max_turns: params.max_turns,
-            max_cost_usd: params.max_cost_usd,
             disclose: params.disclose_config.clone(),
             buzz: params.buzz_config.clone(),
             db_path: params.db_path.clone(),
@@ -65,39 +41,13 @@ impl ReviewFinalizer {
     pub async fn finalize(
         &self,
         spec: &FinalizationSpec,
-        mut outcome: ReviewOutcome,
+        outcome: ReviewOutcome,
         cancel: CancellationToken,
     ) -> Result<ReviewRecord> {
         let report_path = outcome.completed.report_path.clone();
-        let workspace_path = report_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-
-        let dedupe_stats = crate::review::apply_duplicate_suppression(DuplicateSuppressionParams {
-            artifact: &mut outcome.artifact,
-            workspace_path,
-            repo: &spec.repository,
-            pr_number: spec.pr_number,
-            pr_context: &outcome.policy.pr_context,
-            policy: &outcome.policy,
-            provider: &spec.provider,
-            model: &spec.model,
-            verifier_provider: spec.verifier_provider.as_deref(),
-            verifier_model: spec.verifier_model.as_deref(),
-            dedupe_existing_comments: spec.dedupe_existing_comments,
-            dedupe_provider: spec.dedupe_provider.as_deref(),
-            dedupe_model: spec.dedupe_model.as_deref(),
-            max_retries: spec.max_retries,
-            retry_delay_secs: spec.retry_delay_secs,
-            timeout_mins: spec.timeout_mins,
-            max_turns: spec.max_turns,
-            max_cost_usd: crate::review::remaining_cost_budget(
-                spec.max_cost_usd,
-                outcome.completed.metadata.cost_usd,
-            ),
-            cancel_token: cancel,
-        })
-        .await?;
+        if cancel.is_cancelled() {
+            anyhow::bail!("Review finalization cancelled");
+        }
 
         let markdown = crate::reporting::render_markdown(
             &spec.repository,
@@ -114,14 +64,6 @@ impl ReviewFinalizer {
             .context("Failed to write finalized disclosure policy")?;
 
         let mut metadata = outcome.completed.metadata.clone();
-        if let Some(stats) = dedupe_stats {
-            metadata.input_tokens = metadata.input_tokens.max(stats.peak_input_tokens);
-            metadata.output_tokens += stats.output_tokens;
-            metadata.total_tokens += stats.total_tokens;
-            if let Some(cost) = stats.cost_usd {
-                metadata.cost_usd = Some(metadata.cost_usd.unwrap_or(0.0) + cost);
-            }
-        }
         update_metadata(&mut metadata, &outcome, spec.pr_number);
         metadata.artifacts.markdown = Some(absolute(report_path.clone()));
         metadata.artifacts.structured_json = Some(absolute(structured));
@@ -352,18 +294,6 @@ mod tests {
             pr_number: 42,
             review_kind: "security".to_string(),
             security_review: true,
-            provider: "scripted".to_string(),
-            model: "scripted".to_string(),
-            verifier_provider: None,
-            verifier_model: None,
-            dedupe_existing_comments: false,
-            dedupe_provider: None,
-            dedupe_model: None,
-            max_retries: 0,
-            retry_delay_secs: 0,
-            timeout_mins: 1,
-            max_turns: 1,
-            max_cost_usd: Some(1.0),
             disclose: DiscloseConfig {
                 mode: disclose::ReportMode::Local,
                 sync_repo: None,
