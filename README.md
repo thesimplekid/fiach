@@ -81,6 +81,28 @@ nix flake check --no-write-lock-file -L
 
 ## 📖 Usage Examples
 
+### Review cost limits
+
+`max_cost_usd` (CLI: `--max-cost`, NixOS: `maxCostUsd`) limits observed spending
+across skill selection, finder lanes, verification, and duplicate suppression.
+With verification enabled, discovery can use 70% of this limit; the remaining
+30% is reserved for verification. The verifier can also use any unspent discovery
+funds. Without verification, discovery can use the full limit.
+
+Provider-reported charges take precedence over token prices, including explicit
+price overrides. OpenRouter returns the account charge in
+[`usage.cost`](https://openrouter.ai/docs/cookbook/administration/usage-accounting),
+which Goose includes in recursive session accounting. When charges are absent,
+Goose estimates or configured/model token prices are used as a fallback. Logged
+costs can therefore include estimates and are not invoice reconciliation.
+
+Limits are checked against observed usage; in-flight requests and parallel lanes
+can overshoot before their usage arrives. A reserve improves the chance of
+verification completing but cannot guarantee it. Budget-stopped reviews are saved
+as **unverified**, with the exhausted phase in the JSON and Markdown artifacts.
+They are reported as incomplete and do not trigger disclosure, even when
+`notify_on_empty` is enabled.
+
 ### 1. The Autonomous Security Daemon (Sync PR Mode)
 
 This is the primary use case. Run `fiach` as a background daemon that monitors multiple repositories. Out of the box, the daemon searches for **any open PR updated in the last 4 months**. 

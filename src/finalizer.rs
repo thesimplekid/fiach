@@ -200,10 +200,10 @@ fn update_metadata(metadata: &mut ReviewRecord, outcome: &ReviewOutcome, pr_numb
     let publishable = outcome.artifact.publishable_findings(&outcome.policy);
     let already_reported = outcome.artifact.already_reported_findings(&outcome.policy);
     metadata.findings_count = publishable.len() as u32;
-    metadata.status = if outcome.artifact.markdown_only_fallback {
-        ReviewStatus::MarkdownOnly
-    } else if outcome.artifact.verifier_failed {
+    metadata.status = if outcome.artifact.is_incomplete() {
         ReviewStatus::Unverified
+    } else if outcome.artifact.markdown_only_fallback {
+        ReviewStatus::MarkdownOnly
     } else if !publishable.is_empty() {
         ReviewStatus::Confirmed
     } else if !already_reported.is_empty() {
@@ -306,6 +306,19 @@ mod tests {
             buzz: None,
             db_path: root.join("state.redb"),
             trigger_mention_node_id: None,
+        }
+    }
+
+    #[test]
+    fn budget_exhaustion_cannot_finalize_as_a_clean_review() {
+        let mut outcome = clean_outcome(std::path::Path::new("."));
+        outcome.artifact.budget_exhausted = Some(crate::reporting::ReviewPhase::Finder);
+        let mut metadata = outcome.completed.metadata.clone();
+        for markdown_only in [false, true] {
+            outcome.artifact.markdown_only_fallback = markdown_only;
+            update_metadata(&mut metadata, &outcome, 42);
+            assert_eq!(metadata.status, ReviewStatus::Unverified);
+            assert_eq!(metadata.findings_count, 0);
         }
     }
 

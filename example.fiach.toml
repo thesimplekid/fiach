@@ -84,6 +84,7 @@ verify_findings = true
 # personas = ["builtin:pr-review", "builtin:security"] # Run independent passes for this PR
 # review_lanes = ["correctness", "concurrency", "api-compat", "tests"]
 # max_review_lanes = 2
+# With verification enabled, 30% is reserved for verification.
 # max_cost_usd = 5.0
 
 # [review.buzz]

@@ -27,11 +27,18 @@ pub struct ReportingArtifact {
     pub duplicate_decisions: Vec<DuplicateDecision>,
     #[serde(default)]
     pub verifier_failed: bool,
+    /// Phase stopped by its cost limit; this is not a clean review result.
+    #[serde(default)]
+    pub budget_exhausted: Option<ReviewPhase>,
     #[serde(default)]
     pub markdown_only_fallback: bool,
 }
 
 impl ReportingArtifact {
+    pub fn is_incomplete(&self) -> bool {
+        self.verifier_failed || self.budget_exhausted.is_some()
+    }
+
     pub fn finder_complete(&self) -> bool {
         self.no_findings.is_some() || !self.findings.is_empty()
     }
@@ -49,6 +56,9 @@ impl ReportingArtifact {
     }
 
     pub fn publishable_findings(&self, policy: &DisclosurePolicy) -> Vec<AcceptedFinding> {
+        if self.is_incomplete() {
+            return Vec::new();
+        }
         self.accepted_findings(policy)
             .into_iter()
             .filter(|finding| !self.is_already_reported(&finding.finding_id))
@@ -772,7 +782,7 @@ pub fn render_markdown(
     let already_reported = policy
         .map(|policy| artifact.already_reported_findings(policy))
         .unwrap_or_default();
-    let status = if artifact.verifier_failed {
+    let status = if artifact.is_incomplete() {
         "unverified"
     } else if !accepted.is_empty() {
         "confirmed"
@@ -790,7 +800,7 @@ pub fn render_markdown(
         .unwrap_or("none");
     let skills = collect_skills(artifact);
     let findings_count = accepted.len();
-    let notify = findings_count > 0 && !artifact.verifier_failed;
+    let notify = findings_count > 0 && !artifact.is_incomplete();
 
     let mut out = format!(
         r#"---
@@ -837,7 +847,15 @@ findings_count: {findings_count}
         out.push('\n');
     }
 
-    if let Some(no_findings) = &artifact.no_findings {
+    if let Some(phase) = &artifact.budget_exhausted {
+        out.push_str(&format!(
+            "## Incomplete Review\nThe {phase:?} phase reached its cost budget. Review coverage or verification is incomplete; this is not a no-findings result. No PR disclosure was allowed.\n\n"
+        ));
+    }
+
+    if let Some(no_findings) = &artifact.no_findings
+        && !artifact.is_incomplete()
+    {
         out.push_str("## Review Result\n");
         out.push_str(no_findings.summary.trim());
         out.push('\n');
@@ -1133,7 +1151,10 @@ fn markdown_title(
     accepted: &[AcceptedFinding],
     already_reported: &[AcceptedFinding],
 ) -> String {
-    if artifact.verifier_failed {
+    if artifact.budget_exhausted.is_some() {
+        return "Incomplete review: cost budget exhausted".to_string();
+    }
+    if artifact.is_incomplete() {
         return "Unverified review".to_string();
     }
     if let Some(finding) = accepted.first() {
@@ -1230,6 +1251,46 @@ mod tests {
             verdicts,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn budget_exhaustion_overrides_clean_result_and_survives_serialization() {
+        for phase in [ReviewPhase::Finder, ReviewPhase::Verifier] {
+            let artifact = ReportingArtifact {
+                no_findings: Some(NoFindings {
+                    summary: "No actionable findings.".to_string(),
+                    skills_used: Vec::new(),
+                }),
+                budget_exhausted: Some(phase.clone()),
+                ..Default::default()
+            };
+            let artifact: ReportingArtifact =
+                serde_json::from_str(&serde_json::to_string(&artifact).unwrap()).unwrap();
+            assert_eq!(artifact.budget_exhausted, Some(phase));
+            assert!(artifact.is_incomplete());
+            let report = render_markdown("owner/repo", 42, &artifact, Some(&policy()));
+            assert!(report.contains("status: unverified"));
+            assert!(report.contains("notify: false"));
+            assert!(report.contains("Incomplete Review"));
+            assert!(!report.contains("No actionable findings."));
+        }
+    }
+
+    #[test]
+    fn incomplete_review_keeps_evidence_but_has_no_publishable_findings() {
+        let mut artifact = accepted_artifact(1);
+        assert_eq!(artifact.publishable_findings(&policy()).len(), 1);
+        artifact.budget_exhausted = Some(ReviewPhase::Finder);
+        assert!(artifact.publishable_findings(&policy()).is_empty());
+        assert_eq!(artifact.findings.len(), 1);
+        assert_eq!(artifact.verdicts.len(), 1);
+    }
+
+    #[test]
+    fn older_artifacts_default_to_no_budget_exhaustion() {
+        let artifact: ReportingArtifact = serde_json::from_str("{}").unwrap();
+        assert_eq!(artifact.budget_exhausted, None);
+        assert!(!artifact.is_incomplete());
     }
 
     #[test]

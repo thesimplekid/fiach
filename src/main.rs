@@ -229,11 +229,11 @@ enum Commands {
         #[arg(long)]
         max_cost: Option<f64>,
 
-        /// Override input token price per 1M tokens (USD)
+        /// Fallback input token price per 1M tokens (USD) when costs are unavailable
         #[arg(long)]
         input_price: Option<f64>,
 
-        /// Override output token price per 1M tokens (USD)
+        /// Fallback output token price per 1M tokens (USD) when costs are unavailable
         #[arg(long)]
         output_price: Option<f64>,
 
@@ -371,11 +371,11 @@ enum Commands {
         #[arg(long)]
         drafts: Option<bool>,
 
-        /// Override input token price per 1M tokens (USD)
+        /// Fallback input token price per 1M tokens (USD) when costs are unavailable
         #[arg(long)]
         input_price: Option<f64>,
 
-        /// Override output token price per 1M tokens (USD)
+        /// Fallback output token price per 1M tokens (USD) when costs are unavailable
         #[arg(long)]
         output_price: Option<f64>,
 

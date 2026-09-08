@@ -139,11 +139,10 @@ fn cost_from_session_totals(
     input_override: Option<f64>,
     output_override: Option<f64>,
 ) -> Option<f64> {
-    if input_override.is_none()
-        && output_override.is_none()
-        && let Some(cost) = totals.accumulated_cost
-    {
-        return Some(cost.max(0.0));
+    // Goose includes provider-reported charges (including cache discounts) and
+    // child-session costs. Token prices are only a fallback when that is absent.
+    if let Some(cost) = valid_cost(totals.accumulated_cost) {
+        return Some(cost);
     }
 
     let (input, output) = session_accumulated_tokens(totals);
@@ -155,6 +154,34 @@ fn cost_from_session_totals(
         input_override,
         output_override,
     )
+}
+
+fn valid_cost(cost: Option<f64>) -> Option<f64> {
+    cost.filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+
+fn cost_from_provider_usage(
+    usage: &goose::conversation::token_usage::ProviderUsage,
+    provider: &str,
+    model: &str,
+    input_price_per_m: Option<f64>,
+    output_price_per_m: Option<f64>,
+) -> Option<f64> {
+    valid_cost(usage.cost).or_else(|| {
+        estimate_cost(
+            provider,
+            model,
+            nonnegative_token_count(usage.usage.input_tokens),
+            nonnegative_token_count(usage.usage.output_tokens),
+            input_price_per_m,
+            output_price_per_m,
+        )
+    })
+}
+
+// Leave 30% for verification. Unused finder funds also remain available to it.
+fn finder_cost_budget(max_cost: Option<f64>, verify_findings: bool) -> Option<f64> {
+    max_cost.map(|max| if verify_findings { max * 0.7 } else { max })
 }
 
 fn add_known_cost(total: &mut Option<f64>, cost: Option<f64>) {
@@ -1385,11 +1412,10 @@ pub async fn run_review(
                             total_processed_tokens += input + output;
                             add_known_cost(
                                 &mut direct_call_cost_usd,
-                                estimate_cost(
+                                cost_from_provider_usage(
+                                    &usage,
                                     &params.provider,
                                     &params.model,
-                                    input,
-                                    output,
                                     input_price_per_m,
                                     output_price_per_m,
                                 ),
@@ -1613,8 +1639,18 @@ pub async fn run_review(
     );
 
     let phase_cancel_token = cancel_token.child_token();
+    let finder_budget = finder_cost_budget(params.max_cost_usd, params.verify_findings);
+    tracing::info!(
+        finder_budget = %format_cost(finder_budget),
+        review_budget = %format_cost(params.max_cost_usd),
+        "Allocated review cost budget"
+    );
     let mut budget_exceeded = false;
     let review_future = async {
+        if cost_budget_reached(direct_call_cost_usd, finder_budget) {
+            budget_exceeded = true;
+            return Ok(());
+        }
         let mut retries = 0;
         let mut delay = params.retry_delay_secs;
         let mut budget_nudged = false;
@@ -1663,8 +1699,30 @@ pub async fn run_review(
             }
         };
 
+        let mut budget_poll = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
+                _ = budget_poll.tick(), if finder_budget.is_some() => {
+                    if let Ok(totals) = agent.config.session_manager
+                        .get_session_usage_totals(&session_config.id).await
+                    {
+                        let current_cost = sum_known_costs([
+                            direct_call_cost_usd,
+                            cost_from_session_totals(&totals, &params.provider, &params.model,
+                                input_price_per_m, output_price_per_m),
+                        ]);
+                        if cost_budget_reached(current_cost, finder_budget) {
+                            budget_exceeded = true;
+                            tracing::warn!(
+                                cost = %format_cost(current_cost),
+                                max = %format_cost(finder_budget),
+                                "Finder cost budget reached; cancelling active lanes"
+                            );
+                            phase_cancel_token.cancel();
+                            return Ok(());
+                        }
+                    }
+                }
                 _ = phase_cancel_token.cancelled() => {
                     tracing::warn!("Review cancelled by user (Ctrl+C)");
                     bail!("Review cancelled by user");
@@ -1750,25 +1808,25 @@ pub async fn run_review(
                                         );
                                     }
 
-                                    if cost_budget_reached(current_cost, params.max_cost_usd)
+                                    if cost_budget_reached(current_cost, finder_budget)
                                     {
                                         budget_exceeded = true;
                                         tracing::warn!(
                                             cost = %format_cost(current_cost),
-                                            max = %format_cost(params.max_cost_usd),
-                                            "Review cost budget reached; cancelling active finder work"
+                                            max = %format_cost(finder_budget),
+                                            "Finder cost budget reached; preserving remaining funds for verification"
                                         );
                                         phase_cancel_token.cancel();
                                         return Ok(());
                                     }
 
-                                    if let Some(max_cost) = params.max_cost_usd
+                                    if let Some(max_cost) = finder_budget
                                         && let Some(current_cost) = current_cost
                                         && current_cost >= max_cost * 0.8
                                         && !budget_nudged
                                     {
                                         budget_nudged = true;
-                                        let budget_nudge = "COST BUDGET NEARLY EXHAUSTED. Stop further analysis and submit your current result now. Use `submit_finding` for each candidate, or `submit_no_findings` if there are no candidates. Do not do anything else.".to_string();
+                                        let budget_nudge = "FINDER COST BUDGET NEARLY EXHAUSTED. Finalize completed lane results now and submit candidates with `submit_finding`. Use `submit_no_findings` only if all required lanes completed and there are no candidates. Missing or failed lanes are incomplete work, never a no-findings result. Avoid further analysis so funds remain for verification.".to_string();
                                         let follow_up_message = Message::user().with_text(&budget_nudge);
 
                                         tracing::info!(
@@ -1926,7 +1984,7 @@ pub async fn run_review(
                             }
 
                             let follow_up_text = if budget_nudged {
-                                "COST BUDGET NEARLY EXHAUSTED. Submit your current result now with `submit_finding` or `submit_no_findings`; do not perform more analysis.".to_string()
+                                "FINDER COST BUDGET NEARLY EXHAUSTED. Submit candidates from completed lanes now with `submit_finding`. Use `submit_no_findings` only when all required lanes completed without candidates. Missing or failed lanes are incomplete work. Avoid further analysis.".to_string()
                             } else {
                                 match last_assistant_text.as_deref() {
                                     Some(text) if !text.trim().is_empty() => format!(
@@ -2059,8 +2117,12 @@ pub async fn run_review(
         artifact.markdown_only_fallback = true;
     }
 
-    if artifact.finder_complete() || artifact.markdown_only_fallback {
-        if params.verify_findings && !artifact.findings.is_empty() && !budget_exceeded {
+    if artifact.finder_complete() || artifact.markdown_only_fallback || budget_exceeded {
+        if budget_exceeded {
+            artifact.budget_exhausted = Some(ReviewPhase::Finder);
+            *reporting_artifact.lock().await = artifact.clone();
+        }
+        if params.verify_findings && !artifact.findings.is_empty() {
             tracing::info!(
                 findings = artifact.findings.len(),
                 "Running structured verifier pass before disclosure"
@@ -2101,19 +2163,16 @@ pub async fn run_review(
                 );
             }
             if !artifact.verifier_complete() {
+                if verifier_result.budget_exceeded {
+                    artifact.budget_exhausted = Some(ReviewPhase::Verifier);
+                }
                 tracing::warn!(
                     "Verifier did not submit verdicts for all findings; disclosure disabled"
                 );
                 artifact.verifier_failed = true;
             }
         } else if !artifact.findings.is_empty() {
-            if budget_exceeded {
-                tracing::warn!(
-                    "Finder cost budget reached; verifier skipped and findings will not be disclosed"
-                );
-            } else {
-                tracing::warn!("Verifier pass disabled; structured findings will not be disclosed");
-            }
+            tracing::warn!("Verifier pass disabled; structured findings will not be disclosed");
             artifact.verifier_failed = true;
         }
 
@@ -2193,11 +2252,11 @@ pub async fn run_review(
             artifact.already_reported_findings(&policy)
         };
         let findings_count = accepted_findings.len() as u32;
-        let should_notify = findings_count > 0 && !artifact.verifier_failed;
-        let status = if artifact.markdown_only_fallback {
-            state::ReviewStatus::MarkdownOnly
-        } else if artifact.verifier_failed {
+        let should_notify = findings_count > 0 && !artifact.is_incomplete();
+        let status = if artifact.is_incomplete() {
             state::ReviewStatus::Unverified
+        } else if artifact.markdown_only_fallback {
+            state::ReviewStatus::MarkdownOnly
         } else if findings_count > 0 {
             state::ReviewStatus::Confirmed
         } else if !already_reported_findings.is_empty() {
@@ -2230,10 +2289,16 @@ pub async fn run_review(
             duration = %format!("{}s", duration_secs),
             tokens = %format!("in:{} peak:{} out:{} total:{}", total_processed_tokens, peak_input_tokens, total_output_tokens, total_tokens),
             cost = %format_cost(cost_usd),
-            "Review complete"
+            incomplete = artifact.is_incomplete(),
+            "Review finished"
         );
 
-        if !should_notify {
+        if artifact.is_incomplete() {
+            tracing::warn!(
+                budget_exhausted = ?artifact.budget_exhausted,
+                "Review incomplete; no clean-review conclusion can be drawn"
+            );
+        } else if !should_notify {
             tracing::info!(
                 "No actionable findings that require notification were found in this PR"
             );
@@ -2308,7 +2373,7 @@ pub async fn run_review(
             )? {
                 state::DisclosureClaim::Published(url) => url,
                 state::DisclosureClaim::Publish { recovering } => {
-                    let url = if artifact.markdown_only_fallback {
+                    let url = if artifact.markdown_only_fallback && !artifact.is_incomplete() {
                         crate::disclose::handle_disclosure_idempotent(
                             report_file,
                             target,
@@ -2730,7 +2795,7 @@ async fn apply_coordinator_duplicate_suppression(
     if !params.review.dedupe_existing_comments
         || !params.policy.pr_context.comments_allowed()
         || params.artifact.markdown_only_fallback
-        || params.artifact.verifier_failed
+        || params.artifact.is_incomplete()
         || params.max_cost_usd.is_some_and(|budget| budget <= 0.0)
     {
         return Ok(());
@@ -3069,6 +3134,13 @@ struct VerificationParams<'a> {
 }
 
 async fn run_verification_pass(params: VerificationParams<'_>) -> Result<VerificationStats> {
+    if cost_budget_reached(Some(0.0), params.max_cost_usd) {
+        return Ok(VerificationStats {
+            cost_usd: Some(0.0),
+            budget_exceeded: true,
+            ..VerificationStats::default()
+        });
+    }
     let model_config = model_config_from_user_config(params.provider_name, params.model)
         .context("Failed to configure verifier model")?;
     let provider = create_with_named_model(params.provider_name, Vec::new())
@@ -3660,6 +3732,102 @@ Reviewed the PR and found no vulnerabilities.
             cost_from_session_totals(&totals, "unknown", "unknown", None, None),
             Some(1.75)
         );
+    }
+
+    #[test]
+    fn session_cost_uses_reported_charge_even_with_list_prices() {
+        let mut totals = SessionUsageTotals {
+            accumulated_usage: goose::conversation::token_usage::Usage::new(
+                Some(1_000_000),
+                Some(500_000),
+                Some(1_500_000),
+            ),
+            accumulated_cost: Some(0.42),
+        };
+        for reported in [0.42, 0.0] {
+            totals.accumulated_cost = Some(reported);
+            assert_eq!(
+                cost_from_session_totals(&totals, "openrouter", "unknown", Some(2.0), Some(6.0)),
+                Some(reported)
+            );
+        }
+        for missing in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.0)] {
+            totals.accumulated_cost = missing;
+            assert_eq!(
+                cost_from_session_totals(&totals, "openrouter", "unknown", Some(2.0), Some(6.0)),
+                Some(5.0)
+            );
+        }
+    }
+
+    #[test]
+    fn skill_selection_cost_prefers_charge_and_falls_back_to_prices() {
+        use goose::conversation::token_usage::{CostSource, ProviderUsage, Usage};
+
+        let mut usage = ProviderUsage::new(
+            "unknown".to_string(),
+            Usage::new(Some(1_000_000), Some(500_000), Some(1_500_000)),
+        )
+        .with_cost(0.12, CostSource::ProviderReported);
+        assert_eq!(
+            cost_from_provider_usage(&usage, "openrouter", "unknown", Some(2.0), Some(6.0)),
+            Some(0.12)
+        );
+        usage.cost = Some(0.0);
+        assert_eq!(
+            cost_from_provider_usage(&usage, "openrouter", "unknown", Some(2.0), Some(6.0)),
+            Some(0.0)
+        );
+        usage.cost = None;
+        assert_eq!(
+            cost_from_provider_usage(&usage, "openrouter", "unknown", Some(2.0), Some(6.0)),
+            Some(5.0)
+        );
+    }
+
+    #[test]
+    fn finder_leaves_verification_reserve_and_returns_unused_funds() {
+        let finder = finder_cost_budget(Some(10.0), true);
+        assert_eq!(finder, Some(7.0));
+        assert!(cost_budget_reached(Some(7.0), finder));
+        assert_eq!(remaining_cost_budget(Some(10.0), Some(7.0)), Some(3.0));
+        assert_eq!(remaining_cost_budget(Some(10.0), Some(2.0)), Some(8.0));
+        assert_eq!(finder_cost_budget(Some(10.0), false), Some(10.0));
+        assert_eq!(finder_cost_budget(None, true), None);
+    }
+
+    #[tokio::test]
+    async fn exhausted_verifier_budget_makes_no_provider_call() {
+        let artifact = Arc::new(Mutex::new(ReportingArtifact::default()));
+        let context = reporting::PrContext {
+            state: "OPEN".to_string(),
+            merged: false,
+            base_ref_name: "main".to_string(),
+            default_branch: "main".to_string(),
+            base_commit: "base".to_string(),
+            head_commit: "head".to_string(),
+        };
+        let stats = run_verification_pass(VerificationParams {
+            artifact,
+            workspace_path: std::path::Path::new("."),
+            repo: "owner/repo",
+            pr_number: 1,
+            pr_context: &context,
+            diff_base: "base",
+            provider_name: "invalid-provider",
+            model: "invalid-model",
+            max_retries: 0,
+            retry_delay_secs: 0,
+            timeout_mins: 1,
+            max_turns: 1,
+            max_cost_usd: Some(0.0),
+            cancel_token: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+        assert!(stats.budget_exceeded);
+        assert_eq!(stats.cost_usd, Some(0.0));
+        assert_eq!(stats.total_tokens, 0);
     }
 
     #[test]

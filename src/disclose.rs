@@ -306,6 +306,10 @@ fn structured_disclosure_route(
     policy: &DisclosurePolicy,
     config: &DiscloseConfig,
 ) -> StructuredDisclosureRoute {
+    if artifact.is_incomplete() && config.mode != ReportMode::Local {
+        tracing::info!("Review incomplete; skipping disclosure");
+        return StructuredDisclosureRoute::Skip;
+    }
     let accepted_pr_findings = artifact.publishable_findings(policy);
     let duplicate_only =
         accepted_pr_findings.is_empty() && !artifact.already_reported_findings(policy).is_empty();
@@ -1331,6 +1335,30 @@ mod tests {
             rationale: "same root issue already reported".to_string(),
         });
         artifact
+    }
+
+    #[test]
+    fn incomplete_review_skips_disclosure_even_when_notify_on_empty() {
+        for mode in [
+            ReportMode::PrComment,
+            ReportMode::SyncPr,
+            ReportMode::Hybrid,
+        ] {
+            let mut config = disclose_config(mode);
+            config.notify_on_empty = true;
+            let mut artifact = artifact(true);
+            artifact.budget_exhausted = Some(crate::reporting::ReviewPhase::Finder);
+            assert_eq!(
+                structured_disclosure_route(target("security"), &artifact, &policy(), &config),
+                StructuredDisclosureRoute::Skip
+            );
+            artifact.budget_exhausted = None;
+            artifact.verifier_failed = true;
+            assert_eq!(
+                structured_disclosure_route(target("security"), &artifact, &policy(), &config),
+                StructuredDisclosureRoute::Skip
+            );
+        }
     }
 
     #[test]
