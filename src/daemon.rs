@@ -96,6 +96,76 @@ pub struct ReviewJob {
     review_kind: String,
 }
 
+#[derive(Default)]
+struct PendingPollReviews {
+    requests: VecDeque<ReviewRequest<DaemonWork>>,
+}
+
+impl PendingPollReviews {
+    fn refresh(&mut self, discoveries: Vec<ReviewRequest<DaemonWork>>) {
+        let mut order = VecDeque::new();
+        let mut latest = HashMap::new();
+        for request in discoveries {
+            let target = request.target.clone();
+            if latest.insert(target.clone(), request).is_none() {
+                order.push_back(target);
+            }
+        }
+
+        // Keep deferred targets ahead of repeat discoveries, using fresh payloads.
+        // Targets that no longer match discovery are dropped.
+        self.requests = self
+            .requests
+            .drain(..)
+            .map(|request| request.target)
+            .chain(order)
+            .filter_map(|target| latest.remove(&target))
+            .collect();
+    }
+
+    async fn submit(
+        &mut self,
+        scheduler: &SchedulerHandle<DaemonWork>,
+        cancel: &CancellationToken,
+    ) -> Result<(), SubmitError> {
+        while let Some(request) = self.requests.front() {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(SubmitError::Closed),
+                result = scheduler.submit(request.clone()) => { result?; }
+            }
+            self.requests.pop_front();
+        }
+        Ok(())
+    }
+
+    async fn run(
+        &mut self,
+        scheduler: &SchedulerHandle<DaemonWork>,
+        cancel: &CancellationToken,
+        mut discoveries: tokio::sync::watch::Receiver<Vec<ReviewRequest<DaemonWork>>>,
+    ) -> Result<(), SubmitError> {
+        self.refresh(discoveries.borrow_and_update().clone());
+        loop {
+            match self.submit(scheduler, cancel).await {
+                Ok(()) | Err(SubmitError::Full) => {}
+                Err(SubmitError::Closed) => return Err(SubmitError::Closed),
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(SubmitError::Closed),
+                result = discoveries.changed() => {
+                    if result.is_err() {
+                        return Ok(());
+                    }
+                    self.refresh(discoveries.borrow_and_update().clone());
+                }
+                _ = scheduler.capacity_changed(), if !self.requests.is_empty() => {}
+            }
+        }
+    }
+}
+
 pub fn manual_request(
     repo: String,
     pr_number: u64,
@@ -736,6 +806,14 @@ pub async fn run_daemon(
 
     let sleep_duration = Duration::from_secs(params.interval);
     let github = GhCli::default();
+    let (discovery_sender, discoveries) = tokio::sync::watch::channel(Vec::new());
+    let submitter_cancel = cancel_token.child_token();
+    let _submitter_guard = submitter_cancel.clone().drop_guard();
+    let submitter = tokio::spawn(async move {
+        PendingPollReviews::default()
+            .run(&scheduler, &submitter_cancel, discoveries)
+            .await
+    });
 
     loop {
         if cancel_token.is_cancelled() {
@@ -744,6 +822,7 @@ pub async fn run_daemon(
         }
 
         tracing::debug!("Starting polling cycle");
+        let mut discoveries = Vec::new();
 
         for repo in &repo_list {
             if cancel_token.is_cancelled() {
@@ -798,7 +877,7 @@ pub async fn run_daemon(
                             state = %state,
                             max_workers = params.max_workers,
                             personas = params.personas.len(),
-                            "Submitting discovered review jobs"
+                            "Collecting discovered review jobs"
                         );
                         for job in jobs {
                             let request = ReviewRequest {
@@ -814,16 +893,7 @@ pub async fn run_daemon(
                                     honor_mention_trigger: true,
                                 },
                             };
-                            if let Err(error) = scheduler.submit(request).await {
-                                match error {
-                                    SubmitError::Full => tracing::warn!(
-                                        repo = %repo,
-                                        "Review queue is full; remaining discoveries will be retried next poll"
-                                    ),
-                                    SubmitError::Closed => return Ok(()),
-                                }
-                                break;
-                            }
+                            discoveries.push(request);
                         }
                     }
                     Err(error) => {
@@ -837,17 +907,22 @@ pub async fn run_daemon(
             break;
         }
 
+        if discovery_sender.send(discoveries).is_err() {
+            return Ok(());
+        }
         tracing::debug!(
-            "Polling cycle complete, sleeping for {} seconds",
-            params.interval
+            interval_secs = params.interval,
+            "Discovery complete, waiting for the next poll"
         );
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
-            _ = cancel_token.cancelled() => {
-                tracing::info!("Sleep interrupted, shutting down");
-            }
+            _ = cancel_token.cancelled() => {}
+            _ = discovery_sender.closed() => return Ok(()),
         }
     }
+
+    drop(discovery_sender);
+    let _ = submitter.await;
 
     if let Some(listener) = question_listener {
         let _ = listener.await;
@@ -1956,6 +2031,256 @@ fn tail_file(path: &Path, max_lines: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn poll_request(pr: u64) -> ReviewRequest<DaemonWork> {
+        let repo = if pr <= 11 {
+            "owner/first"
+        } else {
+            "owner/second"
+        }
+        .to_string();
+        let job = ReviewJob {
+            pr: PullRequest {
+                number: pr,
+                head_ref_oid: format!("head-{pr}"),
+                head_ref_name: "feature".to_string(),
+                author_association: "MEMBER".to_string(),
+                title: format!("PR {pr}"),
+            },
+            persona: crate::persona::PersonaSource::BuiltinSecurity,
+            review_kind: "security".to_string(),
+        };
+        ReviewRequest {
+            target: ReviewTarget {
+                repository: repo.clone(),
+                pr_number: pr,
+                commit_hash: job.pr.head_ref_oid.clone(),
+                review_kind: job.review_kind.clone(),
+            },
+            payload: DaemonWork::Poll {
+                repo,
+                job,
+                honor_mention_trigger: true,
+            },
+        }
+    }
+
+    #[test]
+    fn pending_polls_refresh_payloads_and_remove_stale_targets() {
+        let mut pending = PendingPollReviews::default();
+        pending.refresh(vec![poll_request(2), poll_request(3), poll_request(4)]);
+        let mut updated = poll_request(2);
+        if let DaemonWork::Poll { job, .. } = &mut updated.payload {
+            job.pr.title = "Updated title".to_string();
+        }
+        let mut new_head = poll_request(4);
+        new_head.target.commit_hash = "new-head".to_string();
+        if let DaemonWork::Poll { job, .. } = &mut new_head.payload {
+            job.pr.head_ref_oid = "new-head".to_string();
+        }
+        let mut other_persona = poll_request(2);
+        other_persona.target.review_kind = "other-persona".to_string();
+        if let DaemonWork::Poll { job, .. } = &mut other_persona.payload {
+            job.review_kind = "other-persona".to_string();
+        }
+        pending.refresh(vec![
+            poll_request(1),
+            updated.clone(),
+            new_head.clone(),
+            updated,
+            other_persona.clone(),
+        ]);
+
+        let targets: Vec<_> = pending.requests.iter().map(|r| r.target.clone()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                poll_request(2).target,
+                poll_request(1).target,
+                new_head.target,
+                other_persona.target,
+            ]
+        );
+        let DaemonWork::Poll { job, .. } = &pending.requests[0].payload else {
+            panic!("expected poll work");
+        };
+        assert_eq!(job.pr.title, "Updated title");
+    }
+
+    #[tokio::test]
+    async fn full_queue_resumes_deferred_polls_before_repeating_skipped_prs() {
+        let cancel = CancellationToken::new();
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let (processed, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let handler = {
+            let gate = gate.clone();
+            std::sync::Arc::new(move |work: DaemonWork, _: CancellationToken| {
+                let gate = gate.clone();
+                let processed = processed.clone();
+                Box::pin(async move {
+                    gate.acquire().await.unwrap().forget();
+                    let DaemonWork::Poll { job, .. } = work else {
+                        panic!("expected poll work");
+                    };
+                    processed.send(job.pr.number).unwrap();
+                    Ok(ExecutionStatus::Skipped)
+                }) as BoxFuture<'static, Result<ExecutionStatus>>
+            })
+        };
+        let scheduler = crate::scheduler::start(1, cancel.clone(), handler);
+        let mut pending = PendingPollReviews::default();
+        pending.refresh((1..=22).map(poll_request).collect());
+        assert_eq!(
+            pending.submit(&scheduler, &cancel).await,
+            Err(SubmitError::Full)
+        );
+        // One running job plus the scheduler's sixteen queue slots.
+        assert_eq!(pending.requests.front().unwrap().target.pr_number, 18);
+        gate.add_permits(17);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for expected in 1..=17 {
+                assert_eq!(received.recv().await.unwrap(), expected);
+            }
+            while scheduler.stats().await.skipped != 17 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        pending.refresh((1..=22).map(poll_request).collect());
+        assert_eq!(
+            pending.submit(&scheduler, &cancel).await,
+            Err(SubmitError::Full)
+        );
+        gate.add_permits(17);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for expected in (18..=22).chain(1..=12) {
+                assert_eq!(received.recv().await.unwrap(), expected);
+            }
+            while scheduler.stats().await.skipped != 34 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pending.submit(&scheduler, &cancel).await, Ok(()));
+        assert!(pending.requests.is_empty());
+        gate.add_permits(5);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for expected in 13..=17 {
+                assert_eq!(received.recv().await.unwrap(), expected);
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn poll_submitter_refills_without_another_discovery() {
+        let cancel = CancellationToken::new();
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let (processed, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let handler = {
+            let gate = gate.clone();
+            std::sync::Arc::new(move |work: DaemonWork, _: CancellationToken| {
+                let gate = gate.clone();
+                let processed = processed.clone();
+                Box::pin(async move {
+                    gate.acquire().await.unwrap().forget();
+                    let DaemonWork::Poll { job, .. } = work else {
+                        panic!("expected poll work");
+                    };
+                    processed.send(job.pr.number).unwrap();
+                    Ok(ExecutionStatus::Skipped)
+                }) as BoxFuture<'static, Result<ExecutionStatus>>
+            })
+        };
+        let scheduler = crate::scheduler::start(1, cancel.clone(), handler);
+        let (discovered, discoveries) = tokio::sync::watch::channel(Vec::new());
+        let submitter = {
+            let scheduler = scheduler.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                PendingPollReviews::default()
+                    .run(&scheduler, &cancel, discoveries)
+                    .await
+            })
+        };
+
+        discovered
+            .send((1..=22).map(poll_request).collect())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while scheduler.stats().await.queued != 16 {
+                tokio::task::yield_now().await;
+            }
+            // Free one worker at a time. All 22 must run from this one discovery,
+            // even though the scheduler can initially accept only 17.
+            for expected in 1..=22 {
+                gate.add_permits(1);
+                assert_eq!(received.recv().await.unwrap(), expected);
+            }
+            while scheduler.stats().await.skipped != 22 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(scheduler.stats().await.total, 22);
+
+        // New discoveries still wake an idle submitter, and cancellation stops
+        // it promptly even when the scheduler is full again.
+        discovered
+            .send((23..=44).map(poll_request).collect())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while scheduler.stats().await.queued != 16 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), submitter)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(SubmitError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_polls_stop_on_cancellation_or_closed_scheduler() {
+        let cancel = CancellationToken::new();
+        let handler = std::sync::Arc::new(|_: DaemonWork, _: CancellationToken| {
+            Box::pin(async { Ok(ExecutionStatus::Skipped) })
+                as BoxFuture<'static, Result<ExecutionStatus>>
+        });
+        let scheduler = crate::scheduler::start(1, cancel.clone(), handler);
+        let mut pending = PendingPollReviews::default();
+        pending.refresh(vec![poll_request(1)]);
+        cancel.cancel();
+        assert_eq!(
+            pending.submit(&scheduler, &cancel).await,
+            Err(SubmitError::Closed)
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while scheduler.stats().await.accepting {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            pending.submit(&scheduler, &CancellationToken::new()).await,
+            Err(SubmitError::Closed)
+        );
+        assert_eq!(pending.requests.len(), 1);
+        assert_eq!(scheduler.stats().await.total, 0);
+    }
 
     #[test]
     fn runtime_rootfs_guard_removes_materialized_root() {

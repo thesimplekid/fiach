@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -103,6 +103,13 @@ impl std::fmt::Display for SubmitError {
 pub struct SchedulerHandle<T> {
     sender: mpsc::Sender<Submission<T>>,
     jobs: Arc<Mutex<HashMap<String, JobSnapshot>>>,
+    capacity: QueueCapacity,
+}
+
+#[derive(Clone)]
+struct QueueCapacity {
+    limit: usize,
+    changed: Arc<Notify>,
 }
 
 impl<T: Send + 'static> SchedulerHandle<T> {
@@ -115,6 +122,15 @@ impl<T: Send + 'static> SchedulerHandle<T> {
                 mpsc::error::TrySendError::Closed(_) => SubmitError::Closed,
             })?;
         receiver.await.map_err(|_| SubmitError::Closed)?
+    }
+
+    /// Wake the poller when space is freed or the scheduler closes.
+    /// A wakeup does not reserve space; submissions can still return `Full`.
+    pub async fn capacity_changed(&self) {
+        tokio::select! {
+            _ = self.capacity.changed.notified() => {}
+            _ = self.sender.closed() => {}
+        }
     }
 
     pub async fn get(&self, job_id: &str) -> Option<JobSnapshot> {
@@ -159,21 +175,29 @@ pub fn start<T: Send + 'static>(
         max_workers
     };
     let (sender, receiver) = mpsc::channel(capacity);
+    let capacity = QueueCapacity {
+        limit: capacity,
+        changed: Arc::new(Notify::new()),
+    };
     let jobs = Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(run_scheduler(
         worker_limit,
-        capacity,
+        capacity.clone(),
         receiver,
         Arc::clone(&jobs),
         cancel,
         handler,
     ));
-    SchedulerHandle { sender, jobs }
+    SchedulerHandle {
+        sender,
+        jobs,
+        capacity,
+    }
 }
 
 async fn run_scheduler<T: Send + 'static>(
     max_workers: usize,
-    capacity: usize,
+    capacity: QueueCapacity,
     mut receiver: mpsc::Receiver<Submission<T>>,
     jobs: Arc<Mutex<HashMap<String, JobSnapshot>>>,
     cancel: CancellationToken,
@@ -189,6 +213,7 @@ async fn run_scheduler<T: Send + 'static>(
         while running.len() < max_workers
             && let Some(queued) = queue.pop_front()
         {
+            capacity.changed.notify_one();
             update_job(&jobs, &queued.id, JobStatus::Running, None).await;
             let id = queued.id;
             let target = queued.request.target;
@@ -233,12 +258,16 @@ async fn run_scheduler<T: Send + 'static>(
                 }
             }
             Some(submission) = receiver.recv() => {
+                // Also wake a submitter rejected by the bounded input channel.
+                if receiver.capacity() == 1 {
+                    capacity.changed.notify_one();
+                }
                 if let Some(existing) = by_target.get(&submission.request.target) {
                     let snapshot = jobs.lock().await.get(existing).cloned();
                     let _ = submission.response.send(snapshot.ok_or(SubmitError::Closed));
                     continue;
                 }
-                if queue.len() >= capacity {
+                if queue.len() >= capacity.limit {
                     let _ = submission.response.send(Err(SubmitError::Full));
                     continue;
                 }
