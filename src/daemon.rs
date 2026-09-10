@@ -724,6 +724,13 @@ fn latest_valid_mention(
     latest
 }
 
+/// Trusted mentions override the automatic backport exclusion. Freshness is
+/// checked separately against the last recorded review attempt.
+fn should_skip_backport(pr: &PullRequest, mention: Option<&ValidMention>) -> bool {
+    mention.is_none()
+        && (pr.head_ref_name.starts_with("backport-") || pr.title.starts_with("[Backport"))
+}
+
 /// A mention is a one-shot trigger: it only (re)starts a review when it is
 /// newer than the last recorded review attempt for this PR and review kind.
 fn apply_mention_trigger(
@@ -1030,17 +1037,6 @@ async fn process_daemon_job(
         return Ok(PrProcessStatus::Skipped);
     }
 
-    if pr.head_ref_name.starts_with("backport-") || pr.title.starts_with("[Backport") {
-        tracing::info!(
-            repo = %repo,
-            pr = pr.number,
-            review_kind = %job.review_kind,
-            "Skipping backport PR"
-        );
-        mark_skipped_if_needed(params, repo, job);
-        return Ok(PrProcessStatus::Skipped);
-    }
-
     let mention = if let Some(mention_user) = mention_user {
         let details = match fetch_pr_mention_details(repo, pr.number).await {
             Ok(details) => details,
@@ -1074,6 +1070,17 @@ async fn process_daemon_job(
     } else {
         None
     };
+    if should_skip_backport(pr, mention.as_ref()) {
+        tracing::info!(
+            repo = %repo,
+            pr = pr.number,
+            review_kind = %job.review_kind,
+            "Skipping backport PR"
+        );
+        mark_skipped_if_needed(params, repo, job);
+        return Ok(PrProcessStatus::Skipped);
+    }
+
     let mention_ts = mention.as_ref().map(|mention| mention.timestamp);
 
     let review_decision = crate::state::should_review_with_retry_limit(
@@ -2566,6 +2573,34 @@ mod tests {
         let mention =
             latest_valid_mention(&details, "MEMBER", "fiach-bot", &[], &associations).unwrap();
         assert_eq!(mention.subject_node_id, None);
+    }
+
+    #[test]
+    fn trusted_mentions_override_backport_exclusion() {
+        let mention = ValidMention {
+            timestamp: 200,
+            subject_node_id: Some("IC_maintainer".to_string()),
+        };
+        for (branch, title, backport) in [
+            ("feature", "Fix issue", false),
+            ("backport-2482-to-v0.17.x", "Fix issue", true),
+            ("feature", "[Backport v0.17.x] Fix issue", true),
+            (
+                "backport-2482-to-v0.17.x",
+                "[Backport v0.17.x] Fix issue",
+                true,
+            ),
+        ] {
+            let pr = PullRequest {
+                number: 2496,
+                head_ref_oid: "head".to_string(),
+                head_ref_name: branch.to_string(),
+                author_association: "MEMBER".to_string(),
+                title: title.to_string(),
+            };
+            assert_eq!(should_skip_backport(&pr, None), backport);
+            assert!(!should_skip_backport(&pr, Some(&mention)));
+        }
     }
 
     #[test]
