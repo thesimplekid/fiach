@@ -31,7 +31,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 
 ## 🛠 Prerequisites
 
-- **Rust:** `1.94.1` (or use the provided Nix flake: `nix develop`)
+- **Rust:** `1.98.1` (or use the provided Nix flake: `nix develop`)
 - **GitHub CLI (`gh`):** Must be installed and authenticated (`gh auth login`).
 - **Environment Variables:**
   - `OPENROUTER_API_KEY`: For default OpenRouter LLM access.
@@ -65,7 +65,7 @@ cp .env.example .env
 
 ### Development Checks
 
-The repository pins Rust 1.94.1 in `rust-toolchain.toml`; the Nix shell uses the
+The repository pins Rust 1.98.1 in `rust-toolchain.toml`; the Nix shell uses the
 same version. Run the fast contributor checks with:
 
 ```bash

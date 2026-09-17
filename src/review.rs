@@ -6,15 +6,24 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
-use goose::agents::{Agent, AgentEvent, ExtensionConfig, SessionConfig};
-use goose::config::GooseMode;
-use goose::conversation::message::{Message, MessageContent};
-use goose::model_config::model_config_from_user_config;
-use goose::providers::canonical::maybe_get_canonical_model;
-use goose::providers::create_with_named_model;
-use goose::session::SessionType;
-use goose::session::session_manager::SessionUsageTotals;
-use rmcp::model::{CallToolResult, ContentBlock as Content, Role};
+use goose::{
+    agents::{
+        Agent, AgentEvent, ExtensionConfig, SessionConfig, mcp_client::McpClientTrait,
+        tool_execution::ToolCallContext,
+    },
+    config::GooseMode,
+    conversation::message::{Message, MessageContent},
+    model_config::model_config_from_user_config,
+    providers::{canonical::maybe_get_canonical_model, create_with_named_model},
+    session::{SessionType, session_manager::SessionUsageTotals},
+};
+use rmcp::{
+    ServiceError,
+    model::{
+        CallToolRequestParams, CallToolResult, ContentBlock as Content, InitializeResult,
+        JsonObject, ListToolsResult, Role,
+    },
+};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -1521,11 +1530,9 @@ pub async fn run_review(
 
     tracing::debug!("Summon extension loaded (in-process)");
 
-    add_reporting_extension(&agent, &session.id)
-        .await
-        .context("Failed to load fiach-reporting extension")?;
+    add_reporting_extension(&agent, ReviewPhase::Finder, reporting_artifact.clone()).await;
 
-    tracing::debug!("fiach-reporting extension loaded (frontend in-process)");
+    tracing::debug!("fiach-reporting extension loaded (in-process MCP)");
 
     // Log available extensions
     for ext in agent.list_extensions().await {
@@ -1742,13 +1749,6 @@ pub async fn run_review(
                                     review_lanes: &normalized_review_lanes,
                                 },
                             );
-                            handle_reporting_tool_requests(
-                                &agent,
-                                &message,
-                                ReviewPhase::Finder,
-                                reporting_artifact.clone(),
-                            )
-                            .await?;
 
                             // Log each message to trace for debugging
                             if let Ok(json) = serde_json::to_string_pretty(&message) {
@@ -2496,181 +2496,201 @@ fn report_would_notify(content: &str) -> bool {
     notify || (findings_count > 0 && status != "none")
 }
 
-async fn add_reporting_extension(agent: &Agent, session_id: &str) -> Result<()> {
-    let reporting_ext = ExtensionConfig::Frontend {
-        name: "fiach-reporting".to_string(),
-        description: "Structured Fiach review reporting tools".to_string(),
-        tools: reporting::reporting_tools(),
-        instructions: Some(
-            "Use these tools to submit structured review results to Fiach. Finder passes with a summary lane call `submit_pr_summary` once, then call `submit_finding` once per candidate or `submit_no_findings`. Verifier passes call `submit_verdict` once per candidate finding. The resumed coordinator calls `submit_duplicate_decision` once per verified finding and must not modify candidates or verdicts. These tools do not post to GitHub or Buzz."
-                .to_string(),
-        ),
-        bundled: Some(true),
-        available_tools: Vec::new(),
-    };
-
-    agent
-        .add_extension(reporting_ext, session_id)
-        .await
-        .context("Failed to add frontend reporting extension")?;
-    Ok(())
-}
-
-async fn handle_reporting_tool_requests(
-    agent: &Agent,
-    message: &Message,
+struct ReportingClient {
     phase: ReviewPhase,
     artifact: SharedReportingArtifact,
-) -> Result<()> {
-    for content in &message.content {
-        let MessageContent::FrontendToolRequest(request) = content else {
-            continue;
-        };
-        let Ok(tool_call) = &request.tool_call else {
-            continue;
-        };
+}
 
-        let result = match tool_call.name.as_ref() {
-            "submit_pr_summary" if phase == ReviewPhase::Finder => {
-                match parse_tool_arguments::<reporting::PullRequestSummary>(
-                    tool_call.arguments.clone(),
-                ) {
-                    Ok(mut summary) => {
-                        if let Err(error) = summary.validate() {
-                            CallToolResult::error(vec![Content::text(error.to_string())])
-                        } else {
-                            artifact.lock().await.pr_summary = Some(summary);
-                            CallToolResult::success(vec![Content::text(
-                                "accepted pull request summary",
-                            )])
-                        }
-                    }
-                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
-                }
-            }
-            "submit_finding" if phase == ReviewPhase::Finder => {
-                match parse_tool_arguments::<reporting::FindingInput>(tool_call.arguments.clone()) {
-                    Ok(input) => {
-                        let mut guard = artifact.lock().await;
-                        if guard.no_findings.is_some() {
-                            CallToolResult::error(vec![Content::text(
-                                "cannot submit findings after submit_no_findings",
-                            )])
-                        } else {
-                            match reporting::Finding::from_input(guard.findings.len(), input) {
-                                Ok(finding) => {
-                                    let id = finding.id.clone();
-                                    guard.findings.push(finding);
-                                    CallToolResult::success(vec![Content::text(format!(
-                                        "accepted finding {id}"
-                                    ))])
-                                }
-                                Err(error) => {
-                                    CallToolResult::error(vec![Content::text(error.to_string())])
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
-                }
-            }
-            "submit_no_findings" if phase == ReviewPhase::Finder => {
-                match parse_tool_arguments::<reporting::NoFindings>(tool_call.arguments.clone()) {
-                    Ok(mut no_findings) => {
-                        if let Err(error) = no_findings.validate() {
-                            CallToolResult::error(vec![Content::text(error.to_string())])
-                        } else {
-                            let mut guard = artifact.lock().await;
-                            if !guard.findings.is_empty() {
-                                CallToolResult::error(vec![Content::text(
-                                    "cannot submit no-findings after submit_finding",
-                                )])
-                            } else {
-                                guard.no_findings = Some(no_findings);
-                                CallToolResult::success(vec![Content::text(
-                                    "accepted no-findings result",
-                                )])
-                            }
-                        }
-                    }
-                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
-                }
-            }
-            "submit_verdict" if phase == ReviewPhase::Verifier => {
-                match parse_tool_arguments::<reporting::Verdict>(tool_call.arguments.clone()) {
-                    Ok(mut verdict) => {
-                        let mut guard = artifact.lock().await;
-                        let ids = guard
-                            .findings
-                            .iter()
-                            .map(|finding| finding.id.clone())
-                            .collect();
-                        match verdict.validate(&ids) {
-                            Ok(()) => {
-                                guard
-                                    .verdicts
-                                    .retain(|existing| existing.finding_id != verdict.finding_id);
-                                let id = verdict.finding_id.clone();
-                                guard.verdicts.push(verdict);
-                                CallToolResult::success(vec![Content::text(format!(
-                                    "accepted verdict for {id}"
-                                ))])
-                            }
-                            Err(error) => {
-                                CallToolResult::error(vec![Content::text(error.to_string())])
-                            }
-                        }
-                    }
-                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
-                }
-            }
-            "submit_duplicate_decision" if phase == ReviewPhase::Dedupe => {
-                match parse_tool_arguments::<reporting::DuplicateDecision>(
-                    tool_call.arguments.clone(),
-                ) {
-                    Ok(mut decision) => {
-                        let mut guard = artifact.lock().await;
-                        let ids = guard
-                            .findings
-                            .iter()
-                            .map(|finding| finding.id.clone())
-                            .collect();
-                        match decision.validate(&ids) {
-                            Ok(()) => {
-                                guard
-                                    .duplicate_decisions
-                                    .retain(|existing| existing.finding_id != decision.finding_id);
-                                let id = decision.finding_id.clone();
-                                guard.duplicate_decisions.push(decision);
-                                CallToolResult::success(vec![Content::text(format!(
-                                    "accepted duplicate decision for {id}"
-                                ))])
-                            }
-                            Err(error) => {
-                                CallToolResult::error(vec![Content::text(error.to_string())])
-                            }
-                        }
-                    }
-                    Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
-                }
-            }
-            "submit_pr_summary"
-            | "submit_finding"
-            | "submit_no_findings"
-            | "submit_verdict"
-            | "submit_duplicate_decision" => CallToolResult::error(vec![Content::text(format!(
-                "tool `{}` is not valid during the {:?} phase",
-                tool_call.name, phase
-            ))]),
-            _ => continue,
-        };
+const REPORTING_INSTRUCTIONS: &str = r#"Use these tools to submit structured review results to Fiach. Finder passes with a summary lane call `submit_pr_summary` once, then call `submit_finding` once per candidate or `submit_no_findings`. Verifier passes call `submit_verdict` once per candidate finding. The resumed coordinator calls `submit_duplicate_decision` once per verified finding and must not modify candidates or verdicts. These tools do not post to GitHub or Buzz."#;
 
-        agent
-            .handle_tool_result(request.id.clone(), Ok(result))
-            .await;
+#[async_trait::async_trait]
+impl McpClientTrait for ReportingClient {
+    async fn list_tools(
+        &self,
+        _session_id: &str,
+        _next_cursor: Option<String>,
+        _cancel_token: CancellationToken,
+    ) -> std::result::Result<ListToolsResult, ServiceError> {
+        Ok(ListToolsResult::with_all_items(reporting::reporting_tools()))
     }
 
-    Ok(())
+    async fn call_tool(
+        &self,
+        _ctx: &ToolCallContext,
+        name: &str,
+        arguments: Option<JsonObject>,
+        _cancel_token: CancellationToken,
+    ) -> std::result::Result<CallToolResult, ServiceError> {
+        let mut tool_call = CallToolRequestParams::new(name.to_owned());
+        tool_call.arguments = arguments;
+        Ok(handle_reporting_tool_call(&tool_call, self.phase.clone(), self.artifact.clone()).await)
+    }
+
+    fn get_info(&self) -> Option<&InitializeResult> {
+        None
+    }
+
+    fn get_instructions(&self) -> Option<String> {
+        Some(REPORTING_INSTRUCTIONS.to_string())
+    }
+}
+
+async fn add_reporting_extension(
+    agent: &Agent,
+    phase: ReviewPhase,
+    artifact: SharedReportingArtifact,
+) {
+    // Register directly: this client lives in the host and has no external transport.
+    agent
+        .extension_manager
+        .add_client(
+            "fiach-reporting".to_string(),
+            ExtensionConfig::Platform {
+                name: "fiach-reporting".to_string(),
+                description: "Structured Fiach review reporting tools".to_string(),
+                display_name: Some("Fiach reporting".to_string()),
+                bundled: Some(true),
+                available_tools: Vec::new(),
+            },
+            Arc::new(ReportingClient { phase, artifact }),
+            None,
+        )
+        .await;
+}
+
+async fn handle_reporting_tool_call(
+    tool_call: &CallToolRequestParams,
+    phase: ReviewPhase,
+    artifact: SharedReportingArtifact,
+) -> CallToolResult {
+    match tool_call.name.as_ref() {
+        "submit_pr_summary" if phase == ReviewPhase::Finder => {
+            match parse_tool_arguments::<reporting::PullRequestSummary>(tool_call.arguments.clone())
+            {
+                Ok(mut summary) => {
+                    if let Err(error) = summary.validate() {
+                        CallToolResult::error(vec![Content::text(error.to_string())])
+                    } else {
+                        artifact.lock().await.pr_summary = Some(summary);
+                        CallToolResult::success(vec![Content::text(
+                            "accepted pull request summary",
+                        )])
+                    }
+                }
+                Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+            }
+        }
+        "submit_finding" if phase == ReviewPhase::Finder => {
+            match parse_tool_arguments::<reporting::FindingInput>(tool_call.arguments.clone()) {
+                Ok(input) => {
+                    let mut guard = artifact.lock().await;
+                    if guard.no_findings.is_some() {
+                        CallToolResult::error(vec![Content::text(
+                            "cannot submit findings after submit_no_findings",
+                        )])
+                    } else {
+                        match reporting::Finding::from_input(guard.findings.len(), input) {
+                            Ok(finding) => {
+                                let id = finding.id.clone();
+                                guard.findings.push(finding);
+                                CallToolResult::success(vec![Content::text(format!(
+                                    "accepted finding {id}"
+                                ))])
+                            }
+                            Err(error) => {
+                                CallToolResult::error(vec![Content::text(error.to_string())])
+                            }
+                        }
+                    }
+                }
+                Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+            }
+        }
+        "submit_no_findings" if phase == ReviewPhase::Finder => {
+            match parse_tool_arguments::<reporting::NoFindings>(tool_call.arguments.clone()) {
+                Ok(mut no_findings) => {
+                    if let Err(error) = no_findings.validate() {
+                        CallToolResult::error(vec![Content::text(error.to_string())])
+                    } else {
+                        let mut guard = artifact.lock().await;
+                        if !guard.findings.is_empty() {
+                            CallToolResult::error(vec![Content::text(
+                                "cannot submit no-findings after submit_finding",
+                            )])
+                        } else {
+                            guard.no_findings = Some(no_findings);
+                            CallToolResult::success(vec![Content::text(
+                                "accepted no-findings result",
+                            )])
+                        }
+                    }
+                }
+                Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+            }
+        }
+        "submit_verdict" if phase == ReviewPhase::Verifier => {
+            match parse_tool_arguments::<reporting::Verdict>(tool_call.arguments.clone()) {
+                Ok(mut verdict) => {
+                    let mut guard = artifact.lock().await;
+                    let ids = guard
+                        .findings
+                        .iter()
+                        .map(|finding| finding.id.clone())
+                        .collect();
+                    match verdict.validate(&ids) {
+                        Ok(()) => {
+                            guard
+                                .verdicts
+                                .retain(|existing| existing.finding_id != verdict.finding_id);
+                            let id = verdict.finding_id.clone();
+                            guard.verdicts.push(verdict);
+                            CallToolResult::success(vec![Content::text(format!(
+                                "accepted verdict for {id}"
+                            ))])
+                        }
+                        Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+                    }
+                }
+                Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+            }
+        }
+        "submit_duplicate_decision" if phase == ReviewPhase::Dedupe => {
+            match parse_tool_arguments::<reporting::DuplicateDecision>(tool_call.arguments.clone())
+            {
+                Ok(mut decision) => {
+                    let mut guard = artifact.lock().await;
+                    let ids = guard
+                        .findings
+                        .iter()
+                        .map(|finding| finding.id.clone())
+                        .collect();
+                    match decision.validate(&ids) {
+                        Ok(()) => {
+                            guard
+                                .duplicate_decisions
+                                .retain(|existing| existing.finding_id != decision.finding_id);
+                            let id = decision.finding_id.clone();
+                            guard.duplicate_decisions.push(decision);
+                            CallToolResult::success(vec![Content::text(format!(
+                                "accepted duplicate decision for {id}"
+                            ))])
+                        }
+                        Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+                    }
+                }
+                Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+            }
+        }
+        "submit_pr_summary"
+        | "submit_finding"
+        | "submit_no_findings"
+        | "submit_verdict"
+        | "submit_duplicate_decision" => CallToolResult::error(vec![Content::text(format!(
+            "tool `{}` is not valid during the {:?} phase",
+            tool_call.name, phase
+        ))]),
+        _ => CallToolResult::error(vec![Content::text("unknown reporting tool")]),
+    }
 }
 
 fn parse_tool_arguments<T: serde::de::DeserializeOwned>(
@@ -2922,6 +2942,8 @@ async fn resume_coordinator_for_duplicates(params: DedupeParams<'_>) -> Result<(
     let agent = params.agent;
     let session_config = params.session_config;
     restrict_coordinator_to_reporting(agent, &session_config.id).await?;
+    // Replace the finder client before resuming, so tool dispatch enforces dedupe policy.
+    add_reporting_extension(agent, ReviewPhase::Dedupe, params.artifact.clone()).await;
     let input_price_per_m = params.input_price_per_m;
     let output_price_per_m = params.output_price_per_m;
     let initial_totals = agent
@@ -3013,14 +3035,7 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
                 }
                 event = stream.next() => {
                     match event {
-                        Some(Ok(AgentEvent::Message(message))) => {
-                            handle_reporting_tool_requests(
-                                agent,
-                                &message,
-                                ReviewPhase::Dedupe,
-                                params.artifact.clone(),
-                            )
-                            .await?;
+                        Some(Ok(AgentEvent::Message(_message))) => {
                             let current_cost = agent
                                 .config
                                 .session_manager
@@ -3181,7 +3196,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         .add_extension(developer_ext, &session.id)
         .await
         .context("Failed to load developer extension for verifier")?;
-    add_reporting_extension(&agent, &session.id).await?;
+    add_reporting_extension(&agent, ReviewPhase::Verifier, params.artifact.clone()).await;
 
     let candidates = serde_json::to_string_pretty(&params.artifact.lock().await.findings)?;
     let pr_context = serde_json::to_string_pretty(params.pr_context)?;
@@ -3260,14 +3275,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                 }
                 event = stream.next() => {
                     match event {
-                        Some(Ok(AgentEvent::Message(message))) => {
-                            handle_reporting_tool_requests(
-                                &agent,
-                                &message,
-                                ReviewPhase::Verifier,
-                                params.artifact.clone(),
-                            )
-                            .await?;
+                        Some(Ok(AgentEvent::Message(_message))) => {
                             let current_cost = agent
                                 .config
                                 .session_manager
@@ -3992,27 +4000,150 @@ Reviewed the PR and found no vulnerabilities.
         (agent, session.id, dir)
     }
 
+    async fn add_test_extension(agent: &Agent, name: &str) {
+        agent
+            .extension_manager
+            .add_client(
+                name.to_string(),
+                ExtensionConfig::Platform {
+                    name: name.to_string(),
+                    description: "inert test extension".into(),
+                    display_name: None,
+                    bundled: Some(true),
+                    available_tools: vec![],
+                },
+                Arc::new(ReportingClient {
+                    phase: ReviewPhase::Finder,
+                    artifact: Arc::new(Mutex::new(ReportingArtifact::default())),
+                }),
+                None,
+            )
+            .await;
+    }
+
+    async fn dispatch_reporting_message(
+        agent: &Agent,
+        session_id: &str,
+        message: Message,
+    ) -> CallToolResult {
+        let MessageContent::ToolRequest(request) = &message.content[0] else {
+            panic!("expected tool request");
+        };
+        let mut call = request.tool_call.clone().unwrap();
+        call.name = format!("fiach-reporting__{}", call.name).into();
+        agent
+            .extension_manager
+            .dispatch_tool_call(
+                &ToolCallContext::new(session_id.to_string(), None, None),
+                call,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .result
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reporting_client_dispatch_validates_and_records_results() {
+        let (agent, session_id, _dir) = coordinator_test_session().await;
+        let shared = Arc::new(Mutex::new(ReportingArtifact::default()));
+        add_reporting_extension(&agent, ReviewPhase::Finder, shared.clone()).await;
+        let invalid = Message::assistant().with_tool_request(
+            "invalid",
+            Ok(CallToolRequestParams::new("submit_no_findings")),
+        );
+        assert_eq!(
+            dispatch_reporting_message(&agent, &session_id, invalid)
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert!(shared.lock().await.no_findings.is_none());
+        let valid = Message::assistant().with_tool_request(
+            "valid",
+            Ok(CallToolRequestParams::new("submit_no_findings")
+                .with_arguments(rmcp::object!({"summary": "No issues found", "skills_used": []}))),
+        );
+        assert_ne!(
+            dispatch_reporting_message(&agent, &session_id, valid)
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_eq!(
+            shared.lock().await.no_findings.as_ref().unwrap().summary,
+            "No issues found"
+        );
+    }
+
+    #[tokio::test]
+    async fn reporting_clients_share_candidates_but_enforce_verifier_phase() {
+        let (finder, finder_session, _finder_dir) = coordinator_test_session().await;
+        let (verifier, verifier_session, _verifier_dir) = coordinator_test_session().await;
+        let shared = Arc::new(Mutex::new(ReportingArtifact::default()));
+        add_reporting_extension(&finder, ReviewPhase::Finder, shared.clone()).await;
+        add_reporting_extension(&verifier, ReviewPhase::Verifier, shared.clone()).await;
+        let candidate = Message::assistant().with_tool_request(
+            "candidate",
+            Ok(CallToolRequestParams::new("submit_finding").with_arguments(
+                rmcp::object!({"title": "Candidate", "severity": "high", "confidence": "high", "evidence": "code evidence", "body_markdown": "Candidate body", "skills_used": []}),
+            )),
+        );
+        assert_eq!(
+            dispatch_reporting_message(&verifier, &verifier_session, candidate.clone())
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert!(shared.lock().await.findings.is_empty());
+        assert_ne!(
+            dispatch_reporting_message(&finder, &finder_session, candidate)
+                .await
+                .is_error,
+            Some(true)
+        );
+        let mut verdict = duplicate_fixture().1.remove(0).verdict;
+        verdict.finding_id = shared.lock().await.findings[0].id.clone();
+        let message = Message::assistant().with_tool_request(
+            "verdict",
+            Ok(CallToolRequestParams::new("submit_verdict").with_arguments(
+                serde_json::to_value(&verdict)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        );
+        assert_eq!(
+            dispatch_reporting_message(&finder, &finder_session, message.clone())
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert!(shared.lock().await.verdicts.is_empty());
+        assert_ne!(
+            dispatch_reporting_message(&verifier, &verifier_session, message)
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_eq!(shared.lock().await.verdicts, vec![verdict]);
+    }
+
     #[tokio::test]
     async fn coordinator_continuation_preserves_history_and_removes_execution_tools() {
         let (agent, session_id, _dir) = coordinator_test_session().await;
-        add_reporting_extension(&agent, &session_id).await.unwrap();
-        // Use frontend extensions to exercise real Goose extension removal without
-        // starting a shell. The continuation must remove these regardless of type.
+        add_reporting_extension(
+            &agent,
+            ReviewPhase::Finder,
+            Arc::new(Mutex::new(ReportingArtifact::default())),
+        )
+        .await;
+        // Register inert clients to exercise removal without starting execution tools.
         for name in ["developer", "summon"] {
-            agent
-                .add_extension(
-                    ExtensionConfig::Frontend {
-                        name: name.into(),
-                        description: "test execution surface".into(),
-                        tools: vec![],
-                        instructions: None,
-                        bundled: Some(true),
-                        available_tools: vec![],
-                    },
-                    &session_id,
-                )
-                .await
-                .unwrap();
+            add_test_extension(&agent, name).await;
         }
         agent.persist_extension_state(&session_id).await.unwrap();
         agent
@@ -4042,20 +4173,7 @@ Reviewed the PR and found no vulnerabilities.
                 .any(|message| message.as_concat_text().contains("retained lane evidence"))
         );
         // A remaining extension must prevent the continuation from receiving discussion.
-        agent
-            .add_extension(
-                ExtensionConfig::Frontend {
-                    name: "unexpected".into(),
-                    description: "unexpected surface".into(),
-                    tools: vec![],
-                    instructions: None,
-                    bundled: Some(true),
-                    available_tools: vec![],
-                },
-                &session_id,
-            )
-            .await
-            .unwrap();
+        add_test_extension(&agent, "unexpected").await;
         assert!(
             restrict_coordinator_to_reporting(&agent, &session_id)
                 .await
@@ -4065,7 +4183,7 @@ Reviewed the PR and found no vulnerabilities.
 
     #[tokio::test]
     async fn duplicate_phase_cannot_rewrite_verified_findings() {
-        let (agent, _session_id, _dir) = coordinator_test_session().await;
+        let (agent, session_id, _dir) = coordinator_test_session().await;
         let mut artifact = ReportingArtifact::default();
         artifact.findings.push(
             reporting::Finding::from_input(
@@ -4086,7 +4204,15 @@ Reviewed the PR and found no vulnerabilities.
         verdict.finding_id = artifact.findings[0].id.clone();
         artifact.verdicts.push(verdict.clone());
         let shared = Arc::new(Mutex::new(artifact.clone()));
-        let message = Message::assistant().with_frontend_tool_request(
+        add_reporting_extension(&agent, ReviewPhase::Finder, shared.clone()).await;
+        // A resumed coordinator must replace the finder client, including cached dispatch.
+        agent
+            .extension_manager
+            .get_prefixed_tools(&session_id, None)
+            .await
+            .unwrap();
+        add_reporting_extension(&agent, ReviewPhase::Dedupe, shared.clone()).await;
+        let message = Message::assistant().with_tool_request(
             "rewrite",
             Ok(
                 rmcp::model::CallToolRequestParams::new("submit_finding").with_arguments(
@@ -4094,11 +4220,10 @@ Reviewed the PR and found no vulnerabilities.
                 ),
             ),
         );
-        handle_reporting_tool_requests(&agent, &message, ReviewPhase::Dedupe, shared.clone())
-            .await
-            .unwrap();
+        let result = dispatch_reporting_message(&agent, &session_id, message).await;
+        assert_eq!(result.is_error, Some(true));
         verdict.confirmed = false;
-        let message = Message::assistant().with_frontend_tool_request(
+        let message = Message::assistant().with_tool_request(
             "change-verdict",
             Ok(
                 rmcp::model::CallToolRequestParams::new("submit_verdict").with_arguments(
@@ -4110,9 +4235,8 @@ Reviewed the PR and found no vulnerabilities.
                 ),
             ),
         );
-        handle_reporting_tool_requests(&agent, &message, ReviewPhase::Dedupe, shared.clone())
-            .await
-            .unwrap();
+        let result = dispatch_reporting_message(&agent, &session_id, message).await;
+        assert_eq!(result.is_error, Some(true));
         let decision = reporting::DuplicateDecision {
             finding_id: artifact.findings[0].id.clone(),
             already_reported: false,
@@ -4120,7 +4244,7 @@ Reviewed the PR and found no vulnerabilities.
             confidence: "high".into(),
             rationale: "No matching comment".into(),
         };
-        let message = Message::assistant().with_frontend_tool_request(
+        let message = Message::assistant().with_tool_request(
             "duplicate-decision",
             Ok(
                 rmcp::model::CallToolRequestParams::new("submit_duplicate_decision")
@@ -4133,9 +4257,8 @@ Reviewed the PR and found no vulnerabilities.
                     ),
             ),
         );
-        handle_reporting_tool_requests(&agent, &message, ReviewPhase::Dedupe, shared.clone())
-            .await
-            .unwrap();
+        let result = dispatch_reporting_message(&agent, &session_id, message).await;
+        assert_ne!(result.is_error, Some(true));
         let updated = shared.lock().await;
         assert_eq!(updated.duplicate_decisions, vec![decision]);
         assert_eq!(updated.findings, artifact.findings);

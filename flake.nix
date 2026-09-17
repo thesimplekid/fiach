@@ -39,7 +39,7 @@
           };
 
           # Pinned toolchain; keep in sync with rust-toolchain.toml and Cargo.toml.
-          stable_toolchain = pkgs.rust-bin.stable."1.94.1".default.override {
+          stable_toolchain = pkgs.rust-bin.stable."1.98.1".default.override {
             extensions = [
               "rustfmt"
               "clippy"
@@ -96,7 +96,7 @@
               lockFile = ./Cargo.lock;
               outputHashes = {
                 "buzz-client-0.1.0" = "sha256-qxOkoR44k3pr9+TmRSZWmRZRXt+56ohCrE4zwF+/nMM=";
-                "goose-1.46.0" = "sha256-SRBz4vv5w0gFyWL5rN2Ml9z0h2EIR9/c8t72my/NcdU=";
+                "goose-1.50.1" = "sha256-n4jslrK5VrhcwzgvLdy2MaL0feQ8+rX+i202UwpAdHE=";
               };
             };
 

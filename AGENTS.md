@@ -5,7 +5,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 ## Architecture & Layout
 
 - **Pre-stage then delegate**: The app isolates work in a temp dir using `gh` CLI *before* giving control to the `goose` agent. This prevents wasting agent turns on git operations.
-- **Structured reporting first**: Finder agents submit candidates through the in-process `fiach-reporting` frontend tool surface (`submit_finding` / `submit_no_findings`). Markdown is rendered by the host from structured data.
+- **Structured reporting first**: Finder agents submit candidates through the in-process `fiach-reporting` MCP client (`submit_finding` / `submit_no_findings`). Markdown is rendered by the host from structured data.
 - **Separate verifier session**: Candidate findings are adjudicated in a second Goose session. The verifier submits one `submit_verdict` per finding; structured verdicts are authoritative for metadata and disclosure.
 - **Host-only disclosure**: Models never post to GitHub. `src/disclose.rs` applies deterministic policy checks before any GitHub side effect.
 - `src/main.rs`: Entrypoint, clap CLI parsing, tracing init.
@@ -43,11 +43,11 @@ High-signal constraints and instructions for AI agents working in this repositor
 ## Dependencies & Overrides (CRITICAL)
 
 - **DO NOT** casually change dependency pins or overrides in `Cargo.toml` / `Cargo.lock`; Goose and RMCP versions are sensitive.
-- Keep the manifest `rmcp = "1.2.0"` pin unless you have verified Goose compatibility and the lockfile outcome. The current lockfile may resolve a newer RMCP through Goose's dependency graph; do not "clean this up" as drive-by churn.
+- Keep the manifest `rmcp = "3.4.0"` requirement unless you have verified Goose compatibility and the lockfile outcome. Keep Fiach and Goose on a single compatible RMCP version; do not change this as drive-by churn.
 
 ## Development Setup
 
-- Requires **Rust 1.94.1** stable (provided via Nix shell `nix develop`).
+- Requires **Rust 1.98.1** stable (provided via Nix shell `nix develop`).
 - Requires `gh` CLI to be authenticated (`gh auth login`).
 - Requires `.env` or service environment containing `GITHUB_TOKEN` and the selected provider API key (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`).
 
