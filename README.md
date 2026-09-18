@@ -36,6 +36,7 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 - **Environment Variables:**
   - `OPENROUTER_API_KEY`: For default OpenRouter LLM access.
   - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`: Required only when using the matching direct provider.
+  - `TYPESAFE_API_KEY`: Enables optional Jev lane selection and live deduplication. Without it, all configured lanes run and deduplication uses the coordinator fallback.
   - `GITHUB_TOKEN`: Host-only token for PR discovery and permitted disclosure actions.
   - `FIACH_REVIEW_GITHUB_TOKEN`: Separate read-only token used inside review sandboxes for cloning repositories and reading PR metadata.
 
@@ -289,9 +290,54 @@ from findings. Buzz delivery enables this lane automatically.
 
 The coordinator launches Goose delegate subagents, collects all lane results, merges candidates describing the same root cause, and submits `submit_finding` or `submit_no_findings`. `max_review_lanes` includes the mandatory persona lane and any summary lane. Lanes return candidate JSON and do not call reporting tools; custom persona files keep their methodology and placeholders, but the appended lane execution contract overrides old instructions to submit findings or write reports.
 
-After the independent verifier finishes, Fiach fetches current PR discussion and resumes the same coordinator session to decide which verified findings were already reported. That continuation has only reporting tools and records matching comment IDs and reasons. There is no separate deduplication model session or model work in host finalization. Both sandboxed and local execution complete this step before returning artifacts for publication. If discussion cannot be fetched or adjudication fails, verified findings remain eligible for publication.
+You can optionally make a specialist lane conditional on the change being relevant:
 
-`dedupe_existing_comments = false` disables the discussion comparison. The resumed coordinator uses the finder provider/model. Verifier provider/model settings remain independent. `timeout_mins` applies separately to the initial coordinator/lane phase, verifier phase, and duplicate-decision continuation. The sandbox hard limit allows those enabled phases plus five minutes for setup.
+```nix
+services.fiach.reviewLaneConditions."public-wallet-api-ffi" = ''
+  Run when the change could require corresponding updates to CDK wallet
+  FFI bindings: public wallet APIs, signatures, behavior, shared exported
+  types, errors, conversions, or the wallet bindings themselves.
+  Consider shared types and re-exports. Skip only clearly unrelated changes.
+'';
+```
+
+Keep the lane in `reviewLanes`; its existing `reviewLanePrompts` entry defines how
+it reviews code once selected. The equivalent TOML setting is
+`[daemon.review_lane_conditions]` or `[review.review_lane_conditions]`, with
+lane names as keys and applicability conditions as string values.
+
+Lane conditions are **optional**. An empty map preserves existing behavior.
+Lanes without conditions always run. Conditions must name configured lanes;
+empty conditions, conflicting normalized names, and conditions on the mandatory
+`persona`, `summary`, or `pr-summary` lanes are configuration errors.
+
+With `TYPESAFE_API_KEY` available, Fiach evaluates conditions before delegation
+using the same diff base as the review, including incremental rereviews. Jev
+returns `run`, `skip`, or `uncertain`. Only `skip` with probability at least 0.98
+and confidence at least 0.95 removes a lane. Missing credentials, uncertainty,
+API failures, insufficient budget, and empty, binary, oversized, or incomplete
+diff context all run the configured lanes. No PR title or description can
+authorize skipping a lane by itself. Conditions and diff content are passed as
+data to a tool-free classification request.
+
+The selected lanes drive both delegation and completion tracking. Structured
+artifacts include `lane_selection` decisions with conditions, actions, model,
+probability, and confidence where available; Markdown distinguishes lanes
+selected to run from lanes skipped as irrelevant. A skip is never recorded as a
+completed review or a no-findings result. Selection has a thirty-second total
+timeout, uses the shared Jev request limits below, and counts against the finder
+budget. `dedupe_existing_comments` controls deduplication independently of lane
+selection.
+
+After the independent verifier finishes, Fiach fetches current PR discussion and uses TypeSafe Jev to compare verified findings with existing comments. Set `TYPESAFE_API_KEY` in the process environment or NixOS service environment file; it is forwarded into review sandboxes. Jev decisions take effect immediately, without shadow mode. The integration uses the standalone `jev-sdk` crate, pinned to `0.1.0`, and pins the model to `jev-1.13.0`. It does not require a Goose fork.
+
+Jev compares each finding with batches of up to eight comments using typed choices: same root issue, different issue, or insufficient evidence. Suppression requires a same-issue probability of at least 0.98 and confidence of at least 0.95. A definite non-match requires a different-issue probability of at least 0.95 and confidence of at least 0.90 for every comment. Comment IDs come from the supplied discussion, and the artifact records the matched ID, model, probability, and confidence. These conservative thresholds are policy defaults, not an accuracy guarantee.
+
+Uncertain comparisons, oversized inputs, missing credentials, and service failures fall back to the finder coordinator for the unresolved findings only. That continuation has only reporting tools. Valid Jev decisions survive fallback failures; any remaining unresolved findings stay eligible for publication. Both sandboxed and local execution finish deduplication before returning artifacts for host disclosure.
+
+Jev requests are limited to 24 KiB, ten seconds per request, and thirty seconds for the whole Jev phase. Inputs are never truncated to force a decision. Reported usage is included in review totals, using the pinned model's [published price](https://docs.typesafe.ai/models) of $0.042 per million input tokens (output is free). Estimated request cost is checked against the remaining budget before sending. Usage from requests that fail without a usable response cannot be accounted for; Fiach does not retry those requests before falling back.
+
+`dedupe_existing_comments = false` disables both Jev and coordinator discussion comparison. The fallback coordinator uses the finder provider/model. Verifier provider/model settings remain independent. `timeout_mins` applies separately to the initial coordinator/lane phase, verifier phase, and fallback duplicate-decision continuation. The sandbox hard limit allows those enabled phases plus five minutes for setup and the bounded Jev phases.
 
 ### Buzz Review Threads
 
@@ -503,6 +549,75 @@ In your `flake.nix` or `configuration.nix`:
   };
 }
 ```
+
+### Deploying optional Jev support
+
+1. Update your Fiach flake input to a revision containing Jev support. If the
+   input is named `fiach`, run `nix flake update fiach` from your NixOS
+   configuration repository after that revision is published to the branch you
+   track. An older pin will not recognize `reviewLaneConditions`.
+
+2. Add `TYPESAFE_API_KEY=your-key` to the secret supplying
+   `services.fiach.environmentFile`. Keep the key in your secret manager, not in
+   a Nix string. For the Beekeeper setup with `fiach-environment.service`, add
+   this line to the encrypted `fiach-env.age` source using your normal secret
+   editing workflow. The existing assembly script copies it into
+   `/run/fiach/environment`; no script change is needed. Fiach forwards the key
+   into review sandboxes automatically.
+
+3. Add an applicability condition for each lane you want Jev to select. For
+   the CDK configuration, add this alongside the existing lane prompts:
+
+   ```nix
+   services.fiach = {
+     reviewLaneConditions."public-wallet-api-ffi" = ''
+       Run when the change could require corresponding updates to CDK wallet
+       FFI bindings: public wallet APIs, signatures, behavior, shared exported
+       types, errors, conversions, or the wallet bindings themselves.
+       Consider shared types and re-exports. Skip only clearly unrelated changes.
+     '';
+     dedupeExistingComments = true;
+   };
+   ```
+
+   Keep `public-wallet-api-ffi` in `reviewLanes` and retain its full
+   `reviewLanePrompts` entry. Leave `security` without a condition so it always
+   runs. The key also enables Jev deduplication when
+   `dedupeExistingComments = true`; there is no separate Jev enable switch.
+   Finder and verifier provider/model settings stay as configured.
+
+4. Build and activate your NixOS configuration with your usual deployment
+   command, for example `sudo nixos-rebuild switch --flake .#my-server` on the
+   target host. Replace `my-server` with your configuration name. For the
+   runtime credential assembly setup, refresh credentials before restarting
+   Fiach:
+
+   ```sh
+   sudo systemctl restart fiach-environment.service
+   sudo systemctl restart fiach.service
+   sudo systemctl status fiach.service
+   sudo journalctl -u fiach.service -f
+   ```
+
+   If your environment file is supplied directly by a secret manager, omit
+   the `fiach-environment.service` command. Restarting Fiach is required for it
+   to pick up a changed environment file.
+
+5. Inspect the next eligible review's JSON `lane_selection` field and Markdown
+   **Lane Selection** section. A Jev decision records its model, probability,
+   and confidence; a fallback records why the lane ran. A lane running does
+   not by itself prove Jev was called. Existing reviewed commits are not
+   automatically reviewed again just because the configuration changed.
+   Deduplication is exercised when verified findings and existing discussion
+   are available; matched decisions record the existing comment ID and Jev
+   metadata. Decisions take effect immediately, without shadow mode.
+
+To disable Jev entirely, remove `TYPESAFE_API_KEY` from the secret, refresh any
+assembled environment file, and restart Fiach. All configured lanes then run,
+and existing-comment deduplication uses the coordinator fallback. To disable
+only lane selection, remove `reviewLaneConditions`; Jev deduplication remains
+available. Setting `dedupeExistingComments = false` disables both Jev and
+coordinator deduplication, independently of lane selection.
 
 ### Available Configuration Options
 

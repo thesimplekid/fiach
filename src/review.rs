@@ -370,6 +370,8 @@ pub struct ReviewParams {
     pub review_lanes: Vec<String>,
     /// Optional user-provided focus prompts keyed by lane name.
     pub review_lane_prompts: HashMap<String, String>,
+    /// Optional Jev applicability conditions; unavailable or uncertain means run.
+    pub review_lane_conditions: HashMap<String, String>,
     /// Maximum lane subagents the parent finder should run concurrently.
     pub max_review_lanes: usize,
     /// Maximum number of turns for the agent
@@ -533,6 +535,29 @@ fn normalize_review_lane_prompts(prompts: &HashMap<String, String>) -> HashMap<S
             }
         })
         .collect()
+}
+
+fn normalize_lane_conditions(
+    conditions: &HashMap<String, String>,
+    lanes: &[String],
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut normalized = std::collections::BTreeMap::new();
+    for (name, condition) in conditions {
+        let lane = normalize_review_lane_name(name);
+        if matches!(lane.as_str(), "persona" | "summary" | "pr-summary") {
+            bail!("Review lane `{lane}` cannot be conditional");
+        }
+        if !lanes.contains(&lane) || condition.trim().is_empty() {
+            bail!("Lane condition `{name}` requires a configured lane and a nonempty condition");
+        }
+        if normalized
+            .insert(lane, condition.trim().to_string())
+            .is_some()
+        {
+            bail!("Duplicate normalized lane condition `{name}`");
+        }
+    }
+    Ok(normalized)
 }
 
 fn review_lane_focus(lane: &str) -> &'static str {
@@ -1201,6 +1226,10 @@ pub async fn run_review(
         bail!("Maximum review cost must be a finite positive number");
     }
 
+    let lane_conditions = normalize_lane_conditions(
+        &params.review_lane_conditions,
+        &effective_review_lanes(&params.review_lanes),
+    )?;
     let start_time = Instant::now();
     let mut peak_input_tokens = 0u64;
     let mut total_output_tokens = 0u64;
@@ -1594,14 +1623,34 @@ pub async fn run_review(
         }
     }
 
+    let selection = crate::lane_selection::select(
+        &workspace.path,
+        &diff_base,
+        &effective_review_lanes(&params.review_lanes),
+        &lane_conditions,
+        remaining_cost_budget(
+            finder_cost_budget(params.max_cost_usd, params.verify_findings),
+            direct_call_cost_usd,
+        ),
+        &cancel_token,
+    )
+    .await?;
+    peak_input_tokens = peak_input_tokens.max(selection.usage.peak_input_tokens);
+    total_output_tokens += selection.usage.output_tokens;
+    total_processed_tokens += selection.usage.total_tokens;
+    if selection.usage.total_tokens > 0 {
+        add_known_cost(&mut direct_call_cost_usd, Some(selection.usage.cost_usd));
+    }
+    reporting_artifact.lock().await.lane_selection = selection.decisions;
+    let normalized_review_lanes = selection.lanes;
+
     // 7. Construct the user message — agent is already in the checked-out PR workspace
     let lane_prompt = review_lane_prompt(
-        &params.review_lanes,
+        &normalized_review_lanes,
         &params.review_lane_prompts,
         params.max_review_lanes,
         &diff_base,
     );
-    let normalized_review_lanes = effective_review_lanes(&params.review_lanes);
     let require_pr_summary = normalized_review_lanes
         .iter()
         .any(|lane| lane == "summary" || lane == "pr-summary");
@@ -2189,7 +2238,7 @@ pub async fn run_review(
         reporting::validate_artifact(&mut artifact)?;
         *reporting_artifact.lock().await = artifact.clone();
 
-        apply_coordinator_duplicate_suppression(CoordinatorDuplicateParams {
+        let dedupe_stats = apply_duplicate_suppression(DuplicateSuppressionParams {
             agent: &agent,
             session_config: &session_config,
             artifact: &mut artifact,
@@ -2201,6 +2250,12 @@ pub async fn run_review(
             cancel_token: cancel_token.clone(),
         })
         .await?;
+        peak_input_tokens = peak_input_tokens.max(dedupe_stats.usage.peak_input_tokens);
+        total_output_tokens += dedupe_stats.usage.output_tokens;
+        total_processed_tokens += dedupe_stats.usage.total_tokens;
+        if dedupe_stats.usage.total_tokens > 0 {
+            add_known_cost(&mut cost_usd, Some(dedupe_stats.usage.cost_usd));
+        }
         // This is the same session: account only for usage added by its continuation,
         // even when duplicate adjudication fails and its decisions are discarded.
         if let Ok(totals) = agent
@@ -2794,7 +2849,7 @@ pub struct VerificationStats {
     pub budget_exceeded: bool,
 }
 
-struct CoordinatorDuplicateParams<'a> {
+struct DuplicateSuppressionParams<'a> {
     agent: &'a Agent,
     session_config: &'a SessionConfig,
     artifact: &'a mut ReportingArtifact,
@@ -2806,9 +2861,9 @@ struct CoordinatorDuplicateParams<'a> {
     cancel_token: CancellationToken,
 }
 
-async fn apply_coordinator_duplicate_suppression(
-    params: CoordinatorDuplicateParams<'_>,
-) -> Result<()> {
+async fn apply_duplicate_suppression(
+    params: DuplicateSuppressionParams<'_>,
+) -> Result<crate::dedupe::Outcome> {
     if params.cancel_token.is_cancelled() {
         bail!("Review cancelled");
     }
@@ -2818,26 +2873,52 @@ async fn apply_coordinator_duplicate_suppression(
         || params.artifact.is_incomplete()
         || params.max_cost_usd.is_some_and(|budget| budget <= 0.0)
     {
-        return Ok(());
+        return Ok(crate::dedupe::Outcome::default());
     }
     let findings = params.artifact.accepted_findings(params.policy);
     if findings.is_empty() {
-        return Ok(());
+        return Ok(crate::dedupe::Outcome::default());
     }
     // Fetch fresh discussion after verification, in host code rather than via model tools.
     let comments = match fetch_existing_pr_comments(&params.review.repo, params.review.pr_number)
         .await
     {
-        Ok(comments) if comments.is_empty() => return Ok(()),
+        Ok(comments) if comments.is_empty() => return Ok(crate::dedupe::Outcome::default()),
         Ok(comments) => comments,
         Err(error) => {
             tracing::warn!(error = %error, "Could not fetch PR discussion; retaining verified findings");
-            return Ok(());
+            return Ok(crate::dedupe::Outcome::default());
         }
     };
+    let mut outcome = crate::dedupe::evaluate(
+        &findings,
+        &comments,
+        params.max_cost_usd,
+        &params.cancel_token,
+    )
+    .await;
+    if params.cancel_token.is_cancelled() {
+        bail!("Review cancelled");
+    }
+    let pending: Vec<_> = findings
+        .into_iter()
+        .filter(|finding| {
+            !outcome
+                .decisions
+                .iter()
+                .any(|decision| decision.finding_id == finding.finding_id)
+        })
+        .collect();
+    params.artifact.duplicate_decisions = std::mem::take(&mut outcome.decisions);
+    let remaining_budget = remaining_cost_budget(params.max_cost_usd, Some(outcome.usage.cost_usd));
+    if pending.is_empty() || remaining_budget.is_some_and(|budget| budget <= 0.0) {
+        return Ok(outcome);
+    }
     // The continuation only needs reporting tools; do not expose shell or delegation
     // to untrusted PR discussion. Fail the optional adjudication if removal fails.
-    let shared = Arc::new(Mutex::new(params.artifact.clone()));
+    let mut fallback_artifact = params.artifact.clone();
+    fallback_artifact.duplicate_decisions.clear();
+    let shared = Arc::new(Mutex::new(fallback_artifact));
     let result = resume_coordinator_for_duplicates(DedupeParams {
         agent: params.agent,
         session_config: params.session_config,
@@ -2845,7 +2926,7 @@ async fn apply_coordinator_duplicate_suppression(
         repo: &params.review.repo,
         pr_number: params.review.pr_number,
         pr_context: &params.policy.pr_context,
-        findings: &findings,
+        findings: &pending,
         existing_comments: &comments,
         provider_name: &params.review.provider,
         model: &params.review.model,
@@ -2854,7 +2935,7 @@ async fn apply_coordinator_duplicate_suppression(
         max_retries: params.review.max_retries,
         retry_delay_secs: params.review.retry_delay_secs,
         timeout_mins: params.review.timeout_mins,
-        max_cost_usd: params.max_cost_usd,
+        max_cost_usd: remaining_budget,
         cancel_token: params.cancel_token.clone(),
     })
     .await;
@@ -2864,8 +2945,8 @@ async fn apply_coordinator_duplicate_suppression(
     match result {
         Ok(()) => {
             let updated = shared.lock().await;
-            match validated_duplicate_decisions(&updated, &findings, &comments) {
-                Ok(decisions) => params.artifact.duplicate_decisions = decisions,
+            match validated_duplicate_decisions(&updated, &pending, &comments) {
+                Ok(decisions) => params.artifact.duplicate_decisions.extend(decisions),
                 Err(error) => {
                     tracing::warn!(error = %error, "Ignoring invalid coordinator duplicate decisions")
                 }
@@ -2875,7 +2956,7 @@ async fn apply_coordinator_duplicate_suppression(
             tracing::warn!(error = %error, "Coordinator duplicate adjudication failed; retaining verified findings")
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn validated_duplicate_decisions(
@@ -3912,6 +3993,47 @@ Reviewed the PR and found no vulnerabilities.
         assert!(prompt.contains(".fiach-persona-lane.md"));
         assert!(prompt.contains("at most 1 delegates"));
         assert!(!prompt.contains("skip review"));
+    }
+
+    #[test]
+    fn lane_conditions_require_configured_optional_lanes() {
+        let lanes =
+            effective_review_lanes(&["wallet-ffi".into(), "security".into(), "summary".into()]);
+        let normalized = normalize_lane_conditions(
+            &HashMap::from([("Wallet FFI".into(), " API changes ".into())]),
+            &lanes,
+        )
+        .unwrap();
+        assert_eq!(normalized["wallet-ffi"], "API changes");
+        for conditions in [
+            HashMap::from([("persona".into(), "skip".into())]),
+            HashMap::from([("summary".into(), "skip".into())]),
+            HashMap::from([("pr-summary".into(), "skip".into())]),
+            HashMap::from([("unknown".into(), "skip".into())]),
+            HashMap::from([("wallet-ffi".into(), " ".into())]),
+            HashMap::from([
+                ("wallet-ffi".into(), "one".into()),
+                ("Wallet FFI".into(), "two".into()),
+            ]),
+        ] {
+            assert!(normalize_lane_conditions(&conditions, &lanes).is_err());
+        }
+    }
+
+    #[test]
+    fn selected_lanes_drive_delegation_and_lane_tracking() {
+        let selected = vec!["persona".into(), "security".into(), "summary".into()];
+        let prompt = review_lane_prompt(
+            &selected,
+            &HashMap::from([("wallet-ffi".into(), "Only inspect FFI".into())]),
+            3,
+            "reviewed-base",
+        );
+        assert!(!prompt.contains("wallet-ffi"));
+        assert!(!prompt.contains("Only inspect FFI"));
+        assert!(prompt.contains("security"));
+        assert!(prompt.contains("reviewed-base"));
+        assert_eq!(effective_review_lanes(&selected), selected);
     }
 
     #[test]

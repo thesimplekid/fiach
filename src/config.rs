@@ -53,6 +53,9 @@ pub struct DaemonConfig {
     pub review_lanes: Option<MultiString>,
     #[serde(default)]
     pub review_lane_prompts: HashMap<String, String>,
+    /// Optional Jev applicability conditions; unavailable or uncertain means run.
+    #[serde(default)]
+    pub review_lane_conditions: HashMap<String, String>,
     pub max_review_lanes: Option<usize>,
     pub max_turns: Option<u32>,
     pub timeout_mins: Option<u64>,
@@ -100,6 +103,9 @@ pub struct ReviewConfig {
     pub review_lanes: Option<MultiString>,
     #[serde(default)]
     pub review_lane_prompts: HashMap<String, String>,
+    /// Optional Jev applicability conditions; unavailable or uncertain means run.
+    #[serde(default)]
+    pub review_lane_conditions: HashMap<String, String>,
     pub max_review_lanes: Option<usize>,
     pub max_turns: Option<u32>,
     pub timeout_mins: Option<u64>,
@@ -359,12 +365,26 @@ review_lanes = ["security", "cashu-mint"]
 
 [review.review_lane_prompts]
 cashu-mint = "Focus on mint quote idempotency."
+
+[review.review_lane_conditions]
+cashu-mint = "Run for mint API changes."
+
+[daemon.review_lane_conditions]
+wallet-ffi = "Run for wallet API changes."
 "#,
         )
         .unwrap();
 
         let config = FiachConfig::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.daemon.unwrap().review_lane_conditions["wallet-ffi"],
+            "Run for wallet API changes."
+        );
         let review = config.review.unwrap();
+        assert_eq!(
+            review.review_lane_conditions["cashu-mint"],
+            "Run for mint API changes."
+        );
 
         assert_eq!(
             review.review_lanes.unwrap().to_vec(),

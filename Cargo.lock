@@ -1858,6 +1858,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "goose",
+ "jev-sdk",
  "nostr",
  "process-wrap 9.1.0",
  "redb",
@@ -2956,6 +2957,20 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jev-sdk"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a11cf79cd75911c818095eec27d424418376d77dc7bf107e7a87dbccd21f513b"
+dependencies = [
+ "indexmap 2.14.2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
 
 [[package]]
 name = "jiff"

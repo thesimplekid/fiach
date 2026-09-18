@@ -1,10 +1,13 @@
 pub mod buzz;
 pub mod config;
 pub mod daemon;
+mod dedupe;
 pub mod disclose;
 pub mod execution;
 pub mod finalizer;
 pub mod github;
+mod jev;
+mod lane_selection;
 pub mod persona;
 pub mod process;
 pub mod reporting;

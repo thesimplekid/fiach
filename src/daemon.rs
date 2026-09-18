@@ -58,6 +58,8 @@ pub struct DaemonParams {
     pub personas: Vec<crate::persona::PersonaSource>,
     pub review_lanes: Vec<String>,
     pub review_lane_prompts: HashMap<String, String>,
+    /// Optional Jev applicability conditions; unavailable or uncertain means run.
+    pub review_lane_conditions: HashMap<String, String>,
     pub max_review_lanes: usize,
     pub max_turns: u32,
     pub timeout_mins: u64,
@@ -1227,6 +1229,7 @@ async fn process_daemon_job(
                 persona: job.persona.clone(),
                 review_lanes: params.review_lanes.clone(),
                 review_lane_prompts: params.review_lane_prompts.clone(),
+                review_lane_conditions: params.review_lane_conditions.clone(),
                 max_review_lanes: params.max_review_lanes,
                 max_turns: params.max_turns,
                 timeout_mins: params.timeout_mins,
@@ -1652,6 +1655,9 @@ async fn run_sandboxed_review(
     if let Ok(val) = std::env::var("GOOGLE_API_KEY") {
         cmd.arg(format!("--setenv=GOOGLE_API_KEY={}", val));
     }
+    if let Ok(val) = std::env::var("TYPESAFE_API_KEY") {
+        cmd.arg(format!("--setenv=TYPESAFE_API_KEY={}", val));
+    }
     // Never expose the host disclosure token to the model-controlled review
     // process. This token must be separately provisioned with read-only access
     // sufficient for cloning repositories and reading pull-request metadata.
@@ -1734,6 +1740,12 @@ async fn run_sandboxed_review(
         cmd.arg("--review-lane-prompts-json").arg(
             serde_json::to_string(&review_params.review_lane_prompts)
                 .context("Failed to serialize review lane prompts for sandbox child")?,
+        );
+    }
+    if !review_params.review_lane_conditions.is_empty() {
+        cmd.arg("--review-lane-conditions-json").arg(
+            serde_json::to_string(&review_params.review_lane_conditions)
+                .context("Failed to serialize review lane conditions for sandbox child")?,
         );
     }
     cmd.arg("--max-review-lanes")

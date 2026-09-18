@@ -15,6 +15,9 @@ pub enum ReviewPhase {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReportingArtifact {
+    /// Host routing decisions, never findings or evidence that a lane completed.
+    #[serde(default)]
+    pub lane_selection: Vec<LaneSelectionDecision>,
     #[serde(default)]
     pub pr_summary: Option<PullRequestSummary>,
     #[serde(default)]
@@ -32,6 +35,24 @@ pub struct ReportingArtifact {
     pub budget_exhausted: Option<ReviewPhase>,
     #[serde(default)]
     pub markdown_only_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneAction {
+    Run,
+    Skip,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneSelectionDecision {
+    pub lane: String,
+    pub condition: String,
+    pub action: LaneAction,
+    pub reason: String,
+    pub model: Option<String>,
+    pub skip_probability: Option<f64>,
+    pub confidence: Option<f64>,
 }
 
 impl ReportingArtifact {
@@ -847,6 +868,21 @@ findings_count: {findings_count}
         out.push('\n');
     }
 
+    if !artifact.lane_selection.is_empty() {
+        out.push_str("## Lane Selection\n");
+        for decision in &artifact.lane_selection {
+            let action = match decision.action {
+                LaneAction::Run => "selected to run",
+                LaneAction::Skip => "skipped as irrelevant (not reviewed by this lane)",
+            };
+            out.push_str(&format!(
+                "- `{}`: {action}. {}\n",
+                decision.lane, decision.reason
+            ));
+        }
+        out.push('\n');
+    }
+
     if let Some(phase) = &artifact.budget_exhausted {
         out.push_str(&format!(
             "## Incomplete Review\nThe {phase:?} phase reached its cost budget. Review coverage or verification is incomplete; this is not a no-findings result. No PR disclosure was allowed.\n\n"
@@ -1182,6 +1218,37 @@ fn severity_rank(severity: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lane_selection_is_separate_from_review_results_and_backward_compatible() {
+        let legacy: ReportingArtifact = serde_json::from_str("{}").unwrap();
+        assert!(legacy.lane_selection.is_empty());
+        let artifact = ReportingArtifact {
+            lane_selection: vec![LaneSelectionDecision {
+                lane: "wallet-ffi".into(),
+                condition: "Run for wallet API changes".into(),
+                action: LaneAction::Skip,
+                reason: "Jev classified this change as unrelated".into(),
+                model: Some("jev-1.13.0".into()),
+                skip_probability: Some(0.99),
+                confidence: Some(0.97),
+            }],
+            ..ReportingArtifact::default()
+        };
+        assert!(!artifact.finder_complete());
+        assert!(artifact.no_findings.is_none());
+        let mut completed = artifact;
+        completed.no_findings = Some(NoFindings {
+            summary: "No findings from the selected lanes.".into(),
+            skills_used: vec![],
+        });
+        let markdown = render_markdown("owner/repo", 1, &completed, None);
+        assert!(markdown.contains("skipped as irrelevant (not reviewed by this lane)"));
+        assert!(markdown.contains("No findings from the selected lanes."));
+        let round_trip: ReportingArtifact =
+            serde_json::from_str(&serde_json::to_string(&completed).unwrap()).unwrap();
+        assert_eq!(round_trip.lane_selection[0].action, LaneAction::Skip);
+    }
 
     fn policy() -> DisclosurePolicy {
         DisclosurePolicy {

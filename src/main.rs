@@ -245,6 +245,10 @@ enum Commands {
         #[arg(long, hide = true)]
         review_lane_prompts_json: Option<String>,
 
+        /// Internal: JSON map of optional lane applicability conditions
+        #[arg(long, hide = true)]
+        review_lane_conditions_json: Option<String>,
+
         /// Internal: write structured sandbox review result to JSON
         #[arg(long, hide = true)]
         result_json: Option<PathBuf>,
@@ -505,6 +509,7 @@ async fn main() -> Result<()> {
             output_price,
             sandbox_child,
             review_lane_prompts_json,
+            review_lane_conditions_json,
             result_json,
             review_kind,
         } => {
@@ -532,6 +537,10 @@ async fn main() -> Result<()> {
             ensure_summary_lane(&mut review_lanes, buzz_config.as_ref());
             let review_lane_prompts =
                 resolve_review_lane_prompts(rev_cfg.review_lane_prompts, review_lane_prompts_json)?;
+            let review_lane_conditions = resolve_review_lane_prompts(
+                rev_cfg.review_lane_conditions,
+                review_lane_conditions_json,
+            )?;
             let max_review_lanes = max_review_lanes.or(rev_cfg.max_review_lanes).unwrap_or(3);
             let use_persona_kind = personas.len() > 1 || buzz_config.is_some();
             let report_mode_str = report_mode
@@ -572,6 +581,7 @@ async fn main() -> Result<()> {
                     persona: persona.clone(),
                     review_lanes: review_lanes.clone(),
                     review_lane_prompts: review_lane_prompts.clone(),
+                    review_lane_conditions: review_lane_conditions.clone(),
                     max_review_lanes,
                     max_turns: max_turns.or(rev_cfg.max_turns).unwrap_or(60),
                     timeout_mins: timeout_mins.or(rev_cfg.timeout_mins).unwrap_or(30),
@@ -711,6 +721,7 @@ async fn main() -> Result<()> {
             let mut review_lanes = resolve_review_lanes(review_lanes, daemon_cfg.review_lanes);
             ensure_summary_lane(&mut review_lanes, buzz_config.as_ref());
             let review_lane_prompts = daemon_cfg.review_lane_prompts;
+            let review_lane_conditions = daemon_cfg.review_lane_conditions;
             let max_review_lanes = max_review_lanes
                 .or(daemon_cfg.max_review_lanes)
                 .unwrap_or(3);
@@ -796,6 +807,7 @@ async fn main() -> Result<()> {
                 personas,
                 review_lanes,
                 review_lane_prompts,
+                review_lane_conditions,
                 max_review_lanes,
                 max_turns: max_turns.or(daemon_cfg.max_turns).unwrap_or(60),
                 timeout_mins: timeout_mins.or(daemon_cfg.timeout_mins).unwrap_or(30),

@@ -101,6 +101,7 @@
             };
 
             nativeBuildInputs = with pkgs; [ pkg-config protobuf ];
+            nativeCheckInputs = with pkgs; [ git ];
             buildInputs = with pkgs; [ openssl sqlite zlib ] ++ libsDarwin;
           };
 
@@ -134,6 +135,8 @@
                       inputPricePerM = 1.25;
                       outputPricePerM = 5.75;
                       withSkill = "cashu-security";
+                      reviewLanes = [ "wallet-ffi" "security" ];
+                      reviewLaneConditions.wallet-ffi = "Run for wallet API changes.";
                       triggerMention = "fiach-bot";
                       allowedMentionUsers = [ "lead-maintainer" ];
                       buzz = {
@@ -205,6 +208,8 @@
               grep -F 'input_price_per_m = 1.25' "$config_path" >/dev/null
               grep -F 'output_price_per_m = 5.75' "$config_path" >/dev/null
               grep -F 'with_skill = "cashu-security"' "$config_path" >/dev/null
+              grep -F '[daemon.review_lane_conditions]' "$config_path" >/dev/null
+              grep -F 'wallet-ffi = "Run for wallet API changes."' "$config_path" >/dev/null
               grep -F 'trigger_mention = "fiach-bot"' "$config_path" >/dev/null
               grep -F 'allowed_mention_users = ["lead-maintainer"]' "$config_path" >/dev/null
 
@@ -377,12 +382,12 @@
             dedupeExistingComments = lib.mkOption {
               type = lib.types.bool;
               default = true;
-              description = "Run duplicate suppression against existing PR discussion before posting verified findings.";
+              description = "Compare verified findings with PR discussion using Jev when TYPESAFE_API_KEY is set, with coordinator fallback for unresolved decisions.";
             };
 
             environmentFile = lib.mkOption {
               type = lib.types.path;
-              description = "Path to environment file containing GITHUB_TOKEN, FIACH_REVIEW_GITHUB_TOKEN when sandboxing is enabled, the selected provider API key, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
+              description = "Path to environment file containing GITHUB_TOKEN, FIACH_REVIEW_GITHUB_TOKEN when sandboxing is enabled, the selected provider API key, TYPESAFE_API_KEY for live Jev deduplication, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
             };
 
             buzz = {
@@ -488,6 +493,13 @@
                 '';
               };
               description = "Custom prompt text keyed by review lane name. Keys are normalized like reviewLanes before matching.";
+            };
+
+            reviewLaneConditions = lib.mkOption {
+              type = lib.types.attrsOf lib.types.str;
+              default = { };
+              description = "Optional Jev applicability conditions keyed by configured review lane name. Only confident irrelevant decisions skip a lane. Missing credentials, failures, or uncertainty run the lane. Persona and summary lanes cannot be conditional.";
+              example.wallet-ffi = "Run when the change affects public wallet APIs or wallet FFI bindings.";
             };
 
             maxReviewLanes = lib.mkOption {
@@ -865,6 +877,7 @@
                       model = cfg.model;
                       review_lanes = cfg.reviewLanes;
                       review_lane_prompts = cfg.reviewLanePrompts;
+                      review_lane_conditions = cfg.reviewLaneConditions;
                       max_review_lanes = cfg.maxReviewLanes;
                       db_path = "${cfg.dataDir}/fiach.redb";
                       out_dir = "${cfg.dataDir}/reports";
