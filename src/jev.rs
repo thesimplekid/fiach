@@ -9,7 +9,8 @@ use serde_json::Value;
 // Pin behavior and pricing together: https://docs.typesafe.ai/models (2026-09-18).
 pub(crate) const MODEL: &str = "jev-1.13.0";
 pub(crate) const INPUT_PRICE_PER_MILLION: f64 = 0.042;
-pub(crate) const MAX_REQUEST_BYTES: usize = 24 * 1024;
+// Byte bound, not a tokenizer: the API enforces its separate token limits.
+pub(crate) const MAX_REQUEST_BYTES: usize = 96 * 1024;
 
 #[derive(Default)]
 pub(crate) struct UsageStats {
@@ -67,7 +68,7 @@ pub(crate) async fn evaluate(
 ) -> Result<SystemOneResponse> {
     let bytes = request.encoded_len()?;
     if bytes > MAX_REQUEST_BYTES {
-        bail!("Jev context exceeds request limit");
+        bail!("Jev request is {bytes} bytes; limit is {MAX_REQUEST_BYTES} bytes");
     }
     let estimated_cost = (bytes + 1024) as f64 * INPUT_PRICE_PER_MILLION / 1_000_000.0;
     if budget.is_some_and(|max| usage.cost_usd + estimated_cost > max) {
