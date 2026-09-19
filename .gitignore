@@ -3,3 +3,6 @@
 reports/
 fiach.redb
 fiach.toml
+
+issues.redb
+issues.artifacts/

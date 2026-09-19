@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct FiachConfig {
+    pub issues: Option<crate::issues::config::IssueConfig>,
     pub daemon: Option<DaemonConfig>,
     pub review: Option<ReviewConfig>,
     #[serde(default)]

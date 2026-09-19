@@ -6,6 +6,7 @@ pub mod disclose;
 pub mod execution;
 pub mod finalizer;
 pub mod github;
+pub mod issues;
 mod jev;
 mod lane_selection;
 pub mod persona;

@@ -8,6 +8,12 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 
 ---
 
+## Issue automation
+
+Fiach also supports project-area labeling, duplicate checks across issues and open PRs,
+and independently verified draft bug-fix PRs. See [the issue workflow guide](ISSUES.md)
+and [example configuration](example.issues.toml). Nothing is merged or closed.
+
 ## 🚀 Features
 
 - **Custom Personas:** Define exactly what the agent should look for using a Markdown file. Use different personas for security audits, general PR code review, code quality checks, or architecture reviews.

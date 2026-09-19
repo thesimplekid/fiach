@@ -1,0 +1,66 @@
+# Run: fiach --config example.issues.toml issues
+# Watch: fiach --config example.issues.toml issues --watch
+# The daemon also runs this workflow when [issues] is present in its config.
+[issues]
+publish = false # Set true to apply labels/comments and publish verified draft PRs.
+auto_fix = true
+interval_secs = 300
+state_path = "issues.redb"
+scratch_dir = "/data/rust/tmp"
+max_items = 1000 # Changed issues per pass; complete duplicate evidence is still collected.
+max_jev_cost_usd = 0.25 # Per issue classification pass, including duplicate comparisons.
+
+[[issues.repos]]
+repo = "owner/repo"
+
+# Paths are enforced for fixes; every changed file needs an allowed area.
+# Disabled areas win overlaps. Use repository-relative Git glob syntax.
+[[issues.repos.areas]]
+label = "area:db"
+description = "Database persistence, queries, and schema migrations"
+paths = ["crates/storage/**", "migrations/**"]
+auto_fix = false
+
+[[issues.repos.areas]]
+label = "area:funding-source"
+description = "Funding integrations, payment flows, and settlement"
+paths = ["crates/funding/**"]
+auto_fix = false
+
+[[issues.repos.areas]]
+label = "area:core"
+description = "Core business logic and domain rules"
+paths = ["crates/core/**"]
+auto_fix = true
+
+[[issues.repos.areas]]
+label = "area:testing"
+description = "Testing infrastructure and test coverage; not every fix that adds a regression test"
+paths = ["tests/**", "test-support/**"]
+auto_fix = true
+
+# Optional names for managed labels. Other project labels are preserved.
+[issues.repos.labels]
+bug = "bug"
+feature = "enhancement"
+documentation = "documentation"
+question = "question"
+duplicate = "duplicate"
+addressed = "already-being-addressed"
+needs_info = "needs-info"
+needs_decision = "needs-decision"
+ready = "ready-for-agent"
+
+# Enable fix workers by supplying a rootfs containing this version of fiach,
+# /bin/git, /bin/ip, CA certificates and your project's build/test tools.
+# Requires Linux/systemd-nspawn privileges. NixOS populates this automatically
+# when services.fiach.sandbox.enable = true and issues.auto_fix = true.
+# [issues.worker]
+# rootfs = "/absolute/path/to/fiach-sandbox-rootfs"
+# provider = "openrouter"
+# model = "your-coding-model"
+# verifier_provider = "openrouter"
+# verifier_model = "your-verifier-model"
+# network = "veth" # Uses Fiach's existing subnet/NAT setup; "host" is explicit opt-in.
+# max_turns = 60
+# timeout_secs = 1800

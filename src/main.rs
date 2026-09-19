@@ -126,6 +126,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Triage issues and optionally publish labels and verified draft fixes
+    Issues {
+        /// Poll continuously instead of processing once
+        #[arg(long)]
+        watch: bool,
+        /// Process one issue (requires exactly one configured repository)
+        #[arg(long)]
+        issue: Option<u64>,
+    },
+    /// Internal isolated issue worker
+    #[command(hide = true)]
+    IssueWorker {
+        #[arg(long)]
+        input: PathBuf,
+    },
     /// Run a review for a single PR
     Review {
         /// GitHub repository to review (e.g., "org/repo")
@@ -458,13 +473,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load config
-    let config = match FiachConfig::load(cli.config.as_deref()) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::warn!("Failed to load config file: {}", e);
-            FiachConfig::default()
-        }
-    };
+    let config = FiachConfig::load(cli.config.as_deref())?;
 
     let cancel_token = CancellationToken::new();
     let cloned_token = cancel_token.clone();
@@ -479,6 +488,14 @@ async fn main() -> Result<()> {
     });
 
     match cli.command {
+        Commands::Issues { watch, issue } => {
+            let config = FiachConfig::load(cli.config.as_deref())?;
+            let issues = config
+                .issues
+                .ok_or_else(|| anyhow::anyhow!("Missing [issues] configuration"))?;
+            fiach::issues::run(issues, watch, issue, cancel_token).await
+        }
+        Commands::IssueWorker { input } => fiach::issues::run_child(input, cancel_token).await,
         Commands::Review {
             repo,
             pr,
@@ -895,7 +912,22 @@ async fn main() -> Result<()> {
                 }
             });
 
-            daemon::run_daemon(params, scheduler, cancel_token).await
+            if let Some(issues) = config.issues {
+                issues.validate()?;
+                let issue_cancel = cancel_token.clone();
+                tokio::select! {
+                    result = daemon::run_daemon(params, scheduler, cancel_token.clone()) => {
+                        cancel_token.cancel();
+                        result
+                    }
+                    result = fiach::issues::run(issues, true, None, issue_cancel) => {
+                        cancel_token.cancel();
+                        result
+                    }
+                }
+            } else {
+                daemon::run_daemon(params, scheduler, cancel_token).await
+            }
         }
         Commands::History {
             db_path,

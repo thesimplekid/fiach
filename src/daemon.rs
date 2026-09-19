@@ -391,12 +391,12 @@ fn validate_veth_worker_capacity(max_workers: usize) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct SandboxVethReservation {
+pub(crate) struct SandboxVethReservation {
     index: u8,
 }
 
 impl SandboxVethReservation {
-    fn reserve(machine_name: &str) -> Result<Self> {
+    pub(crate) fn reserve(machine_name: &str) -> Result<Self> {
         let active_subnets = ACTIVE_VETH_SUBNETS.get_or_init(|| Mutex::new(HashSet::new()));
         let mut active_subnets = active_subnets
             .lock()
@@ -407,7 +407,7 @@ impl SandboxVethReservation {
         })
     }
 
-    fn host_gateway(&self) -> String {
+    pub(crate) fn host_gateway(&self) -> String {
         format!(
             "{}.{}.{}.1",
             VETH_SUBNET_BASE_OCTETS.0, VETH_SUBNET_BASE_OCTETS.1, self.index
@@ -418,7 +418,7 @@ impl SandboxVethReservation {
         format!("{}/30", self.host_gateway())
     }
 
-    fn guest_cidr(&self) -> String {
+    pub(crate) fn guest_cidr(&self) -> String {
         format!(
             "{}.{}.{}.2/30",
             VETH_SUBNET_BASE_OCTETS.0, VETH_SUBNET_BASE_OCTETS.1, self.index
@@ -1490,7 +1490,7 @@ async fn run_ip_command(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-async fn configure_sandbox_veth_host(
+pub(crate) async fn configure_sandbox_veth_host(
     machine_name: &str,
     network: &SandboxVethReservation,
 ) -> Result<()> {

@@ -65,6 +65,7 @@
               typos
 
               cargo-nextest
+              python3
 
               # Needed for building native dependencies
               openssl
@@ -101,7 +102,7 @@
             };
 
             nativeBuildInputs = with pkgs; [ pkg-config protobuf ];
-            nativeCheckInputs = with pkgs; [ git ];
+            nativeCheckInputs = with pkgs; [ git python3 ];
             buildInputs = with pkgs; [ openssl sqlite zlib ] ++ libsDarwin;
           };
 
@@ -151,6 +152,13 @@
                           allowedPubkeys = [ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ];
                         };
                       };
+                      issues = {
+                        publish = false;
+                        repos = [{
+                          repo = "owner/repo";
+                          areas = [{ label = "area:db"; description = "Persistence"; auto_fix = false; }];
+                        }];
+                      };
                       sandbox = {
                         enable = true;
                         networkMode = "veth";
@@ -186,6 +194,10 @@
               grep -F 'port = 4321' "$config_path" >/dev/null
               grep -F 'max_workers = 2' "$config_path" >/dev/null
               grep -F 'sandbox_network = "veth"' "$config_path" >/dev/null
+              grep -F '[issues]' "$config_path" >/dev/null
+              grep -F '[issues.worker]' "$config_path" >/dev/null
+              grep -F 'label = "area:db"' "$config_path" >/dev/null
+              grep -F 'scratch_dir = "/data/rust/tmp/fiach-issues"' "$config_path" >/dev/null
               grep -F '[daemon.buzz]' "$config_path" >/dev/null
               grep -F 'relay_url = "https://buzz.example.com"' "$config_path" >/dev/null
               grep -F 'public_channel = "00000000-0000-0000-0000-000000000001"' "$config_path" >/dev/null
@@ -283,6 +295,12 @@
             repos = lib.mkOption {
               type = lib.types.listOf lib.types.str;
               description = "List of repositories to monitor (e.g., ['org/repo'])";
+            };
+
+            issues = lib.mkOption {
+              type = lib.types.nullOr (pkgs.formats.toml { }).type;
+              default = null;
+              description = "Optional issue workflow configuration, using the same keys as [issues] in fiach.toml. Runs alongside PR reviews. Publishing is opt-in.";
             };
 
             interval = lib.mkOption {
@@ -649,6 +667,11 @@
                   useful for offline use cases.
                 '';
               };
+              extraPackages = lib.mkOption {
+                type = lib.types.listOf lib.types.package;
+                default = [ ];
+                description = "Build and test tools available in review and issue worker sandboxes.";
+              };
               extraArgs = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
@@ -686,6 +709,14 @@
               };
               users.groups.fiach = lib.mkIf (!cfg.sandbox.enable) { };
               assertions = [
+                {
+                  assertion = cfg.issues == null || !(cfg.issues ? worker) || cfg.sandbox.enable;
+                  message = "services.fiach.issues.worker requires services.fiach.sandbox.enable for container privileges.";
+                }
+                {
+                  assertion = cfg.issues == null || !cfg.sandbox.enable || builtins.elem cfg.sandbox.networkMode [ "veth" "host" ];
+                  message = "Issue workers require sandbox.networkMode veth or host.";
+                }
                 {
                   assertion = !(cfg.sandbox.enable && cfg.sandbox.networkMode == "veth" && (cfg.maxWorkers == 0 || cfg.maxWorkers > 254));
                   message = "services.fiach.sandbox.networkMode = \"veth\" requires maxWorkers between 1 and 254 so each concurrent sandbox can receive a unique /30 subnet.";
@@ -825,7 +856,7 @@
                       sandboxEntrypoint
                       sandboxSkills
                       sandboxOsRelease
-                    ];
+                    ] ++ cfg.sandbox.extraPackages;
                     pathsToLink = [ "/bin" "/etc" "/share" "/usr" ];
                   };
 
@@ -860,64 +891,78 @@
                       };
                     };
                   };
-                  configFile = tomlFormat.generate "fiach.toml" {
-                    daemon = {
-                      repos = cfg.repos;
-                      port = cfg.port;
-                      interval = cfg.interval;
-                      updated_within_days = cfg.updatedWithinDays;
-                      filter_by_updated = cfg.filterByUpdated;
-                      pr_state = cfg.prStates;
-                      pr_limit = cfg.prLimit;
-                      skip_prs = cfg.skipPrs;
-                      allowed_author_associations = cfg.allowedAuthorAssociations;
-                      max_workers = cfg.maxWorkers;
-                      drafts = cfg.drafts;
-                      provider = cfg.provider;
-                      model = cfg.model;
-                      review_lanes = cfg.reviewLanes;
-                      review_lane_prompts = cfg.reviewLanePrompts;
-                      review_lane_conditions = cfg.reviewLaneConditions;
-                      max_review_lanes = cfg.maxReviewLanes;
-                      db_path = "${cfg.dataDir}/fiach.redb";
-                      out_dir = "${cfg.dataDir}/reports";
-                      report_mode = cfg.reportMode;
-                      verify_findings = cfg.verifyFindings;
-                      dedupe_existing_comments = cfg.dedupeExistingComments;
-                      max_turns = cfg.maxTurns;
-                      timeout_mins = cfg.timeoutMins;
-                      max_retries = cfg.maxRetries;
-                      retry_delay_secs = cfg.retryDelaySecs;
-                    } // personaConfig // buzzConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
-                      verifier_provider = cfg.verifierProvider;
-                    } // lib.optionalAttrs (cfg.verifierModel != null) {
-                      verifier_model = cfg.verifierModel;
-                    } // lib.optionalAttrs (cfg.withSkill != null) {
-                      with_skill = cfg.withSkill;
-                    } // lib.optionalAttrs (cfg.triggerMention != null) {
-                      trigger_mention = cfg.triggerMention;
-                    } // lib.optionalAttrs (cfg.allowedMentionUsers != [ ]) {
-                      allowed_mention_users = cfg.allowedMentionUsers;
-                    } // lib.optionalAttrs (cfg.syncRepo != null) {
-                      sync_repo = cfg.syncRepo;
-                    } // lib.optionalAttrs (cfg.maxCostUsd != null) {
-                      max_cost_usd = cfg.maxCostUsd;
-                    } // lib.optionalAttrs (cfg.inputPricePerM != null) {
-                      input_price_per_m = cfg.inputPricePerM;
-                    } // lib.optionalAttrs (cfg.outputPricePerM != null) {
-                      output_price_per_m = cfg.outputPricePerM;
-                    } // lib.optionalAttrs cfg.notifyOnEmpty {
-                      notify_on_empty = cfg.notifyOnEmpty;
-                    } // {
-                      review_start_reaction = cfg.reviewStartReaction;
-                      no_findings_reaction = cfg.noFindingsReaction;
-                    } // lib.optionalAttrs cfg.sandbox.enable {
-                      sandbox_rootfs = "${sandboxRootfs}";
-                      sandbox_network = cfg.sandbox.networkMode;
-                      sandbox_extra_args = cfg.sandbox.extraArgs;
-                    };
-                    context_groups = cfg.contextGroups;
-                  };
+                  configFile = tomlFormat.generate "fiach.toml" (
+                    {
+                      daemon = {
+                        repos = cfg.repos;
+                        port = cfg.port;
+                        interval = cfg.interval;
+                        updated_within_days = cfg.updatedWithinDays;
+                        filter_by_updated = cfg.filterByUpdated;
+                        pr_state = cfg.prStates;
+                        pr_limit = cfg.prLimit;
+                        skip_prs = cfg.skipPrs;
+                        allowed_author_associations = cfg.allowedAuthorAssociations;
+                        max_workers = cfg.maxWorkers;
+                        drafts = cfg.drafts;
+                        provider = cfg.provider;
+                        model = cfg.model;
+                        review_lanes = cfg.reviewLanes;
+                        review_lane_prompts = cfg.reviewLanePrompts;
+                        review_lane_conditions = cfg.reviewLaneConditions;
+                        max_review_lanes = cfg.maxReviewLanes;
+                        db_path = "${cfg.dataDir}/fiach.redb";
+                        out_dir = "${cfg.dataDir}/reports";
+                        report_mode = cfg.reportMode;
+                        verify_findings = cfg.verifyFindings;
+                        dedupe_existing_comments = cfg.dedupeExistingComments;
+                        max_turns = cfg.maxTurns;
+                        timeout_mins = cfg.timeoutMins;
+                        max_retries = cfg.maxRetries;
+                        retry_delay_secs = cfg.retryDelaySecs;
+                      } // personaConfig // buzzConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
+                        verifier_provider = cfg.verifierProvider;
+                      } // lib.optionalAttrs (cfg.verifierModel != null) {
+                        verifier_model = cfg.verifierModel;
+                      } // lib.optionalAttrs (cfg.withSkill != null) {
+                        with_skill = cfg.withSkill;
+                      } // lib.optionalAttrs (cfg.triggerMention != null) {
+                        trigger_mention = cfg.triggerMention;
+                      } // lib.optionalAttrs (cfg.allowedMentionUsers != [ ]) {
+                        allowed_mention_users = cfg.allowedMentionUsers;
+                      } // lib.optionalAttrs (cfg.syncRepo != null) {
+                        sync_repo = cfg.syncRepo;
+                      } // lib.optionalAttrs (cfg.maxCostUsd != null) {
+                        max_cost_usd = cfg.maxCostUsd;
+                      } // lib.optionalAttrs (cfg.inputPricePerM != null) {
+                        input_price_per_m = cfg.inputPricePerM;
+                      } // lib.optionalAttrs (cfg.outputPricePerM != null) {
+                        output_price_per_m = cfg.outputPricePerM;
+                      } // lib.optionalAttrs cfg.notifyOnEmpty {
+                        notify_on_empty = cfg.notifyOnEmpty;
+                      } // {
+                        review_start_reaction = cfg.reviewStartReaction;
+                        no_findings_reaction = cfg.noFindingsReaction;
+                      } // lib.optionalAttrs cfg.sandbox.enable {
+                        sandbox_rootfs = "${sandboxRootfs}";
+                        sandbox_network = cfg.sandbox.networkMode;
+                        sandbox_extra_args = cfg.sandbox.extraArgs;
+                      };
+                      context_groups = cfg.contextGroups;
+                    } // lib.optionalAttrs (cfg.issues != null) {
+                      issues = {
+                        state_path = "${cfg.dataDir}/issues.redb";
+                        scratch_dir = "/data/rust/tmp/fiach-issues";
+                      } // cfg.issues // lib.optionalAttrs (cfg.sandbox.enable && (cfg.issues.auto_fix or true)) {
+                        worker = {
+                          rootfs = "${sandboxRootfs}";
+                          provider = cfg.provider;
+                          model = cfg.model;
+                          network = if cfg.sandbox.networkMode == "host" then "host" else "veth";
+                        } // (cfg.issues.worker or { });
+                      };
+                    }
+                  );
                 in
                 {
                   description = "Fiach Daemon";
