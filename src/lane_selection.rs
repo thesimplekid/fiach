@@ -234,7 +234,7 @@ async fn select_with_client(
     conditions: &BTreeMap<String, String>,
     budget: Option<f64>,
     cancel: &CancellationToken,
-    client: Option<&jev_sdk::TypeSafeClient>,
+    client: Option<&jev::Client>,
 ) -> Result<Selection> {
     let mut selection = Selection::new(lanes, conditions);
     if conditions.is_empty() {
@@ -452,7 +452,7 @@ mod tests {
     }
 
     struct Mock {
-        client: jev_sdk::TypeSafeClient,
+        client: jev::Client,
         calls: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<Value>>>,
         task: JoinHandle<()>,

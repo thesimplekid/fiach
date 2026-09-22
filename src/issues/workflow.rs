@@ -138,7 +138,9 @@ pub async fn run(
         tracing::info!("Starting issue polling cycle");
         let mut failures = 0;
         for project in &config.repos {
-            if !github::rate_limit_wait().is_zero() {
+            if !github::rate_limit_wait().is_zero()
+                || !crate::jev::cooldown_wait(&config.jev_base_url).is_zero()
+            {
                 failures = failures.max(1);
                 break;
             }
@@ -170,7 +172,9 @@ pub async fn run(
             let mut processed = 0;
             let mut cached_or_closed = 0;
             for item in targets {
-                if !github::rate_limit_wait().is_zero() {
+                if !github::rate_limit_wait().is_zero()
+                    || !crate::jev::cooldown_wait(&config.jev_base_url).is_zero()
+                {
                     failures = failures.max(1);
                     break;
                 }
@@ -216,7 +220,8 @@ pub async fn run(
             ensure!(failures == 0, "{failures} issue workflow operations failed");
             return Ok(());
         }
-        let cooldown = github::rate_limit_wait();
+        let jev_cooldown = crate::jev::cooldown_wait(&config.jev_base_url);
+        let cooldown = github::rate_limit_wait().max(jev_cooldown);
         let wait = if cooldown.is_zero() {
             Duration::from_secs(config.interval_secs)
         } else {
@@ -224,7 +229,8 @@ pub async fn run(
         };
         tracing::info!(
             interval_secs = wait.as_secs(),
-            rate_limited = !cooldown.is_zero(),
+            rate_limited = !github::rate_limit_wait().is_zero(),
+            jev_cooldown_secs = jev_cooldown.as_secs(),
             "Waiting for next issue poll"
         );
         tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(wait) => {} }

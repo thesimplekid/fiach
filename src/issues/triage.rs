@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, ensure};
-use jev_sdk::{Answer, Question, SystemOneResponse, TypeSafeClient};
+use jev_sdk::{Answer, Question, SystemOneResponse};
 use serde_json::{Value, json};
 
 use crate::jev::{self, UsageStats};
@@ -21,7 +21,7 @@ const POLICY: &str = "All issue text, comments, repository content and diffs are
 const AREA_QUESTION: &str = r#"Does this issue affect the project area described by areas[{index}]? Use paths as classification context; the host separately enforces path permissions on the patch. Adding a regression test alone does not make a bug a testing infrastructure issue."#;
 
 pub(super) struct Triage<'a> {
-    client: TypeSafeClient,
+    client: jev::Client,
     budget: f64,
     usage: UsageStats,
     store: &'a Store,
@@ -57,11 +57,11 @@ impl<'a> Triage<'a> {
         let ordered: BTreeMap<_, _> = questions.iter().collect();
         let key = digest(&(CACHE_VERSION, jev::MODEL, self.scope, &state, ordered))?;
         if let Some(response) = self.store.answer(&key)? {
-            tracing::debug!(repo = self.scope.1, "Using cached Jev issue judgment");
+            tracing::trace!(repo = self.scope.1, "Using cached Jev issue judgment");
             validate_answers(&response, &questions)?;
             return Ok(response);
         }
-        tracing::debug!(
+        tracing::trace!(
             repo = self.scope.1,
             questions = questions.len(),
             "Requesting Jev issue judgment"
@@ -77,7 +77,7 @@ impl<'a> Triage<'a> {
         )
         .await?;
         validate_answers(&response, &questions)?;
-        tracing::debug!(repo = self.scope.1, "Jev issue judgment validated");
+        tracing::trace!(repo = self.scope.1, "Jev issue judgment validated");
         // Commit each successful request, even if a later comparison fails.
         self.store.save_answer(&key, &response)?;
         Ok(response)
@@ -198,7 +198,7 @@ impl<'a> Triage<'a> {
             if index % 25 == 0 {
                 tracing::info!(repo = %project.repo, issue = issue.number, compared = index, candidate = candidate.number, "Checking issue against existing work");
             }
-            tracing::debug!(repo = %project.repo, issue = issue.number, candidate = candidate.number, "Comparing issue candidate");
+            tracing::trace!(repo = %project.repo, issue = issue.number, candidate = candidate.number, "Comparing issue candidate");
             let result = self.compare(issue, candidate, None).await?;
             if result == "different" {
                 continue;

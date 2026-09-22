@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use jev_sdk::{Question, SystemOneResponse, TypeSafeClient};
+use jev_sdk::{Question, SystemOneResponse};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -182,7 +182,7 @@ pub(crate) async fn evaluate(
 }
 
 async fn evaluate_with_client(
-    client: &TypeSafeClient,
+    client: &jev::Client,
     findings: &[AcceptedFinding],
     comments: &[ExistingPrComment],
     max_cost_usd: Option<f64>,
