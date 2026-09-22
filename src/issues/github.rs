@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -9,13 +9,14 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 
-use crate::process::output_limited;
+use crate::process::{LimitedOutput, output_limited};
 
 use super::{Item, config::Project};
 
 pub(super) const MARKER: &str = "<!-- fiach-issue-triage -->";
 const LIMIT: usize = 8 * 1024 * 1024;
-pub(super) const PR_DIFF_LIMIT: usize = 80 * 1024;
+// Bound capture/cache memory independently of Jev's token-based context limit.
+pub(super) const PR_DIFF_LIMIT: usize = 512 * 1024;
 
 // Shared by issue API calls, including publication rechecks and worker helpers.
 static RATE_LIMIT_UNTIL: AtomicU64 = AtomicU64::new(0);
@@ -28,10 +29,44 @@ struct CachedDiff {
     diff: Option<String>,
 }
 
+/// Small bounded LRU; touching one PR must not evict the other cached diffs.
+#[derive(Default)]
+struct DiffCache {
+    entries: VecDeque<((String, u64), CachedDiff)>,
+}
+
+impl DiffCache {
+    fn get(&mut self, key: &(String, u64), head: &str, base: &str) -> Option<Option<String>> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(cached_key, _)| cached_key == key)?;
+        let entry = self.entries.remove(index)?;
+        if entry.1.head != head || entry.1.base != base {
+            return None;
+        }
+        let diff = entry.1.diff.clone();
+        self.entries.push_back(entry);
+        Some(diff)
+    }
+
+    fn insert(&mut self, key: (String, u64), diff: CachedDiff) {
+        self.entries.retain(|(cached_key, _)| cached_key != &key);
+        if self.entries.len() >= 128 {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, diff));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 pub(super) struct Github {
     pub login: String,
     candidates: Mutex<HashMap<(String, u64), Item>>,
-    diffs: Mutex<HashMap<(String, u64), CachedDiff>>,
+    diffs: Mutex<DiffCache>,
 }
 
 impl Github {
@@ -40,7 +75,7 @@ impl Github {
         Ok(Self {
             login: string(&user, "login")?,
             candidates: Mutex::new(HashMap::new()),
-            diffs: Mutex::new(HashMap::new()),
+            diffs: Mutex::new(DiffCache::default()),
         })
     }
 
@@ -149,18 +184,15 @@ impl Github {
         .await
     }
 
-    /// None means the diff exceeded the capture limit; no partial evidence is returned.
+    /// None means the diff exceeded the local or GitHub limit; no partial evidence is returned.
     pub async fn pr_diff(&self, repo: &str, number: u64) -> Result<Option<String>> {
         let before = api(&format!("repos/{repo}/pulls/{number}"), "GET", None).await?;
         ensure!(before["state"] == "open", "Candidate PR is no longer open");
         let key = (repo.to_owned(), number);
         let head = string(&before["head"], "sha")?;
         let base = string(&before["base"], "sha")?;
-        if let Some(cached) = self.diffs.lock().await.get(&key).cloned()
-            && cached.head == head
-            && cached.base == base
-        {
-            return Ok(cached.diff);
+        if let Some(diff) = self.diffs.lock().await.get(&key, &head, &base) {
+            return Ok(diff);
         }
         check_rate_limit()?;
         let output = output_limited(
@@ -179,28 +211,7 @@ impl Github {
         )
         .await
         .with_context(|| format!("Fetching diff for {repo}#{number}"))?;
-        let diff = if output.stdout_truncated {
-            tracing::warn!(
-                repo,
-                candidate_pr = number,
-                limit_bytes = PR_DIFF_LIMIT,
-                "Candidate PR diff exceeds limit; coverage unresolved"
-            );
-            None
-        } else {
-            if !output.status.success() {
-                observe_rate_limit(
-                    &RateHeaders::default(),
-                    &String::from_utf8_lossy(&output.stderr),
-                );
-            }
-            ensure!(
-                output.status.success(),
-                "Fetching diff for {repo}#{number} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            Some(String::from_utf8(output.stdout)?)
-        };
+        let diff = candidate_diff(repo, number, output)?;
         let after = api(&format!("repos/{repo}/pulls/{number}"), "GET", None).await?;
         ensure!(
             after["head"]["sha"] == head
@@ -209,9 +220,6 @@ impl Github {
             "Candidate PR changed during collection"
         );
         let mut cache = self.diffs.lock().await;
-        if cache.len() >= 128 {
-            cache.clear();
-        }
         cache.insert(
             key,
             CachedDiff {
@@ -612,9 +620,173 @@ pub(super) async fn git(path: &Path, args: &[&str]) -> Result<String> {
     .await
 }
 
+/// Interpret only explicit size rejections as missing evidence. Other command
+/// failures must still abort collection rather than being cached as oversized PRs.
+fn candidate_diff(repo: &str, number: u64, output: LimitedOutput) -> Result<Option<String>> {
+    if output.stdout_truncated {
+        tracing::warn!(
+            repo,
+            candidate_pr = number,
+            limit_bytes = PR_DIFF_LIMIT,
+            "Candidate PR diff exceeds limit; coverage unresolved"
+        );
+        return Ok(None);
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("HTTP 406:")
+            && (stderr.contains("the diff exceeded the maximum number of lines")
+                || stderr
+                    .lines()
+                    .any(|line| line.trim() == "PullRequest.diff too_large"))
+        {
+            tracing::warn!(
+                repo,
+                candidate_pr = number,
+                "Candidate PR diff exceeds GitHub's limit; coverage unresolved"
+            );
+            return Ok(None);
+        }
+        observe_rate_limit(&RateHeaders::default(), &stderr);
+        anyhow::bail!("Fetching diff for {repo}#{number} failed: {stderr}");
+    }
+    Ok(Some(String::from_utf8(output.stdout)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diff_cache_evicts_only_the_least_recently_used_entry() {
+        let mut cache = DiffCache::default();
+        let key = |number| ("owner/repo".to_owned(), number);
+        let diff = |text: Option<&str>| CachedDiff {
+            head: "head".into(),
+            base: "base".into(),
+            diff: text.map(str::to_owned),
+        };
+        for number in 0..128 {
+            cache.insert(key(number), diff(Some("complete diff")));
+        }
+        assert!(cache.get(&key(0), "head", "base").is_some());
+        cache.insert(key(128), diff(None));
+        assert!(cache.get(&key(1), "head", "base").is_none());
+        for number in (2..128).chain([0]) {
+            assert_eq!(
+                cache.get(&key(number), "head", "base"),
+                Some(Some("complete diff".into()))
+            );
+        }
+        assert_eq!(cache.get(&key(128), "head", "base"), Some(None));
+        // Updating an existing entry must neither duplicate it nor evict a peer.
+        cache.insert(key(128), diff(Some("replacement")));
+        assert_eq!(cache.entries.len(), 128);
+        assert!(cache.get(&key(2), "head", "base").is_some());
+        assert_eq!(
+            cache.get(&key(128), "head", "base"),
+            Some(Some("replacement".into()))
+        );
+        cache.clear();
+        assert!(cache.get(&key(128), "head", "base").is_none());
+    }
+
+    #[test]
+    fn diff_cache_invalidates_either_revision_and_separates_repositories() {
+        let mut cache = DiffCache::default();
+        let key = ("owner/repo".to_owned(), 1);
+        for (head, base) in [("new-head", "base"), ("head", "new-base")] {
+            cache.insert(
+                key.clone(),
+                CachedDiff {
+                    head: "head".into(),
+                    base: "base".into(),
+                    diff: None,
+                },
+            );
+            assert!(
+                cache
+                    .get(&("other/repo".to_owned(), 1), "head", "base")
+                    .is_none()
+            );
+            assert!(cache.get(&key, head, base).is_none());
+            assert!(cache.get(&key, "head", "base").is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    mod diffs {
+        use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+
+        use super::*;
+
+        fn output(success: bool, stdout: &[u8], stderr: &str, truncated: bool) -> LimitedOutput {
+            LimitedOutput {
+                status: ExitStatus::from_raw(if success { 0 } else { 256 }),
+                stdout: stdout.to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+                stdout_truncated: truncated,
+            }
+        }
+
+        #[test]
+        fn github_size_rejection_is_unresolved_evidence() {
+            let stderr = "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) (https://api.github.com/repos/cashubtc/cdk/pulls/2479)\nPullRequest.diff too_large";
+            for message in [
+                stderr,
+                "HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)",
+                "HTTP 406: Not Acceptable\nPullRequest.diff too_large",
+            ] {
+                assert_eq!(
+                    candidate_diff(
+                        "cashubtc/cdk",
+                        2479,
+                        output(false, b"partial", message, false)
+                    )
+                    .unwrap(),
+                    None
+                );
+            }
+        }
+
+        #[test]
+        fn unrelated_failures_remain_errors() {
+            for stderr in [
+                "HTTP 406: Not Acceptable",
+                "HTTP 401: Bad credentials",
+                "HTTP 403: Resource not accessible by integration",
+                "HTTP 502: Bad Gateway",
+                "could not find pull request",
+                "connection reset by peer",
+                "PullRequest.diff too_large",
+            ] {
+                let error =
+                    candidate_diff("owner/repo", 1, output(false, b"", stderr, false)).unwrap_err();
+                assert!(error.to_string().contains(stderr));
+                assert!(error.to_string().contains("owner/repo#1"));
+            }
+        }
+
+        #[test]
+        fn local_truncation_discards_partial_diff_even_when_process_was_killed() {
+            for success in [true, false] {
+                assert_eq!(
+                    candidate_diff("owner/repo", 1, output(success, b"partial", "", true)).unwrap(),
+                    None
+                );
+            }
+        }
+
+        #[test]
+        fn complete_diff_is_preserved_and_invalid_utf8_rejected() {
+            let diff = b"diff --git a/file b/file\n+HTTP 406: PullRequest.diff too_large";
+            assert_eq!(
+                candidate_diff("owner/repo", 1, output(true, diff, "", false)).unwrap(),
+                Some(String::from_utf8(diff.to_vec()).unwrap())
+            );
+            assert!(candidate_diff("owner/repo", 1, output(true, &[0xff], "", false)).is_err());
+        }
+    }
+
     #[test]
     fn rate_headers_preserve_body_and_honor_both_reset_and_retry_after() {
         let (headers, body) = split_response(b"HTTP/2.0 403 Forbidden\r\nx-ratelimit-remaining: 0\r\nX-RateLimit-Reset: 200\r\nRetry-After: 150\r\n\r\n{\"message\":\"limited\"}").unwrap();

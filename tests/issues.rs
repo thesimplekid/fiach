@@ -17,6 +17,10 @@ p = os.environ['FIXTURE']
 s = json.load(open(p))
 a = sys.argv[1:]
 with open(p + '.calls', 'a') as f: f.write(json.dumps(a) + '\n')
+if s.get('stall_at') and (s['stall_at'] == 'diff' and a[:2] == ['pr', 'diff'] or s['stall_at'] in a):
+    import time
+    with open(p + '.stalled', 'w') as f: f.write(str(os.getpid()))
+    time.sleep(60)
 if a[:2] == ['repo', 'clone']:
     import subprocess
     sys.exit(subprocess.call(['git','clone',s['remote'],a[3]]))
@@ -24,8 +28,14 @@ if a[:2] == ['pr', 'diff']:
     if s.get('fail_diff'):
         print('diff unavailable', file=sys.stderr)
         sys.exit(1)
+    if int(a[2]) in s.get('github_oversized_prs', []):
+        print('could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)\nPullRequest.diff too_large', file=sys.stderr)
+        sys.exit(1)
+    if a[2] in s.get('diffs', {}):
+        print(s['diffs'][a[2]])
+        sys.exit(0)
     if int(a[2]) in s.get('oversized_prs', []):
-        print('x' * (80 * 1024 + 1))
+        print('x' * (512 * 1024 + 1))
         sys.exit(0)
     print('diff --git a/db.rs b/db.rs\n--- a/db.rs\n+++ b/db.rs\n@@ -1 +1 @@\n-bug\n+fix')
     sys.exit(0)
@@ -161,6 +171,18 @@ async fn setup(
                 requests.push(request.clone());
                 first && request["state"]["candidate"]["body"] == "FAIL_ONCE"
             };
+            if request["state"]["candidate"]["body"] == "STALL_COMPARISON" {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+            if request["state"]["issue"]["body"] == "CLASSIFICATION_CONTEXT_LIMIT" && request["questions"]["kind"].is_object() {
+                return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"detail":{"error_type":"context_length_exceeded","message":"State plus question exceeds token limit"}})));
+            }
+            if request["state"]["issue"]["body"] == "CLASSIFICATION_INVALID" {
+                return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"detail":"Missing required classification field"})));
+            }
+            if request["state"]["candidate"]["body"] == "CONTEXT_LIMIT" && request["state"]["pr_diff"].is_string() {
+                return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"detail":{"error_type":"context_length_exceeded","message":"State plus question exceeds token limit"}})));
+            }
             let questions = request["questions"].as_object().unwrap();
             let mut answers = serde_json::Map::new();
             for (id, q) in questions {
@@ -178,7 +200,7 @@ async fn setup(
             }
             if fail_once { answers["match"]["probabilities"] = json!({}); }
             let input_tokens = if request["state"]["issue"]["body"] == "LARGE_USAGE" { 10000 } else { 100 };
-            Json(json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":input_tokens,"output_tokens":10}}))
+            (axum::http::StatusCode::OK, Json(json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":input_tokens,"output_tokens":10}})))
         }
     }));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -707,6 +729,106 @@ auto_fix = false
 }
 
 #[tokio::test]
+async fn active_inventory_and_triage_cancel_promptly_without_publication_or_retry() {
+    use std::{process::Stdio, time::Duration};
+
+    for stage in [
+        "user",
+        "repos/owner/repo/issues?state=all&sort=created&direction=asc&per_page=100&page=1",
+        "diff",
+        "comparison",
+    ] {
+        let (dir, server, requests) = setup("bug", "same", true, true).await;
+        let mut state = fixture(dir.path());
+        if stage == "comparison" {
+            state["items"][1]["body"] = json!("STALL_COMPARISON");
+        } else {
+            state["stall_at"] = json!(stage);
+        }
+        save_fixture(dir.path(), &state);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fiach"))
+            .args([
+                "--config",
+                dir.path().join("fiach.toml").to_str().unwrap(),
+                "issues",
+                "--issue",
+                "1",
+            ])
+            .env("FIXTURE", dir.path().join("fixture.json"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("TYPESAFE_API_KEY", "test-only")
+            .env("RUST_LOG", "error")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let stalled = if stage == "comparison" {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r["state"]["candidate"]["body"] == "STALL_COMPARISON")
+                } else {
+                    dir.path().join("fixture.json.stalled").exists()
+                };
+                if stalled {
+                    break;
+                }
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "Workflow exited before {stage}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            Command::new("kill")
+                .args(["-INT", &child.id().unwrap().to_string()])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .expect("Cancellation must interrupt active evidence work")
+                .unwrap()
+                .success()
+        );
+        let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+        assert!(!calls.contains("POST") && !calls.contains("PATCH") && !calls.contains("DELETE"));
+        assert!(!dir.path().join("fixture.json.phases").exists());
+        // Cancellation is not a failed classification and must not set retry backoff.
+        let mut state = fixture(dir.path());
+        state["stall_at"] = Value::Null;
+        state["items"][1]["body"] = item(2, true)["body"].clone();
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        assert!(
+            fixture(dir.path())["items"][0]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["name"] == "already-being-addressed")
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn rate_limit_wait_does_not_repoll_and_can_be_cancelled() {
     use std::{process::Stdio, time::Duration};
 
@@ -902,12 +1024,118 @@ async fn failed_pr_diff_command_still_fails_triage_with_candidate_context() {
 }
 
 #[tokio::test]
-async fn oversized_pr_diff_preserves_uncertainty_and_continues_comparisons() {
-    for matching in ["different", "same"] {
+async fn oversized_initial_classification_is_marked_once_without_starting_worker() {
+    for provider in [false, true] {
+        let (dir, server, requests) = setup("bug", "different", true, true).await;
+        enable_worker(dir.path(), false).await;
+        let mut state = fixture(dir.path());
+        state["items"][0]["body"] = if provider {
+            json!("CLASSIFICATION_CONTEXT_LIMIT")
+        } else {
+            json!("x".repeat(1024 * 1024))
+        };
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        let state = fixture(dir.path());
+        assert!(
+            state["items"][0]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["name"] == "needs-decision")
+        );
+        let body = state["comments"]["1"][0]["body"].as_str().unwrap();
+        assert!(
+            body.contains("context limit") && body.contains("no automatic fix"),
+            "{body}"
+        );
+        assert!(!dir.path().join("fixture.json.phases").exists());
+        assert_eq!(requests.lock().unwrap().len(), usize::from(provider));
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            usize::from(provider),
+            "Unchanged oversized classifications must not be retried"
+        );
+        assert_eq!(
+            fixture(dir.path())["comments"]["1"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn unrelated_classification_validation_failure_is_not_marked_as_oversized() {
+    let (dir, server, _) = setup("bug", "different", false, true).await;
+    let mut state = fixture(dir.path());
+    state["items"][0]["body"] = json!("CLASSIFICATION_INVALID");
+    save_fixture(dir.path(), &state);
+    assert!(!run(dir.path()).await.status.success());
+    assert!(
+        fixture(dir.path())["comments"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v.as_array().unwrap().is_empty())
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn candidate_request_above_old_caps_reaches_jev_intact() {
+    let (dir, server, requests) = setup("bug", "same", true, true).await;
+    let mut state = fixture(dir.path());
+    let diff = "diff --git a/file b/file\n".to_owned() + &"+example change\n".repeat(7000);
+    assert!(diff.len() > 80 * 1024);
+    state["diffs"] = json!({"2": diff});
+    std::fs::write(
+        dir.path().join("fixture.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    assert_ok(&run(dir.path()).await);
+    let received = requests.lock().unwrap();
+    let request = received
+        .iter()
+        .find(|r| r["state"]["pr_diff"].is_string())
+        .unwrap();
+    assert!(serde_json::to_vec(request).unwrap().len() > 100200);
+    // The fixture's print adds a trailing newline; no evidence is trimmed.
+    assert_eq!(request["state"]["pr_diff"], diff + "\n");
+    let state = fixture(dir.path());
+    assert!(
+        state["items"][0]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["name"] == "already-being-addressed")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn oversized_candidate_evidence_preserves_uncertainty_and_continues_comparisons() {
+    for (matching, limit) in ["different", "same"]
+        .into_iter()
+        .flat_map(|matching| ["local", "github", "jev", "provider"].map(|limit| (matching, limit)))
+    {
         let (dir, server, requests) = setup("bug", matching, true, true).await;
         enable_worker(dir.path(), false).await;
         let mut state = fixture(dir.path());
-        state["oversized_prs"] = json!([2]);
+        match limit {
+            "local" => state["oversized_prs"] = json!([2]),
+            "github" => state["github_oversized_prs"] = json!([2]),
+            "jev" => {
+                state["diffs"] = json!({"2": "x".repeat(512 * 1024 - 1)});
+                state["items"][1]["body"] = json!("x".repeat(600 * 1024));
+            }
+            "provider" => state["items"][1]["body"] = json!("CONTEXT_LIMIT"),
+            _ => unreachable!(),
+        }
         state["items"].as_array_mut().unwrap().push(item(3, true));
         std::fs::write(
             dir.path().join("fixture.json"),
@@ -930,10 +1158,12 @@ async fn oversized_pr_diff_preserves_uncertainty_and_continues_comparisons() {
                 .any(|l| l["name"] == expected)
         );
         let body = state["comments"]["1"][0]["body"].as_str().unwrap();
-        assert!(
-            body.contains("#2") && body.contains("81920-byte") && body.contains("unresolved"),
-            "{body}"
-        );
+        if matches!(limit, "local" | "github") {
+            assert!(
+                body.contains("#2") && body.contains("524288-byte") && body.contains("unresolved"),
+                "{body}"
+            );
+        }
         let received = requests.lock().unwrap();
         assert!(
             received.iter().any(
@@ -941,11 +1171,12 @@ async fn oversized_pr_diff_preserves_uncertainty_and_continues_comparisons() {
             ),
             "Later candidates must still be checked"
         );
-        assert!(
-            !received.iter().any(
+        assert_eq!(
+            received.iter().any(
                 |r| r["state"]["candidate"]["number"] == 2 && r["state"]["pr_diff"].is_string()
             ),
-            "Partial diffs must never reach Jev"
+            limit == "provider",
+            "Only complete requests within resource limits may reach Jev"
         );
         assert!(
             !dir.path().join("fixture.json.phases").exists(),

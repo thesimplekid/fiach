@@ -120,7 +120,10 @@ pub async fn run(
     // redb's exclusive file lock also prevents concurrent issue publishers using this state file.
     let store = Store::open(&config.state_path)?;
     let github = loop {
-        match Github::new().await {
+        let Some(result) = cancel.run_until_cancelled(Github::new()).await else {
+            return Ok(());
+        };
+        match result {
             Ok(github) => break github,
             Err(error) if watch && !github::rate_limit_wait().is_zero() => {
                 tracing::warn!(error = %format!("{error:#}"), "Waiting for GitHub quota before starting issue workflow");
@@ -145,7 +148,13 @@ pub async fn run(
                 break;
             }
             tracing::info!(repo = %project.repo, "Collecting issue and PR inventory");
-            let inventory = match github.inventory(&project.repo).await {
+            let Some(result) = cancel
+                .run_until_cancelled(github.inventory(&project.repo))
+                .await
+            else {
+                return Ok(());
+            };
+            let inventory = match result {
                 Ok(items) => items,
                 Err(error) => {
                     tracing::error!(repo = %project.repo, error = %format!("{error:#}"), "Issue inventory failed");
@@ -199,6 +208,9 @@ pub async fn run(
                         true
                     }
                 };
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
                 cursors.insert(project.repo.clone(), item.number);
                 if worked {
                     processed += 1;
@@ -284,19 +296,27 @@ async fn process(
                 current_base["sha"] == pending.base_sha,
                 "Default branch changed since interrupted publication"
             );
-            let inventory = github.inventory(&project.repo).await?;
+            let Some(inventory) = cancel
+                .run_until_cancelled(github.inventory(&project.repo))
+                .await
+            else {
+                return Ok(false);
+            };
+            let inventory = inventory?;
             let mut recheck = Triage::new(
                 config.max_jev_cost_usd,
                 &config.jev_base_url,
                 store,
                 &project.repo,
             )?;
+            let Some(decision) = cancel
+                .run_until_cancelled(recheck.classify(project, &fresh, &inventory, github))
+                .await
+            else {
+                return Ok(false);
+            };
             ensure!(
-                recheck
-                    .classify(project, &fresh, &inventory, github)
-                    .await?
-                    .route
-                    == Route::Ready,
+                decision?.route == Route::Ready,
                 "Issue no longer eligible for interrupted publication"
             );
             record.pr = Some(
@@ -316,7 +336,13 @@ async fn process(
             store.put(&key, &record)?;
         }
     }
-    let issue = github.issue(&project.repo, number).await?;
+    let Some(issue) = cancel
+        .run_until_cancelled(github.issue(&project.repo, number))
+        .await
+    else {
+        return Ok(false);
+    };
+    let issue = issue?;
     if !issue.open || issue.is_pr {
         return Ok(false);
     }
@@ -348,7 +374,15 @@ async fn process(
         store,
         &project.repo,
     )?;
-    let mut decision = match triage.classify(project, &issue, inventory, github).await {
+    // Cancel only read-only evidence work. Publication and worker cleanup keep
+    // their existing journal/cleanup paths rather than being dropped mid-write.
+    let Some(result) = cancel
+        .run_until_cancelled(triage.classify(project, &issue, inventory, github))
+        .await
+    else {
+        return Ok(false);
+    };
+    let mut decision = match result {
         Ok(decision) => decision,
         Err(error) => {
             let failures = record
@@ -405,16 +439,26 @@ async fn process(
                         fresh.open && content_key(&fresh)? == content_key(&issue)?,
                         "Issue changed during fix; withholding publication"
                     );
-                    let inventory = github.inventory(&project.repo).await?;
+                    let Some(inventory) = cancel
+                        .run_until_cancelled(github.inventory(&project.repo))
+                        .await
+                    else {
+                        return Ok(false);
+                    };
+                    let inventory = inventory?;
                     let mut recheck = Triage::new(
                         config.max_jev_cost_usd,
                         &config.jev_base_url,
                         store,
                         &project.repo,
                     )?;
-                    decision = recheck
-                        .classify(project, &fresh, &inventory, github)
-                        .await?;
+                    let Some(result) = cancel
+                        .run_until_cancelled(recheck.classify(project, &fresh, &inventory, github))
+                        .await
+                    else {
+                        return Ok(false);
+                    };
+                    decision = result?;
                     if decision.route == Route::Ready {
                         decision
                             .labels

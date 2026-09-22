@@ -627,16 +627,18 @@ mod tests {
     #[tokio::test]
     async fn serialized_request_limit_runs_lanes_without_calling_api() {
         let (dir, _, reviewed) = repository().await;
-        // JSON escaping expands this complete, sub-80-KiB diff past 96 KiB.
+        // Large question text must still respect the transport resource bound.
         std::fs::write(dir.path().join("README.md"), "\"".repeat(60 * 1024)).unwrap();
         git(dir.path(), &["commit", "-am", "escape-heavy change"]).await;
         assert!(diff_output(dir.path(), &reviewed, false).await.is_ok());
         let mock = mock(StatusCode::OK, json!({})).await;
+        let conditions =
+            BTreeMap::from([("summary".to_owned(), "x".repeat(jev::MAX_REQUEST_BYTES))]);
         let selected = select_with_client(
             dir.path(),
             &reviewed,
             &lanes(),
-            &conditions(),
+            &conditions,
             None,
             &CancellationToken::new(),
             Some(&mock.client),
@@ -648,7 +650,7 @@ mod tests {
         assert!(
             selected.decisions[0]
                 .reason
-                .contains("limit is 98304 bytes")
+                .contains(&format!("limit is {} bytes", jev::MAX_REQUEST_BYTES))
         );
     }
 

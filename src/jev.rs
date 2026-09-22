@@ -13,8 +13,10 @@ use serde_json::Value;
 // Pin behavior and pricing together: https://docs.typesafe.ai/models (2026-09-18).
 pub(crate) const MODEL: &str = "jev-1.13.0";
 pub(crate) const INPUT_PRICE_PER_MILLION: f64 = 0.042;
-// Byte bound, not a tokenizer: the API enforces its separate token limits.
-pub(crate) const MAX_REQUEST_BYTES: usize = 96 * 1024;
+// Resource guard, not an estimate of the model's context window. JSON byte size
+// varies with escaping and content. Jev enforces its own token limits (32k for
+// state + longest question, 64k overall): https://docs.typesafe.ai/models.
+pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 // Shared by all clients for an endpoint, independently of issue fingerprints.
 static PROVIDERS: LazyLock<Mutex<HashMap<String, Arc<Provider>>>> =
@@ -93,6 +95,29 @@ impl Request {
             "model": MODEL, "state": self.state, "questions": self.questions,
         }))?
         .len())
+    }
+}
+
+/// Only explicit provider size/context failures may become unresolved evidence.
+/// Preserve authentication, overload and unrelated validation failures as errors.
+pub(crate) fn is_size_rejection(error: &anyhow::Error) -> bool {
+    let Some(jev_sdk::Error::Api(error)) = error.downcast_ref::<jev_sdk::Error>() else {
+        return false;
+    };
+    match error.status.as_u16() {
+        413 => true,
+        400 | 422 => {
+            let message = error.message.to_ascii_lowercase();
+            let code = error
+                .body
+                .as_ref()
+                .and_then(|body| body.pointer("/detail/error_type"))
+                .and_then(Value::as_str);
+            code == Some("context_length_exceeded")
+                || ((message.contains("context") || message.contains("token"))
+                    && (message.contains("exceed") || message.contains("too long")))
+        }
+        _ => false,
     }
 }
 
@@ -200,6 +225,32 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn provider_size_rejections_do_not_hide_other_errors() {
+        for (status, message, code, expected) in [
+            (413, "Request body too large", "", true),
+            (422, "State plus question exceeds token limit", "", true),
+            (400, "Maximum context length exceeded", "", true),
+            (422, "Input is too long", "context_length_exceeded", true),
+            (422, "Missing questions", "validation_error", false),
+            (400, "Invalid token parameter", "", false),
+            (401, "Token limit exceeded", "", false),
+            (429, "Token rate limit exceeded", "", false),
+            (529, "Context length exceeded", "", false),
+        ] {
+            let error = jev_sdk::Error::Api(jev_sdk::ApiError {
+                status: StatusCode::from_u16(status).unwrap(),
+                message: message.into(),
+                body: Some(json!({"detail": {"error_type": code}})),
+            });
+            let error = anyhow::Error::new(error).context("Comparing candidate");
+            assert_eq!(is_size_rejection(&error), expected, "{status}: {message}");
+        }
+        assert!(!is_size_rejection(&anyhow::anyhow!(
+            "context length exceeded"
+        )));
+    }
 
     #[test]
     fn cooldown_grows_across_expirations_and_caps_at_one_hour() {
