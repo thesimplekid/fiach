@@ -195,6 +195,7 @@ async fn setup(
                     "information" => "sufficient",
                     "direction" => "established",
                     "area_2" => "no",
+                    "relevance" => if request["state"]["candidate"]["comments"].to_string().contains("RELEVANCE_CONFIRMED") { "relevant" } else if request["state"]["candidate"]["comments"].to_string().contains("RELEVANCE_REJECTED") { "different" } else if request["state"]["candidate"]["body"] == "RELEVANCE_UNCERTAIN" { "uncertain" } else if request["state"]["candidate"]["body"] == "RELEVANCE_DIFFERENT" { "different" } else { "relevant" },
                     "match" => if request["state"]["candidate"]["comments"].to_string().contains("SAME_NOW") { "same" } else if request["state"]["pr_diff"].is_string() || request["state"]["candidate"]["is_pr"] == false { matching } else { "uncertain" },
                     _ => "yes",
                 };
@@ -202,7 +203,10 @@ async fn setup(
                 let probabilities: serde_json::Map<String,Value> = options.keys().map(|k| (k.clone(), json!(if k == selected {1.0} else {0.0}))).collect();
                 answers.insert(id.clone(), json!({"type":"choice","choice":selected,"confidence":1.0,"probabilities":probabilities}));
             }
-            if fail_once { answers["match"]["probabilities"] = json!({}); }
+            if fail_once {
+                let key = if questions.contains_key("relevance") { "relevance" } else { "match" };
+                answers[key]["probabilities"] = json!({});
+            }
             let input_tokens = if request["state"]["issue"]["body"] == "LARGE_USAGE" { 10000 } else { 100 };
             (axum::http::StatusCode::OK, Json(json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":input_tokens,"output_tokens":10}})))
         }
@@ -995,6 +999,66 @@ async fn candidate_details_and_unchanged_diffs_are_shared_across_issues() {
             if revision.is_some() { 4 } else { 3 },
             "Both issues must validate the current PR revisions, with an extra check after download"
         );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn pr_relevance_screens_diffs_without_turning_uncertainty_into_clearance() {
+    for (body, discussion, fetch_diff, expected_label) in [
+        ("RELEVANCE_DIFFERENT", "", false, "ready-for-agent"),
+        ("RELEVANCE_UNCERTAIN", "", false, "needs-decision"),
+        (
+            "RELEVANCE_UNCERTAIN",
+            "RELEVANCE_CONFIRMED",
+            true,
+            "already-being-addressed",
+        ),
+        (
+            "Concrete connection",
+            "RELEVANCE_REJECTED",
+            false,
+            "ready-for-agent",
+        ),
+    ] {
+        let (dir, server, requests) = setup("bug", "same", true, true).await;
+        let mut state = fixture(dir.path());
+        state["items"][1]["body"] = json!(body);
+        if !discussion.is_empty() {
+            state["comments"]["2"] =
+                json!([{"id": 42, "user": {"login": "maintainer"}, "body": discussion}]);
+        }
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+        let fetched = calls.lines().any(|line| {
+            let args: Vec<String> = serde_json::from_str(line).unwrap();
+            args.starts_with(&["pr".into(), "diff".into()])
+        });
+        assert_eq!(fetched, fetch_diff, "{body}: {discussion}");
+        let received = requests.lock().unwrap();
+        assert!(
+            received
+                .iter()
+                .any(|r| r["questions"]["relevance"].is_object())
+        );
+        assert_eq!(
+            received.iter().any(|r| r["state"]["pr_diff"].is_string()),
+            fetch_diff
+        );
+        let state = fixture(dir.path());
+        assert!(
+            state["items"][0]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["name"] == expected_label),
+            "{body}: {discussion}: {}",
+            state["items"][0]["labels"]
+        );
+        if !fetch_diff {
+            assert!(state["comments"]["1"].as_array().unwrap().is_empty());
+        }
         server.abort();
     }
 }
