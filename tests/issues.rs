@@ -65,9 +65,13 @@ elif path == root + '/issues/comments':
     comments = [dict(c, issue_url='https://api.github.com/' + root + '/issues/' + n) for n, cs in s['comments'].items() for c in cs]
     result = comments[(page-1)*size:page*size]
 elif path.startswith(root + '/issues/comments/'):
-    assert method == 'PATCH'
     comment = next(c for cs in s['comments'].values() for c in cs if c['id'] == int(path.split('/')[-1]))
-    comment['body'] = body['body']; result = comment
+    if method == 'DELETE':
+        for cs in s['comments'].values():
+            if comment in cs: cs.remove(comment)
+    else:
+        assert method == 'PATCH'
+        comment['body'] = body['body']; result = comment
 elif path.startswith(root + '/issues/'):
     tail = path[len(root + '/issues/'):].split('/')
     n = int(tail[0]); issue = next(i for i in s['items'] if i['number'] == n)
@@ -348,8 +352,18 @@ async fn dry_run_emits_multiple_areas_without_writing_github() {
 }
 
 #[tokio::test]
-async fn fully_described_feature_still_requires_maintainer_and_reuses_comment_after_edit() {
+async fn feature_uses_labels_and_removes_only_owned_triage_comments() {
     let (dir, server, _) = setup("feature", "same", false, true).await;
+    let mut state = fixture(dir.path());
+    let preserved = json!([
+        {"id": 51, "user": {"login": "maintainer"}, "body": "<!-- fiach-issue-triage -->\nHuman guidance"},
+        {"id": 52, "user": {"login": "fiach-bot"}, "body": "Other bot conversation"}
+    ]);
+    state["comments"]["1"] = preserved.clone();
+    state["comments"]["1"].as_array_mut().unwrap().push(json!({
+        "id": 53, "user": {"login": "fiach-bot"}, "body": "<!-- fiach-issue-triage -->\nOld generic guidance"
+    }));
+    save_fixture(dir.path(), &state);
     assert_ok(&run(dir.path()).await);
     let mut state = fixture(dir.path());
     assert!(
@@ -359,20 +373,11 @@ async fn fully_described_feature_still_requires_maintainer_and_reuses_comment_af
             .iter()
             .any(|l| l["name"] == "needs-decision")
     );
+    assert_eq!(state["comments"]["1"], preserved);
     state["items"][0]["body"] = json!("Updated feature request with more context");
-    std::fs::write(
-        dir.path().join("fixture.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    save_fixture(dir.path(), &state);
     assert_ok(&run(dir.path()).await);
-    assert_eq!(
-        fixture(dir.path())["comments"]["1"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(fixture(dir.path())["comments"]["1"], preserved);
     server.abort();
 }
 
@@ -657,11 +662,13 @@ async fn disabled_automation_pauses_pending_publication_and_can_resume() {
         assert!(fixture(dir.path()).get("prs").is_none());
         let state = fixture(dir.path());
         assert!(
-            state["comments"]["1"][0]["body"]
-                .as_str()
+            state["items"][0]["labels"]
+                .as_array()
                 .unwrap()
-                .contains("paused")
+                .iter()
+                .any(|l| l["name"] == "needs-decision")
         );
+        assert!(state["comments"]["1"].as_array().unwrap().is_empty());
         std::fs::write(&config_path, enabled).unwrap();
         assert_ok(&run(dir.path()).await);
         assert_eq!(fixture(dir.path())["prs"].as_array().unwrap().len(), 1);
@@ -1044,11 +1051,7 @@ async fn oversized_initial_classification_is_marked_once_without_starting_worker
                 .iter()
                 .any(|l| l["name"] == "needs-decision")
         );
-        let body = state["comments"]["1"][0]["body"].as_str().unwrap();
-        assert!(
-            body.contains("context limit") && body.contains("no automatic fix"),
-            "{body}"
-        );
+        assert!(state["comments"]["1"].as_array().unwrap().is_empty());
         assert!(!dir.path().join("fixture.json.phases").exists());
         assert_eq!(requests.lock().unwrap().len(), usize::from(provider));
         assert_ok(&run(dir.path()).await);
@@ -1062,7 +1065,7 @@ async fn oversized_initial_classification_is_marked_once_without_starting_worker
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            0
         );
         server.abort();
     }
@@ -1157,12 +1160,15 @@ async fn oversized_candidate_evidence_preserves_uncertainty_and_continues_compar
                 .iter()
                 .any(|l| l["name"] == expected)
         );
-        let body = state["comments"]["1"][0]["body"].as_str().unwrap();
-        if matches!(limit, "local" | "github") {
+        if matching == "same" {
+            let body = state["comments"]["1"][0]["body"].as_str().unwrap();
+            assert!(body.contains("Matching work: #3."), "{body}");
             assert!(
-                body.contains("#2") && body.contains("524288-byte") && body.contains("unresolved"),
+                !body.contains("#2") && !body.contains("Related work:"),
                 "{body}"
             );
+        } else {
+            assert!(state["comments"]["1"].as_array().unwrap().is_empty());
         }
         let received = requests.lock().unwrap();
         assert!(
@@ -1251,25 +1257,36 @@ async fn work_limit_batches_changed_issues_without_counting_cached_results() {
         .replace("[issues]", "[issues]\nmax_items = 1");
     std::fs::write(path, config).unwrap();
     assert_ok(&run(dir.path()).await);
-    assert_eq!(
-        fixture(dir.path())["comments"]["1"]
+    let state = fixture(dir.path());
+    assert!(
+        state["items"][0]["labels"]
             .as_array()
             .unwrap()
-            .len(),
-        1
+            .iter()
+            .any(|l| l["name"] == "needs-decision")
     );
     assert!(
-        fixture(dir.path())["comments"]["2"]
-            .as_array()
-            .is_none_or(|cs| cs.is_empty())
-    );
-    assert_ok(&run(dir.path()).await);
-    assert_eq!(
-        fixture(dir.path())["comments"]["2"]
+        !state["items"][1]["labels"]
             .as_array()
             .unwrap()
-            .len(),
-        1
+            .iter()
+            .any(|l| l["name"] == "needs-decision")
+    );
+    assert_ok(&run(dir.path()).await);
+    let state = fixture(dir.path());
+    assert!(
+        state["items"][1]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["name"] == "needs-decision")
+    );
+    assert!(
+        state["comments"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|cs| cs.as_array().unwrap().is_empty())
     );
     server.abort();
 }
@@ -1406,7 +1423,7 @@ async fn failed_comparison_preserves_progress_and_persists_retry_backoff() {
         3
     );
     assert!(
-        !fixture(dir.path())["comments"]
+        fixture(dir.path())["comments"]
             .as_object()
             .unwrap()
             .values()

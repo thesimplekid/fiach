@@ -236,7 +236,7 @@ impl Github {
         project: &Project,
         number: u64,
         labels: &[String],
-        body: &str,
+        body: Option<&str>,
     ) -> Result<()> {
         let repo = &project.repo;
         let endpoint = format!("repos/{repo}/issues/{number}");
@@ -287,8 +287,24 @@ impl Github {
             )
             .await?;
         }
-        let text = format!("{MARKER}\n{body}");
         let comments = self.comments(repo, number).await?;
+        let Some(body) = body else {
+            // Remove only this account's marked triage comments when labels suffice.
+            for comment in comments.iter().filter(|c| {
+                c["user"]["login"] == self.login
+                    && c["body"].as_str().is_some_and(|b| b.starts_with(MARKER))
+            }) {
+                let id = comment["id"].as_u64().context("Missing comment id")?;
+                api(
+                    &format!("repos/{repo}/issues/comments/{id}"),
+                    "DELETE",
+                    None,
+                )
+                .await?;
+            }
+            return Ok(());
+        };
+        let text = format!("{MARKER}\n{body}");
         if let Some(comment) = comments.iter().find(|c| {
             c["user"]["login"] == self.login
                 && c["body"].as_str().is_some_and(|b| b.starts_with(MARKER))

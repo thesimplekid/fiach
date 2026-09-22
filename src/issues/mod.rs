@@ -37,5 +37,11 @@ pub struct Decision {
     pub labels: Vec<String>,
     pub matches: Vec<u64>,
     pub related: Vec<u64>,
+    /// Internal evidence gaps; never render these as related work.
+    #[serde(default)]
+    pub unresolved: Vec<u64>,
+    /// Concrete worker guidance suitable for publication, when available.
+    #[serde(default)]
+    pub guidance: Option<String>,
     pub explanation: String,
 }

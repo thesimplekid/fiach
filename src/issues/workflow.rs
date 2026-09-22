@@ -432,6 +432,7 @@ async fn process(
                         Route::NeedsDecision
                     };
                     reroute(project, &mut decision, route, &fix.report.summary);
+                    decision.guidance = Some(fix.report.summary.clone());
                 }
                 Ok(fix) => {
                     let fresh = github.issue(&project.repo, number).await?;
@@ -588,16 +589,7 @@ async fn process(
             },
         );
     }
-    let mut body = decision.explanation.clone();
-    if !decision.matches.is_empty() {
-        body.push_str(&format!("\n\nMatching work: {}.", links(&decision.matches)));
-    }
-    if !decision.related.is_empty() {
-        body.push_str(&format!("\n\nRelated work: {}.", links(&decision.related)));
-    }
-    if let Some(url) = &record.pr {
-        body.push_str(&format!("\n\nDraft PR: {url}"));
-    }
+    let body = render_comment(&decision, record.pr.as_deref());
     if config.publish {
         let fresh = github.issue(&project.repo, number).await?;
         ensure!(
@@ -605,7 +597,7 @@ async fn process(
             "Issue changed before marking"
         );
         github
-            .mark(project, number, &decision.labels, &body)
+            .mark(project, number, &decision.labels, body.as_deref())
             .await?;
     }
     println!(
@@ -636,7 +628,29 @@ fn reroute(project: &Project, decision: &mut Decision, route: Route, explanation
         .push(route_label(project, &route).to_owned());
     decision.route = route;
     decision.explanation = explanation.to_owned();
+    decision.guidance = None;
 }
+fn render_comment(decision: &Decision, draft_pr: Option<&str>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(guidance) = &decision.guidance {
+        if !guidance.trim().is_empty() {
+            parts.push(guidance.clone());
+        }
+    } else if decision.route == Route::NeedsInfo || !decision.matches.is_empty() {
+        parts.push(decision.explanation.clone());
+    }
+    if !decision.matches.is_empty() {
+        parts.push(format!("Matching work: {}.", links(&decision.matches)));
+    }
+    if !decision.related.is_empty() {
+        parts.push(format!("Related work: {}.", links(&decision.related)));
+    }
+    if let Some(url) = draft_pr {
+        parts.push(format!("Draft PR: {url}"));
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 fn links(numbers: &[u64]) -> String {
     numbers
         .iter()
@@ -703,6 +717,60 @@ mod tests {
             labels: Default::default(),
         }
     }
+    #[test]
+    fn comments_only_link_confirmed_work() {
+        let mut decision = Decision {
+            route: Route::NeedsDecision,
+            labels: vec![],
+            matches: vec![],
+            related: vec![],
+            unresolved: vec![1666, 2479],
+            guidance: None,
+            explanation: "Coverage comparisons remain unresolved.".into(),
+        };
+        assert_eq!(render_comment(&decision, None), None);
+        decision.route = Route::Ready;
+        assert_eq!(render_comment(&decision, None), None);
+        decision.route = Route::NeedsInfo;
+        decision.explanation = "Please provide reproduction steps.".into();
+        assert_eq!(
+            render_comment(&decision, None).as_deref(),
+            Some("Please provide reproduction steps.")
+        );
+        decision.route = Route::NeedsDecision;
+        decision.guidance = Some("Should negative amounts be rejected or clamped to zero?".into());
+        assert_eq!(render_comment(&decision, None), decision.guidance);
+        reroute(
+            &project(),
+            &mut decision,
+            Route::NeedsDecision,
+            "Coverage comparisons remain unresolved.",
+        );
+        assert!(decision.guidance.is_none());
+        decision.related.push(42);
+        assert_eq!(
+            render_comment(&decision, None).as_deref(),
+            Some("Related work: #42.")
+        );
+        decision.related.clear();
+        decision.matches.push(1834);
+        decision.related.push(42);
+        assert_eq!(
+            render_comment(&decision, Some("https://example.com/pr")).unwrap(),
+            "Coverage comparisons remain unresolved.\n\nMatching work: #1834.\n\nRelated work: #42.\n\nDraft PR: https://example.com/pr"
+        );
+        let saved = serde_json::to_value(&decision).unwrap();
+        assert_eq!(saved["unresolved"], serde_json::json!([1666, 2479]));
+        let mut legacy = saved;
+        legacy.as_object_mut().unwrap().remove("unresolved");
+        assert!(
+            serde_json::from_value::<Decision>(legacy)
+                .unwrap()
+                .unresolved
+                .is_empty()
+        );
+    }
+
     #[test]
     fn bot_updates_do_not_loop_but_new_unlinked_prs_invalidate_triage() {
         let mut issue = item();

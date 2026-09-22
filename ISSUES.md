@@ -15,7 +15,10 @@ fiach --config issues.toml issues --watch     # continuous polling
 
 `TYPESAFE_API_KEY` and authenticated `gh` are required. The default `publish = false`
 prints JSON decisions and saves state without GitHub writes or coding-agent runs.
-Set `publish = true` to apply labels and a single bot-owned status comment.
+Set `publish = true` to apply labels and, when there are actionable details, a
+single bot-owned triage comment. Generic maintainer-review and ready statuses are
+label-only. Comments carry confirmed matching/related links, missing-information
+requests, concrete worker guidance, or a draft PR link.
 Set up `[issues.worker]` to enable coding; without it, eligible issues receive the
 ready label but no coding job starts. `auto_fix = false` enables classification
 and marking without coding jobs. Adding `[issues]` to the regular daemon config
@@ -69,8 +72,11 @@ each entry in the complete inventory; plausible candidates get full discussion,
 and PR coverage requires a diff. Definite partial overlap is reported as related
 work. Uncertain coverage requires a maintainer decision and prevents a new fix.
 A confirmed duplicate is marked and linked, never closed. An open covering PR
-gets `already-being-addressed`. Oversized PR diffs are recorded as unresolved
-coverage, with the PR number and evidence limit in the explanation. Other comparisons continue; unresolved coverage
+gets `already-being-addressed`. Related-work judgments require both selected
+probability and confidence of at least 0.95; shared topics alone are insufficient.
+Low-confidence comparisons and oversized PR diffs are recorded internally as
+unresolved coverage and never published as related links. Other comparisons
+continue; unresolved coverage
 requires a maintainer decision unless another candidate establishes a duplicate or
 covering PR. It never authorizes an automatic fix. Pagination, command, or Jev
 failures stop that attempt instead of interpreting incomplete evidence as permission
@@ -99,8 +105,12 @@ remain uncertain. Missing options, invalid values, and larger or unexplained
 discrepancies still stop the attempt with a question-specific diagnostic.
 
 Only the configured managed labels are reconciled. Unrelated human labels remain.
-Missing configured labels are created. The bot edits only a comment bearing its
-marker **and** authored by the authenticated account. Use a dedicated bot account.
+Missing configured labels are created. `needs-decision` indicates maintainer review;
+`bug` plus `ready-for-agent` indicates eligibility for investigation, not an estimate
+of fix complexity. The bot edits only a comment bearing its marker **and** authored
+by the authenticated account. When a re-evaluated issue needs labels only, it
+removes its own marked triage comments while preserving human and unrelated bot
+comments. Use a dedicated bot account.
 
 ## Automatic fixes
 
