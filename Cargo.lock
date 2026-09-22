@@ -20,9 +20,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "2.0.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d87bc7769eba641753ba5dc52f73ec3765d51022c6753bf040967125ddc86a8"
+checksum = "13f780597b2c88ab83d02509bcc3e86366751f86fa12114005e35c55ed691763"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -44,9 +44,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e8d5f32208cdc11238004bec4e4229d68fb937598f900e153468ca084865fa5"
+checksum = "f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de"
 dependencies = [
  "quote",
  "syn 3.0.6",
@@ -54,9 +54,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-http"
-version = "2.0.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b4d8db045bc66b84526dfe4ef2ffb87d651b81c4ff945f91c63a2bc677a582c"
+checksum = "18e3d7117a48e9db3c4b5e29f7539bc14e390f1f782d10a99b1d9f5c3a8cc28f"
 dependencies = [
  "agent-client-protocol",
  "async-stream",
@@ -71,9 +71,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "1.5.0"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5c231915b4ab578c722eca2d1bd7df4d300bfd6cac3b8e9f0d1e3ddc95b187c"
+checksum = "1d595a79e1665d02c91c7dd1bedd118501e75cc0a3d5b1651b5150ec4c5c1e0d"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -536,7 +536,7 @@ dependencies = [
  "sha1 0.10.7",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.29.0",
  "tower",
  "tower-layer",
  "tower-service",
@@ -889,7 +889,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.29.0",
  "tracing",
  "url",
 ]
@@ -1643,6 +1643,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1858,7 +1867,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "goose",
- "jev-sdk",
+ "goose-providers",
  "nostr",
  "process-wrap 9.1.0",
  "redb",
@@ -2190,8 +2199,8 @@ dependencies = [
 
 [[package]]
 name = "goose"
-version = "1.50.1"
-source = "git+https://github.com/aaif-goose/goose?tag=v1.50.1#881f96c00d618ab6fca9b2aaa3a0abf07673cc2c"
+version = "1.51.0"
+source = "git+https://github.com/aaif-goose/goose?rev=8a460f964ef5b165e35ab231e76ccfa0c133abbd#8a460f964ef5b165e35ab231e76ccfa0c133abbd"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-http",
@@ -2207,7 +2216,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
- "dirs",
+ "dirs 7.0.0",
  "etcetera",
  "fs-err",
  "fs2",
@@ -2293,8 +2302,8 @@ dependencies = [
 
 [[package]]
 name = "goose-acp-macros"
-version = "1.50.1"
-source = "git+https://github.com/aaif-goose/goose?tag=v1.50.1#881f96c00d618ab6fca9b2aaa3a0abf07673cc2c"
+version = "1.51.0"
+source = "git+https://github.com/aaif-goose/goose?rev=8a460f964ef5b165e35ab231e76ccfa0c133abbd#8a460f964ef5b165e35ab231e76ccfa0c133abbd"
 dependencies = [
  "quote",
  "syn 3.0.6",
@@ -2302,8 +2311,8 @@ dependencies = [
 
 [[package]]
 name = "goose-agent"
-version = "0.1.0-alpha.8"
-source = "git+https://github.com/aaif-goose/goose?tag=v1.50.1#881f96c00d618ab6fca9b2aaa3a0abf07673cc2c"
+version = "0.1.0-alpha.9"
+source = "git+https://github.com/aaif-goose/goose?rev=8a460f964ef5b165e35ab231e76ccfa0c133abbd#8a460f964ef5b165e35ab231e76ccfa0c133abbd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2320,12 +2329,12 @@ dependencies = [
 
 [[package]]
 name = "goose-context-management"
-version = "0.1.0-alpha.8"
-source = "git+https://github.com/aaif-goose/goose?tag=v1.50.1#881f96c00d618ab6fca9b2aaa3a0abf07673cc2c"
+version = "0.1.0-alpha.9"
+source = "git+https://github.com/aaif-goose/goose?rev=8a460f964ef5b165e35ab231e76ccfa0c133abbd#8a460f964ef5b165e35ab231e76ccfa0c133abbd"
 dependencies = [
  "anyhow",
  "async-trait",
- "goose-providers",
+ "goose-provider-types",
  "include_dir",
  "minijinja",
  "rmcp",
@@ -2336,8 +2345,8 @@ dependencies = [
 
 [[package]]
 name = "goose-download-manager"
-version = "0.1.0-alpha.8"
-source = "git+https://github.com/aaif-goose/goose?tag=v1.50.1#881f96c00d618ab6fca9b2aaa3a0abf07673cc2c"
+version = "0.1.0-alpha.9"
+source = "git+https://github.com/aaif-goose/goose?rev=8a460f964ef5b165e35ab231e76ccfa0c133abbd#8a460f964ef5b165e35ab231e76ccfa0c133abbd"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -2349,8 +2358,8 @@ dependencies = [
 
 [[package]]
 name = "goose-provider-types"
-version = "0.1.0-alpha.8"
-source = "git+https://github.com/aaif-goose/goose?tag=v1.50.1#881f96c00d618ab6fca9b2aaa3a0abf07673cc2c"
+version = "0.1.0-alpha.9"
+source = "git+https://github.com/aaif-goose/goose?rev=8a460f964ef5b165e35ab231e76ccfa0c133abbd#8a460f964ef5b165e35ab231e76ccfa0c133abbd"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2371,16 +2380,18 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
 name = "goose-providers"
-version = "0.1.0-alpha.8"
-source = "git+https://github.com/aaif-goose/goose?tag=v1.50.1#881f96c00d618ab6fca9b2aaa3a0abf07673cc2c"
+version = "0.1.0-alpha.9"
+source = "git+https://github.com/aaif-goose/goose?rev=8a460f964ef5b165e35ab231e76ccfa0c133abbd#8a460f964ef5b165e35ab231e76ccfa0c133abbd"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "futures",
  "goose-provider-types",
@@ -2391,16 +2402,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.28.0",
  "tokio-util",
  "tracing",
  "url",
  "urlencoding",
+ "uuid",
 ]
 
 [[package]]
 name = "goose-sdk-types"
-version = "0.1.0-alpha.8"
-source = "git+https://github.com/aaif-goose/goose?tag=v1.50.1#881f96c00d618ab6fca9b2aaa3a0abf07673cc2c"
+version = "0.1.0-alpha.9"
+source = "git+https://github.com/aaif-goose/goose?rev=8a460f964ef5b165e35ab231e76ccfa0c133abbd#8a460f964ef5b165e35ab231e76ccfa0c133abbd"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
@@ -2959,20 +2972,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jev-sdk"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a11cf79cd75911c818095eec27d424418376d77dc7bf107e7a87dbccd21f513b"
-dependencies = [
- "indexmap 2.14.2",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
 name = "jiff"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3115,9 +3114,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.52.1"
+version = "0.55.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93e842fa72fd1e50ca4676a527641c13f5ee0d423ac699bfe1cd2afa3a4fdbac"
+checksum = "b68339c3d874e48151d74ffe256d93a58cffa240983cb0967d3cbaea083a44fe"
 dependencies = [
  "ahash",
  "bytecount",
@@ -3143,22 +3142,23 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.52.1"
+version = "0.55.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5d90ea83fa606c96f0b4737ecedf1fa6b624272022edc42039565f8d8af0b78"
+checksum = "6307b5b51216ec9b941b52244c74043fa0b1d6b657b56199f57cb1416d3641c5"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.52.1"
+version = "0.55.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da4ab4cbe58181a117d8c3582844ce20b07184319b51ba6d756596c1c451aebc"
+checksum = "0230ac05e09c6111e96c147b75c390579f5cbd45654b980c68ac60fe17b3f129"
 dependencies = [
  "ahash",
  "bytecount",
  "fraction",
+ "getrandom 0.3.4",
  "num-cmp",
  "num-traits",
  "serde_json",
@@ -4293,9 +4293,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.52.1"
+version = "0.55.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d38a014525040cdc9893361b7419bcf1f43b7ba7055eabaf6d91d6b75caa8b3f"
+checksum = "a196a5b4a8a12f46b6353174df865a05d41a6055aff212ec30877492788618b6"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -4976,7 +4976,7 @@ version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
 ]
 
 [[package]]
@@ -5648,6 +5648,22 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite 0.28.0",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "tokio-tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
@@ -5658,7 +5674,7 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tungstenite",
+ "tungstenite 0.29.0",
  "webpki-roots 0.26.11",
 ]
 
@@ -5995,6 +6011,25 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.5.0",
+ "httparse",
+ "log",
+ "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
+ "sha1 0.10.7",
+ "thiserror 2.0.20",
+ "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
@@ -6126,6 +6161,12 @@ name = "urlencoding"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use jev_sdk::{Answer, Question, SystemOneResponse};
+use goose_providers::decision::{DecisionAnswer as Answer, DecisionResponse};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
@@ -53,7 +53,7 @@ impl Selection {
         }
     }
 
-    fn apply(&mut self, response: SystemOneResponse) -> Result<()> {
+    fn apply(&mut self, response: DecisionResponse) -> Result<()> {
         if response.model != jev::MODEL || response.answers.len() != self.decisions.len() {
             bail!("Unexpected Jev lane selection response");
         }
@@ -64,14 +64,14 @@ impl Selection {
                 .answers
                 .get(&index.to_string())
                 .context("Missing lane selection answer")?;
-            let Answer::Choice(answer) = answer else {
-                bail!("Lane selection requires a Choice answer");
-            };
-            let jev_sdk::ChoiceAnswer {
+            let Answer::Choice {
                 choice,
                 probabilities,
                 confidence,
-            } = answer;
+            } = answer
+            else {
+                bail!("Lane selection requires a Choice answer");
+            };
             let options = ["run", "skip", "uncertain"];
             if probabilities.len() != options.len()
                 || !options.contains(&choice.as_str())
@@ -174,7 +174,7 @@ fn request(state: DiffState<'_>, conditions: &BTreeMap<String, String>) -> Resul
         .map(|(index, condition)| {
             (
                 index.to_string(),
-                Question::Choice(jev_sdk::Choice::new(
+                jev::choice_question(
                     INSTRUCTIONS.replace("{condition}", condition),
                     [
                         ("run", "The change is relevant to the configured lane."),
@@ -187,7 +187,7 @@ fn request(state: DiffState<'_>, conditions: &BTreeMap<String, String>) -> Resul
                             "Applicability cannot be determined from the supplied evidence.",
                         ),
                     ],
-                )),
+                ),
             )
         })
         .collect();
@@ -303,7 +303,7 @@ mod tests {
         json!({"type": "choice", "choice": choice, "confidence": confidence,
             "probabilities": {"run": probabilities[0], "skip": probabilities[1], "uncertain": probabilities[2]}})
     }
-    fn response(answers: Value) -> SystemOneResponse {
+    fn response(answers: Value) -> DecisionResponse {
         serde_json::from_value(json!({"model": jev::MODEL, "answers": answers,
             "usage": {"input_tokens": 1000, "output_tokens": 30}}))
         .unwrap()

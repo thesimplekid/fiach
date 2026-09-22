@@ -1,12 +1,17 @@
-//! Shared, optional Jev transport through the standalone Jev SDK.
+//! Shared, optional Jev decisions through the GDK TypeSafe provider.
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
-use jev_sdk::{Question, RetryPolicy, SystemOneResponse, TypeSafeClient};
+use anyhow::{Context, Result, bail};
+use goose_providers::{
+    api_client::{ApiClient, AuthMethod},
+    decision::{DecisionProvider, DecisionQuestion as Question, DecisionRequest, DecisionResponse},
+    errors::ProviderError,
+    typesafe::TypeSafeProvider,
+};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -41,12 +46,8 @@ impl Cooldown {
     }
 
     fn overload(&mut self, now: Instant) -> Duration {
-        let policy = RetryPolicy {
-            initial_backoff: Duration::from_secs(60),
-            max_backoff: Duration::from_secs(3600),
-            ..RetryPolicy::default()
-        };
-        let delay = policy.backoff_for(self.failures);
+        let delay = Duration::from_secs(60 * 2_u64.pow(self.failures.min(6)))
+            .min(Duration::from_secs(3600));
         self.failures = self.failures.saturating_add(1);
         self.until = Some(now + delay);
         delay
@@ -71,7 +72,7 @@ pub(crate) fn cooldown_wait(base_url: &str) -> Duration {
 }
 
 pub(crate) struct Client {
-    inner: TypeSafeClient,
+    inner: TypeSafeProvider,
     provider: Arc<Provider>,
 }
 
@@ -89,6 +90,19 @@ pub(crate) struct Request {
     pub questions: HashMap<String, Question>,
 }
 
+pub(crate) fn choice_question(
+    instructions: impl Into<String>,
+    criteria: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+) -> Question {
+    Question::Choice {
+        instructions: instructions.into(),
+        criteria: criteria
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+    }
+}
+
 impl Request {
     pub fn encoded_len(&self) -> Result<usize> {
         Ok(serde_json::to_vec(&serde_json::json!({
@@ -101,23 +115,37 @@ impl Request {
 /// Only explicit provider size/context failures may become unresolved evidence.
 /// Preserve authentication, overload and unrelated validation failures as errors.
 pub(crate) fn is_size_rejection(error: &anyhow::Error) -> bool {
-    let Some(jev_sdk::Error::Api(error)) = error.downcast_ref::<jev_sdk::Error>() else {
+    let Some(error) = error.downcast_ref::<ProviderError>() else {
         return false;
     };
-    match error.status.as_u16() {
-        413 => true,
-        400 | 422 => {
-            let message = error.message.to_ascii_lowercase();
-            let code = error
-                .body
-                .as_ref()
-                .and_then(|body| body.pointer("/detail/error_type"))
-                .and_then(Value::as_str);
-            code == Some("context_length_exceeded")
-                || ((message.contains("context") || message.contains("token"))
-                    && (message.contains("exceed") || message.contains("too long")))
+    match error {
+        ProviderError::ContextLengthExceeded(_) => true,
+        // GDK maps some TypeSafe 400/422 bodies to RequestFailed and keeps
+        // the HTTP status in these prefixes. Do not classify unrelated errors.
+        ProviderError::RequestFailed(message)
+            if message.starts_with("Bad request (400):")
+                || message.starts_with("Request failed with status 422 ") =>
+        {
+            let message = message.to_ascii_lowercase();
+            (message.contains("context") || message.contains("token"))
+                && (message.contains("exceed") || message.contains("too long"))
         }
         _ => false,
+    }
+}
+
+fn overload_retry_delay(error: &ProviderError) -> Option<Duration> {
+    match error {
+        ProviderError::RateLimitExceeded { retry_delay, .. } => {
+            Some(retry_delay.unwrap_or(Duration::ZERO))
+        }
+        ProviderError::ServerError(message)
+            if message.starts_with("Server error (503 ")
+                || message.starts_with("Server error (529 ") =>
+        {
+            Some(Duration::ZERO)
+        }
+        _ => None,
     }
 }
 
@@ -133,17 +161,13 @@ pub(crate) fn client_from_env() -> Result<Option<Client>> {
 }
 
 pub(crate) fn client(key: &str, base_url: &str) -> Result<Client> {
-    let inner = TypeSafeClient::builder()
-        .api_key(key)
-        .base_url(base_url)
-        .model(MODEL)
-        .timeout(Duration::from_secs(10))
-        // A timed-out request may still be billable. Let each caller fall back.
-        .retry(RetryPolicy {
-            max_retries: 0,
-            ..RetryPolicy::default()
-        })
-        .build()?;
+    // The decision provider sends once; a timed-out request may be billable.
+    let inner = TypeSafeProvider::new(ApiClient::with_timeout_and_tls(
+        base_url.trim_end_matches('/').to_owned(),
+        AuthMethod::BearerToken(key.to_owned()),
+        Duration::from_secs(10),
+        None,
+    )?);
     Ok(Client {
         inner,
         provider: provider(base_url),
@@ -155,7 +179,7 @@ pub(crate) async fn evaluate(
     request: Request,
     budget: Option<f64>,
     usage: &mut UsageStats,
-) -> Result<SystemOneResponse> {
+) -> Result<DecisionResponse> {
     let bytes = request.encoded_len()?;
     if bytes > MAX_REQUEST_BYTES {
         bail!("Jev request is {bytes} bytes; limit is {MAX_REQUEST_BYTES} bytes");
@@ -180,32 +204,42 @@ pub(crate) async fn evaluate(
     }
     let response = match client
         .inner
-        .system_one(request.state, request.questions)
+        .create_decision(&DecisionRequest {
+            model: MODEL.to_owned(),
+            state: request.state,
+            questions: request.questions,
+        })
         .await
     {
         Ok(response) => response,
         Err(error) => {
-            if matches!(
-                error.status().map(|status| status.as_u16()),
-                Some(429 | 503 | 529)
-            ) {
-                // SDK 0.1.0 discards response headers, so Retry-After is unavailable here.
-                let delay = client
+            if let Some(retry_after) = overload_retry_delay(&error) {
+                let mut cooldown = client
                     .provider
                     .cooldown
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .overload(Instant::now());
-                tracing::warn!(status = ?error.status(), cooldown_secs = delay.as_secs(),
+                    .unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                let delay = cooldown.overload(now).max(retry_after);
+                cooldown.until = now.checked_add(delay).or(cooldown.until);
+                tracing::warn!(error = %error, cooldown_secs = delay.as_secs(),
                     "Jev overloaded; pausing provider requests");
             }
             return Err(error.into());
         }
     };
-    usage.peak_input_tokens = usage.peak_input_tokens.max(response.usage.input_tokens);
-    usage.output_tokens += response.usage.output_tokens;
-    usage.total_tokens += response.usage.input_tokens + response.usage.output_tokens;
-    usage.cost_usd += response.usage.input_tokens as f64 * INPUT_PRICE_PER_MILLION / 1_000_000.0;
+    let input_tokens = response
+        .usage
+        .input_tokens
+        .context("Jev response omitted input token usage")?;
+    let output_tokens = response
+        .usage
+        .output_tokens
+        .context("Jev response omitted output token usage")?;
+    usage.peak_input_tokens = usage.peak_input_tokens.max(input_tokens);
+    usage.output_tokens += output_tokens;
+    usage.total_tokens += input_tokens + output_tokens;
+    usage.cost_usd += input_tokens as f64 * INPUT_PRICE_PER_MILLION / 1_000_000.0;
     if response.model != MODEL {
         bail!("Unexpected Jev response model");
     }
@@ -239,17 +273,92 @@ mod tests {
             (429, "Token rate limit exceeded", "", false),
             (529, "Context length exceeded", "", false),
         ] {
-            let error = jev_sdk::Error::Api(jev_sdk::ApiError {
-                status: StatusCode::from_u16(status).unwrap(),
-                message: message.into(),
-                body: Some(json!({"detail": {"error_type": code}})),
-            });
+            let error = goose_providers::http_status::map_http_error_to_provider_error(
+                StatusCode::from_u16(status).unwrap(),
+                Some(json!({"detail": {"error_type": code, "message": message}})),
+                "http://localhost/v1/systemone",
+            );
             let error = anyhow::Error::new(error).context("Comparing candidate");
             assert_eq!(is_size_rejection(&error), expected, "{status}: {message}");
         }
         assert!(!is_size_rejection(&anyhow::anyhow!(
             "context length exceeded"
         )));
+    }
+
+    #[tokio::test]
+    async fn gdk_transport_preserves_context_and_validation_failures() {
+        for (status, body, oversized) in [
+            (400, json!({"error_type": "max_tokens_exceeded"}), true),
+            (
+                422,
+                json!({"detail": {"error_type": "context_length_exceeded"}}),
+                true,
+            ),
+            (413, json!({"message": "Request too large"}), true),
+            (422, json!({"detail": "Missing questions"}), false),
+            (401, json!({"error_type": "max_tokens_exceeded"}), false),
+        ] {
+            let app = Router::new().route(
+                "/v1/systemone",
+                post(move || {
+                    let body = body.clone();
+                    async move { (StatusCode::from_u16(status).unwrap(), Json(body)) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = client("test", &endpoint).unwrap();
+            let error = evaluate(
+                &client,
+                Request {
+                    state: json!({}),
+                    questions: HashMap::new(),
+                },
+                None,
+                &mut UsageStats::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(is_size_rejection(&error), oversized, "{status}: {error}");
+            assert!(cooldown_wait(&endpoint).is_zero());
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_usage_cannot_bypass_budget_accounting() {
+        for usage in [
+            json!({}),
+            json!({"input_tokens": 10}),
+            json!({"output_tokens": 0}),
+        ] {
+            let app = Router::new().route(
+                "/v1/systemone",
+                post(move || {
+                    let usage = usage.clone();
+                    async move { Json(json!({"model": MODEL, "answers": {}, "usage": usage})) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = client("test", &endpoint).unwrap();
+            let error = evaluate(
+                &client,
+                Request {
+                    state: json!({}),
+                    questions: HashMap::new(),
+                },
+                Some(1.0),
+                &mut UsageStats::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("token usage"), "{error}");
+            task.abort();
+        }
     }
 
     #[test]
@@ -280,6 +389,7 @@ mod tests {
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 (StatusCode::from_u16(status.load(Ordering::SeqCst)).unwrap(),
+                 [("retry-after", "300")],
                  Json(json!({"model": MODEL, "answers": {}, "usage": {"input_tokens": 10, "output_tokens": 0}})))
             }
         }));
@@ -292,7 +402,10 @@ mod tests {
             state: json!({"issue": "changed evidence"}),
             questions: HashMap::from([(
                 "q".into(),
-                Question::from(jev_sdk::Noul::new("Is this a bug?")),
+                Question::Noul {
+                    instructions: "Is this a bug?".into(),
+                    criteria: None,
+                },
             )]),
         };
         let mut usage = UsageStats::default();
@@ -302,16 +415,14 @@ mod tests {
             let error = evaluate(&first, request(), None, &mut usage)
                 .await
                 .unwrap_err();
-            assert_eq!(
-                error
-                    .downcast_ref::<jev_sdk::Error>()
-                    .unwrap()
-                    .status()
-                    .unwrap()
-                    .as_u16(),
-                code
-            );
+            assert!(matches!(
+                error.downcast_ref::<ProviderError>().unwrap(),
+                ProviderError::RateLimitExceeded { .. } | ProviderError::ServerError(_)
+            ));
             assert!(!cooldown_wait(&endpoint).is_zero());
+            if code == 429 {
+                assert!(cooldown_wait(&endpoint) > Duration::from_secs(299));
+            }
             let error = evaluate(&second, request(), None, &mut usage)
                 .await
                 .unwrap_err();

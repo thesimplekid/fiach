@@ -9,7 +9,7 @@ use futures::StreamExt;
 use goose::{
     agents::{
         Agent, AgentEvent, ExtensionConfig, SessionConfig, mcp_client::McpClientTrait,
-        tool_execution::ToolCallContext,
+        state_machine, tool_execution::ToolCallContext,
     },
     config::GooseMode,
     conversation::message::{Message, MessageContent},
@@ -1725,6 +1725,7 @@ pub async fn run_review(
                 .reply(
                     user_message_clone,
                     session_config_clone,
+                    state_machine::enabled(),
                     Some(phase_cancel_token.clone()),
                 )
                 .await
@@ -1891,6 +1892,7 @@ pub async fn run_review(
                                                 .reply(
                                                     follow_up_message.clone(),
                                                     session_config.clone(),
+                                                    state_machine::enabled(),
                                                     Some(phase_cancel_token.clone()),
                                                 )
                                                 .await
@@ -1976,6 +1978,7 @@ pub async fn run_review(
                                     .reply(
                                         follow_up_message.clone(),
                                         session_config.clone(),
+                                        state_machine::enabled(),
                                         Some(phase_cancel_token.clone()),
                                     )
                                     .await
@@ -2069,6 +2072,7 @@ pub async fn run_review(
                                     .reply(
                                         follow_up_message.clone(),
                                         session_config.clone(),
+                                        state_machine::enabled(),
                                         Some(phase_cancel_token.clone()),
                                     )
                                     .await
@@ -3079,6 +3083,7 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
                 .reply(
                     Message::user().with_text(&dedupe_prompt),
                     session_config.clone(),
+                    state_machine::enabled(),
                     Some(phase_cancel_token.clone()),
                 )
                 .await
@@ -3164,6 +3169,7 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
                                 .reply(
                                     Message::user().with_text(&retry_prompt),
                                     session_config.clone(),
+                                    state_machine::enabled(),
                                     Some(phase_cancel_token.clone()),
                                 )
                                 .await
@@ -3184,6 +3190,7 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
                                 .reply(
                                     Message::user().with_text(&retry_prompt),
                                     session_config.clone(),
+                                    state_machine::enabled(),
                                     Some(phase_cancel_token.clone()),
                                 )
                                 .await
@@ -3319,6 +3326,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                 .reply(
                     Message::user().with_text(&verifier_prompt),
                     session_config.clone(),
+                    state_machine::enabled(),
                     Some(phase_cancel_token.clone()),
                 )
                 .await
@@ -3405,6 +3413,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                                 .reply(
                                     Message::user().with_text(&retry_prompt),
                                     session_config.clone(),
+                                    state_machine::enabled(),
                                     Some(phase_cancel_token.clone()),
                                 )
                                 .await
@@ -3425,6 +3434,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                                 .reply(
                                     Message::user().with_text(&retry_prompt),
                                     session_config.clone(),
+                                    state_machine::enabled(),
                                     Some(phase_cancel_token.clone()),
                                 )
                                 .await

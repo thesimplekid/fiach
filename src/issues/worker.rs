@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use futures::StreamExt;
 use goose::{
-    agents::{Agent, AgentEvent, ExtensionConfig, SessionConfig},
+    agents::{Agent, AgentEvent, ExtensionConfig, SessionConfig, state_machine},
     config::GooseMode,
     conversation::message::{Message, MessageContent},
     model_config::model_config_from_user_config,
@@ -610,7 +610,12 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
         retry_config: None,
     };
     let mut stream = agent
-        .reply(Message::user().with_text(&prompt), config, Some(cancel))
+        .reply(
+            Message::user().with_text(&prompt),
+            config,
+            state_machine::enabled(),
+            Some(cancel),
+        )
         .await?;
     let mut last = String::new();
     let mut transcript = String::new();

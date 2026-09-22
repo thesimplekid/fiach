@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use anyhow::{Result, ensure};
+use goose_providers::decision::DecisionResponse;
 use nostr::hashes::{Hash, sha256};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -74,7 +75,7 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    pub(super) fn answer(&self, key: &str) -> Result<Option<jev_sdk::SystemOneResponse>> {
+    pub(super) fn answer(&self, key: &str) -> Result<Option<DecisionResponse>> {
         let tx = self.0.begin_read()?;
         let table = tx.open_table(ANSWERS)?;
         table
@@ -82,7 +83,7 @@ impl Store {
             .map(|v| serde_json::from_str(v.value()).map_err(Into::into))
             .transpose()
     }
-    pub(super) fn save_answer(&self, key: &str, answer: &jev_sdk::SystemOneResponse) -> Result<()> {
+    pub(super) fn save_answer(&self, key: &str, answer: &DecisionResponse) -> Result<()> {
         let value = serde_json::to_string(answer)?;
         let tx = self.0.begin_write()?;
         {

@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use jev_sdk::{Question, SystemOneResponse};
+use goose_providers::decision::DecisionResponse;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -94,14 +94,14 @@ impl Answer {
 
 fn request_body(finding: &AcceptedFinding, comments: &[ExistingPrComment]) -> Result<jev::Request> {
     let questions = comments.iter().enumerate().map(|(index, _)| {
-        (index.to_string(), Question::Choice(jev_sdk::Choice::new(
+        (index.to_string(), jev::choice_question(
             INSTRUCTIONS.replace("{index}", &index.to_string()),
             [
                 ("same_root_issue", "The comment already reports this concrete root cause and failure scenario."),
                 ("different_issue", "The comment discusses a distinct issue or does not report a bug."),
                 ("insufficient_evidence", "The text leaves doubt about whether these are the same issue."),
             ],
-        )))
+        ))
     }).collect();
     let state = State {
         finding: FindingContext {
@@ -123,7 +123,7 @@ fn request_body(finding: &AcceptedFinding, comments: &[ExistingPrComment]) -> Re
     Ok(request)
 }
 
-fn answers(response: SystemOneResponse, count: usize) -> Result<Vec<Answer>> {
+fn answers(response: DecisionResponse, count: usize) -> Result<Vec<Answer>> {
     if response.model != MODEL {
         bail!("Unexpected Jev response model");
     }
