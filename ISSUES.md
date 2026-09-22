@@ -57,6 +57,14 @@ A confirmed duplicate is marked and linked, never closed. An open covering PR
 gets `already-being-addressed`. Pagination, diff-size, or Jev failures
 stop that attempt instead of interpreting incomplete evidence as permission to fix.
 
+Jev sometimes returns probabilities rounded to hundredths whose total is 0.99
+or 1.01. Fiach accepts only drift consistent with half a hundredth per option
+when all entries use that precision. For these answers, it subtracts 0.005 from
+the selected probability and confidence before applying decision thresholds;
+it never scales probabilities upward to force a total of one. Borderline answers
+remain uncertain. Missing options, invalid values, and larger or unexplained
+discrepancies still stop the attempt with a question-specific diagnostic.
+
 Only the configured managed labels are reconciled. Unrelated human labels remain.
 Missing configured labels are created. The bot edits only a comment bearing its
 marker **and** authored by the authenticated account. Use a dedicated bot account.

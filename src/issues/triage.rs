@@ -252,7 +252,15 @@ impl Triage {
             "match",
             &["same", "different", "related", "uncertain"],
             0.95,
-        )?
+        )
+        .with_context(|| {
+            format!(
+                "Duplicate comparison against {} #{} (diff supplied: {})",
+                if candidate.is_pr { "PR" } else { "issue" },
+                candidate.number,
+                diff.is_some()
+            )
+        })?
         .to_owned())
     }
 }
@@ -280,27 +288,63 @@ fn choice<'a>(
     options: &[&str],
     threshold: f64,
 ) -> Result<&'a str> {
-    let Answer::Choice(answer) = response.answers.get(key).context("Missing Jev answer")? else {
-        anyhow::bail!("Expected Jev choice");
+    let Answer::Choice(answer) = response
+        .answers
+        .get(key)
+        .with_context(|| format!("Missing Jev answer for question {key}"))?
+    else {
+        anyhow::bail!("Expected Jev choice for question {key}");
     };
     ensure!(
-        answer.probabilities.len() == options.len()
-            && options.contains(&answer.choice.as_str())
-            && options.iter().all(|o| answer
-                .probabilities
-                .get(*o)
-                .is_some_and(|p| p.is_finite() && (0.0..=1.0).contains(p)))
-            && answer.confidence.is_finite()
-            && (0.0..=1.0).contains(&answer.confidence)
-            && (answer.probabilities.values().sum::<f64>() - 1.0).abs() < 0.001,
-        "Invalid Jev answer probabilities"
+        options.contains(&answer.choice.as_str()),
+        "Invalid Jev answer for question {key}: selected option is not in the requested options"
+    );
+    for option in options {
+        let probability = answer.probabilities.get(*option).with_context(|| {
+            format!(
+                "Invalid Jev answer for question {key}: missing probability for option {option}"
+            )
+        })?;
+        ensure!(
+            probability.is_finite() && (0.0..=1.0).contains(probability),
+            "Invalid Jev answer for question {key}: probability for option {option} is {probability}; expected a finite value in [0, 1]"
+        );
+    }
+    ensure!(
+        answer.probabilities.len() == options.len(),
+        "Invalid Jev answer for question {key}: expected {} probability entries, received {} (unexpected options)",
+        options.len(),
+        answer.probabilities.len()
+    );
+    ensure!(
+        answer.confidence.is_finite() && (0.0..=1.0).contains(&answer.confidence),
+        "Invalid Jev answer for question {key}: confidence is {}; expected a finite value in [0, 1]",
+        answer.confidence
+    );
+    let sum = answer.probabilities.values().sum::<f64>();
+    // Live Jev responses use hundredths and can total 0.99 or 1.01. Each
+    // rounded entry can contribute at most half a hundredth of error. Keep
+    // the old tolerance for higher-precision responses; do not normalize
+    // missing mass into a higher score that could authorize an action.
+    const HALF_STEP: f64 = 0.005;
+    const FLOAT_EPSILON: f64 = 1e-12;
+    let rounded = (sum - 1.0).abs() >= 0.001;
+    let rounding_limit = options.len() as f64 * HALF_STEP;
+    let hundredths = answer
+        .probabilities
+        .values()
+        .all(|p| (p * 100.0 - (p * 100.0).round()).abs() < FLOAT_EPSILON);
+    ensure!(
+        !rounded || (hundredths && (sum - 1.0).abs() <= rounding_limit + FLOAT_EPSILON),
+        "Invalid Jev answer for question {key}: probabilities sum to {sum}; expected 1 within 0.001 or hundredth rounding within {rounding_limit}"
     );
     let selected = answer.probabilities[&answer.choice];
     ensure!(
         answer.probabilities.values().all(|p| *p <= selected),
-        "Jev choice contradicts probabilities"
+        "Invalid Jev answer for question {key}: selected probability {selected} is below another option"
     );
-    if selected < threshold || answer.confidence < threshold {
+    let margin = if rounded { HALF_STEP } else { 0.0 };
+    if selected - margin < threshold || answer.confidence - margin < threshold {
         Ok("uncertain")
     } else {
         Ok(&answer.choice)
@@ -312,6 +356,116 @@ mod tests {
     use super::*;
     fn response(p: Value) -> SystemOneResponse {
         serde_json::from_value(json!({"model": jev::MODEL, "answers": {"match": p}, "usage":{"input_tokens":1,"output_tokens":1}})).unwrap()
+    }
+    #[test]
+    fn validation_errors_identify_question_and_failure() {
+        for (answer, expected) in [
+            (
+                json!({"choice":"same", "confidence":1.0}),
+                "missing probability for option same",
+            ),
+            (
+                json!({"choice":"same", "confidence":1.0, "probabilities":{"same":1.0,"different":0.0,"extra":0.0}}),
+                "unexpected options",
+            ),
+            (
+                json!({"choice":"other", "confidence":1.0, "probabilities":{"same":1.0,"different":0.0}}),
+                "selected option is not in the requested options",
+            ),
+            (
+                json!({"choice":"same", "confidence":1.0, "probabilities":{"same":1.1,"different":-0.1}}),
+                "probability for option same is 1.1",
+            ),
+            (
+                json!({"choice":"same", "confidence":1.1, "probabilities":{"same":1.0,"different":0.0}}),
+                "confidence is 1.1",
+            ),
+            (
+                json!({"choice":"same", "confidence":1.0, "probabilities":{"same":0.6,"different":0.6}}),
+                "probabilities sum to 1.2",
+            ),
+            (
+                json!({"choice":"same", "confidence":1.0, "probabilities":{"same":0.1,"different":0.9}}),
+                "selected probability 0.1 is below another option",
+            ),
+        ] {
+            let mut answer = answer;
+            answer["type"] = json!("choice");
+            let response = response(answer);
+            let error = choice(&response, "match", &["same", "different"], 0.95)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("question match"), "{error}");
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn valid_distributions_preserve_confidence_and_rounding_policy() {
+        for (same, different, confidence, expected) in [
+            (0.99, 0.01, 0.99, "same"),
+            (0.949, 0.051, 1.0, "uncertain"),
+            (0.99, 0.01, 0.949, "uncertain"),
+            (0.99, 0.0095, 0.99, "same"),
+        ] {
+            let response = response(
+                json!({"type":"choice", "choice":"same", "confidence":confidence, "probabilities":{"same":same,"different":different}}),
+            );
+            assert_eq!(
+                choice(&response, "match", &["same", "different"], 0.95).unwrap(),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn hundredth_rounded_distribution_routes_live_failure_to_uncertain() {
+        // The live #1310/#215 comparison failed with a total of 0.99.
+        // These option values are synthetic; the original response was not captured.
+        let response = response(json!({
+            "type": "choice", "choice": "different", "confidence": 0.93,
+            "probabilities": {"same": 0.0, "different": 0.94, "related": 0.04, "uncertain": 0.01}
+        }));
+        let result = choice(
+            &response,
+            "match",
+            &["same", "different", "related", "uncertain"],
+            0.95,
+        )
+        .unwrap();
+        assert_eq!(result, "uncertain");
+    }
+    #[test]
+    fn rounded_totals_never_inflate_borderline_decisions() {
+        for (selected, other, confidence, expected) in [
+            (0.98, 0.01, 0.99, "same"), // total 0.99
+            (0.98, 0.03, 0.99, "same"), // total 1.01
+            (0.95, 0.04, 1.0, "uncertain"),
+            (0.95, 0.06, 1.0, "uncertain"),
+            (0.98, 0.01, 0.95, "uncertain"),
+            (0.94, 0.05, 1.0, "uncertain"),
+        ] {
+            let r = response(
+                json!({"type":"choice", "choice":"same", "confidence":confidence,
+                "probabilities":{"same":selected,"different":other}}),
+            );
+            assert_eq!(
+                choice(&r, "match", &["same", "different"], 0.95).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rounding_allowance_rejects_large_or_unexplained_drift() {
+        for probabilities in [
+            json!({"same":0.97,"different":0.01}),
+            json!({"same":0.99,"different":0.03}),
+            json!({"same":0.981,"different":0.01}),
+        ] {
+            let r = response(json!({"type":"choice", "choice":"same", "confidence":1.0,
+                "probabilities":probabilities}));
+            assert!(choice(&r, "match", &["same", "different"], 0.95).is_err());
+        }
     }
     #[test]
     fn uncertain_or_invalid_answers_cannot_authorize_actions() {
