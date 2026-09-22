@@ -119,18 +119,34 @@ pub async fn run(
     tokio::fs::create_dir_all(&config.scratch_dir).await?;
     // redb's exclusive file lock also prevents concurrent issue publishers using this state file.
     let store = Store::open(&config.state_path)?;
-    let github = Github::new().await?;
+    let github = loop {
+        match Github::new().await {
+            Ok(github) => break github,
+            Err(error) if watch && !github::rate_limit_wait().is_zero() => {
+                tracing::warn!(error = %format!("{error:#}"), "Waiting for GitHub quota before starting issue workflow");
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(github::rate_limit_wait()) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let mut cursors: HashMap<String, u64> = HashMap::new();
     loop {
         let started = std::time::Instant::now();
         tracing::info!("Starting issue polling cycle");
         let mut failures = 0;
         for project in &config.repos {
+            if !github::rate_limit_wait().is_zero() {
+                failures = failures.max(1);
+                break;
+            }
             tracing::info!(repo = %project.repo, "Collecting issue and PR inventory");
             let inventory = match github.inventory(&project.repo).await {
                 Ok(items) => items,
                 Err(error) => {
-                    tracing::error!(repo = %project.repo, %error, "Issue inventory failed");
+                    tracing::error!(repo = %project.repo, error = %format!("{error:#}"), "Issue inventory failed");
                     failures += 1;
                     continue;
                 }
@@ -154,6 +170,10 @@ pub async fn run(
             let mut processed = 0;
             let mut cached_or_closed = 0;
             for item in targets {
+                if !github::rate_limit_wait().is_zero() {
+                    failures = failures.max(1);
+                    break;
+                }
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
@@ -196,11 +216,18 @@ pub async fn run(
             ensure!(failures == 0, "{failures} issue workflow operations failed");
             return Ok(());
         }
+        let cooldown = github::rate_limit_wait();
+        let wait = if cooldown.is_zero() {
+            Duration::from_secs(config.interval_secs)
+        } else {
+            cooldown
+        };
         tracing::info!(
-            interval_secs = config.interval_secs,
+            interval_secs = wait.as_secs(),
+            rate_limited = !cooldown.is_zero(),
             "Waiting for next issue poll"
         );
-        tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(config.interval_secs)) => {} }
+        tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(wait) => {} }
     }
 }
 

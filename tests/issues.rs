@@ -21,6 +21,12 @@ if a[:2] == ['repo', 'clone']:
     import subprocess
     sys.exit(subprocess.call(['git','clone',s['remote'],a[3]]))
 if a[:2] == ['pr', 'diff']:
+    if s.get('fail_diff'):
+        print('diff unavailable', file=sys.stderr)
+        sys.exit(1)
+    if int(a[2]) in s.get('oversized_prs', []):
+        print('x' * (80 * 1024 + 1))
+        sys.exit(0)
     print('diff --git a/db.rs b/db.rs\n--- a/db.rs\n+++ b/db.rs\n@@ -1 +1 @@\n-bug\n+fix')
     sys.exit(0)
 assert a[:3] == ['api', '--method', a[2]], a
@@ -29,6 +35,10 @@ body = json.load(sys.stdin) if '--input' in a else None
 path = endpoint.split('?')[0]
 root = 'repos/owner/repo'
 result = None
+if s.get('rate_limit_endpoint') == path:
+    print('HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 4102444800\r\n\r\n{}')
+    print('gh: API rate limit exceeded for user ID 1 (HTTP 403)', file=sys.stderr)
+    sys.exit(1)
 if path == 'user': result = {'login':'fiach-bot'}
 elif path == root + '/issues':
     query = parse_qs(urlsplit(endpoint).query)
@@ -90,9 +100,13 @@ elif path == root + '/pulls':
             sys.exit(1)
     else: result = s.get('prs', [])
 elif path.startswith(root + '/pulls/'):
-    n = int(path.split('/')[-1]); result = {'state':'open','head':{'sha':'abc'}}
+    n = int(path.split('/')[-1]); result = {'state':'open','head':{'sha':'abc'},'base':{'sha':'base'}}
+    s['pull_reads'] = s.get('pull_reads', 0) + 1
+    if s.get('change_revision') and s['pull_reads'] >= 3:
+        result[s['change_revision']]['sha'] = 'changed'
 else: raise Exception(a)
 json.dump(s,open(p,'w'))
+if '--include' in a: print('HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4000\r\n\r\n', end='')
 print(json.dumps(result))
 "#;
 
@@ -687,6 +701,255 @@ auto_fix = false
         assert_eq!(
             std::fs::read_to_string(dir.path().join("fixture.json.phases")).unwrap(),
             "code\n"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_wait_does_not_repoll_and_can_be_cancelled() {
+    use std::{process::Stdio, time::Duration};
+
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    for endpoint in ["user", "repos/owner/repo/issues"] {
+        let (dir, server, _) = setup("bug", "different", false, false).await;
+        let mut state = fixture(dir.path());
+        state["rate_limit_endpoint"] = json!(endpoint);
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let config = dir.path().join("fiach.toml");
+        let text = std::fs::read_to_string(&config)
+            .unwrap()
+            .replace("[issues]", "[issues]\ninterval_secs = 1");
+        std::fs::write(&config, text).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fiach"))
+            .args(["--config", config.to_str().unwrap(), "issues", "--watch"])
+            .env("FIXTURE", dir.path().join("fixture.json"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("TYPESAFE_API_KEY", "test-only")
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("Workflow exited before waiting");
+                if line.contains("Waiting for GitHub quota")
+                    || (line.contains("Waiting for next issue poll")
+                        && line.contains("rate_limited=true"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let calls_path = dir.path().join("fixture.json.calls");
+        let before = std::fs::read_to_string(&calls_path).unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            std::fs::read_to_string(&calls_path).unwrap(),
+            before,
+            "The ordinary poll interval must not bypass quota backoff"
+        );
+        assert!(
+            Command::new("kill")
+                .args(["-INT", &child.id().unwrap().to_string()])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn issue_rate_limit_stops_the_pass_before_other_issues_or_publication() {
+    let (dir, server, _) = setup("bug", "same", true, true).await;
+    let mut state = fixture(dir.path());
+    state["scan_all"] = json!(true);
+    state["rate_limit_endpoint"] = json!("repos/owner/repo/issues/2");
+    state["items"].as_array_mut().unwrap().push(item(3, false));
+    std::fs::write(
+        dir.path().join("fixture.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    let output = run(dir.path()).await;
+    assert!(!output.status.success());
+    let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+    let calls: Vec<Value> = calls
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c[3] == "repos/owner/repo/issues/2")
+            .count(),
+        1
+    );
+    assert!(!calls.iter().any(|c| c[3] == "repos/owner/repo/issues/3"));
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c[2] == "POST" || c[2] == "PATCH" || c[2] == "DELETE")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn candidate_details_and_unchanged_diffs_are_shared_across_issues() {
+    for revision in [None, Some("head"), Some("base")] {
+        let (dir, server, _) = setup("bug", "same", true, false).await;
+        let mut state = fixture(dir.path());
+        state["scan_all"] = json!(true);
+        state["change_revision"] = json!(revision);
+        state["items"].as_array_mut().unwrap().push(item(3, false));
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        assert_ok(&run(dir.path()).await);
+        let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+        let calls: Vec<Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c[3] == "repos/owner/repo/issues/2")
+                .count(),
+            2,
+            "The candidate should be fetched once, with its pagination consistency reread"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c[0] == "pr" && c[1] == "diff")
+                .count(),
+            if revision.is_some() { 2 } else { 1 }
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c[3] == "repos/owner/repo/pulls/2")
+                .count(),
+            if revision.is_some() { 4 } else { 3 },
+            "Both issues must validate the current PR revisions, with an extra check after download"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn failed_pr_diff_command_still_fails_triage_with_candidate_context() {
+    let (dir, server, _) = setup("bug", "same", true, true).await;
+    let mut state = fixture(dir.path());
+    state["fail_diff"] = json!(true);
+    std::fs::write(
+        dir.path().join("fixture.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    let output = run(dir.path()).await;
+    assert!(!output.status.success());
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        logs.contains("Fetching diff for owner/repo#2 failed: diff unavailable"),
+        "{logs}"
+    );
+    assert!(
+        fixture(dir.path())["comments"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v.as_array().unwrap().is_empty())
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn oversized_pr_diff_preserves_uncertainty_and_continues_comparisons() {
+    for matching in ["different", "same"] {
+        let (dir, server, requests) = setup("bug", matching, true, true).await;
+        enable_worker(dir.path(), false).await;
+        let mut state = fixture(dir.path());
+        state["oversized_prs"] = json!([2]);
+        state["items"].as_array_mut().unwrap().push(item(3, true));
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        assert_ok(&run(dir.path()).await);
+        let state = fixture(dir.path());
+        let expected = if matching == "same" {
+            "already-being-addressed"
+        } else {
+            "needs-decision"
+        };
+        assert!(
+            state["items"][0]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["name"] == expected)
+        );
+        let body = state["comments"]["1"][0]["body"].as_str().unwrap();
+        assert!(
+            body.contains("#2") && body.contains("81920-byte") && body.contains("unresolved"),
+            "{body}"
+        );
+        let received = requests.lock().unwrap();
+        assert!(
+            received.iter().any(
+                |r| r["state"]["candidate"]["number"] == 3 && r["state"]["pr_diff"].is_string()
+            ),
+            "Later candidates must still be checked"
+        );
+        assert!(
+            !received.iter().any(
+                |r| r["state"]["candidate"]["number"] == 2 && r["state"]["pr_diff"].is_string()
+            ),
+            "Partial diffs must never reach Jev"
+        );
+        assert!(
+            !dir.path().join("fixture.json.phases").exists(),
+            "Unresolved or addressed issues must never start the worker"
         );
         server.abort();
     }

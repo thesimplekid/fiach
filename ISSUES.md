@@ -69,8 +69,26 @@ each entry in the complete inventory; plausible candidates get full discussion,
 and PR coverage requires a diff. Definite partial overlap is reported as related
 work. Uncertain coverage requires a maintainer decision and prevents a new fix.
 A confirmed duplicate is marked and linked, never closed. An open covering PR
-gets `already-being-addressed`. Pagination, diff-size, or Jev failures
-stop that attempt instead of interpreting incomplete evidence as permission to fix.
+gets `already-being-addressed`. Oversized PR diffs are recorded as unresolved
+coverage, with the PR number and evidence limit in the explanation. Other comparisons continue; unresolved coverage
+requires a maintainer decision unless another candidate establishes a duplicate or
+covering PR. It never authorizes an automatic fix. Pagination, command, or Jev
+failures stop that attempt instead of interpreting incomplete evidence as permission
+to fix. Progress logs identify comparison milestones and candidate PR evidence
+fetches.
+
+GitHub candidate details are reused within an inventory pass. PR diffs are reused
+only after checking that the PR is still open and both its head and base revisions
+match. Every new inventory, including checks before fix publication, clears these
+bounded in-memory caches; target-issue reads and publication checks stay fresh.
+
+The issue workflow honors GitHub's rate-limit reset and Retry-After headers. It
+stops the pass when quota is exhausted and, in watch mode, waits until requests
+are permitted again. Secondary limits without a deadline use increasing backoff.
+The wait can be cancelled. One-shot runs report the failure instead of sleeping.
+This cooldown applies to issue API calls; the separate PR review poller continues
+independently. Inventory is still fetched in full each pass, so this reduces
+repeated candidate requests rather than implementing incremental synchronization.
 
 Jev sometimes returns probabilities rounded to hundredths whose total is 0.99
 or 1.01. Fiach accepts only drift consistent with half a hundredth per option
