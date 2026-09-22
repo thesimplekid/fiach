@@ -1,4 +1,4 @@
-use std::{path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -37,10 +37,39 @@ impl Github {
                 }
             }
             if values.len() < 100 {
-                return Ok(result);
+                break;
             }
         }
-        unreachable!()
+        // Fetch discussions in repository-wide pages, rather than one request
+        // per historical issue. Include human comments even when title/body
+        // alone would look unrelated; exclude only our own marked comments.
+        let positions: HashMap<_, _> = result
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (item.number, i))
+            .collect();
+        for page in 1.. {
+            let value = api(&format!("repos/{repo}/issues/comments?sort=created&direction=asc&per_page=100&page={page}"), "GET", None).await?;
+            let comments = value
+                .as_array()
+                .context("Expected repository issue comments")?;
+            for comment in comments {
+                let number = comment["issue_url"]
+                    .as_str()
+                    .and_then(|url| url.rsplit('/').next())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .context("Missing comment issue number")?;
+                if let Some(&index) = positions.get(&number)
+                    && let Some(text) = self.comment_text(comment)
+                {
+                    result[index].comments.push(text);
+                }
+            }
+            if comments.len() < 100 {
+                break;
+            }
+        }
+        Ok(result)
     }
 
     pub async fn issue(&self, repo: &str, number: u64) -> Result<Item> {
@@ -49,18 +78,7 @@ impl Github {
             .comments(repo, number)
             .await?
             .into_iter()
-            .filter(|c| {
-                !(c["user"]["login"] == self.login
-                    && c["body"].as_str().is_some_and(|b| b.starts_with(MARKER)))
-            })
-            .map(|c| {
-                format!(
-                    "{} (GitHub association: {}): {}",
-                    c["user"]["login"].as_str().unwrap_or("unknown"),
-                    c["author_association"].as_str().unwrap_or("NONE"),
-                    c["body"].as_str().unwrap_or("")
-                )
-            })
+            .filter_map(|c| self.comment_text(&c))
             .collect();
         // Re-read to detect edits during pagination.
         let after = api(&format!("repos/{repo}/issues/{number}"), "GET", None).await?;
@@ -69,6 +87,19 @@ impl Github {
             "Issue changed while collecting evidence"
         );
         Ok(result)
+    }
+
+    fn comment_text(&self, comment: &Value) -> Option<String> {
+        let body = comment["body"].as_str().unwrap_or("");
+        if comment["user"]["login"] == self.login && body.starts_with(MARKER) {
+            return None;
+        }
+        Some(format!(
+            "{} (GitHub association: {}): {}",
+            comment["user"]["login"].as_str().unwrap_or("unknown"),
+            comment["author_association"].as_str().unwrap_or("NONE"),
+            body
+        ))
     }
 
     async fn comments(&self, repo: &str, number: u64) -> Result<Vec<Value>> {

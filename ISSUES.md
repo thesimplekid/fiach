@@ -34,6 +34,21 @@ content so the workflow does not trigger itself. One process owns `state_path`;
 use the same path across restarts and never run multiple publishers with separate
 state files for the same repositories.
 
+Validated Jev responses are saved individually in that database. Comparisons
+reuse unchanged evidence across passes and restarts; adding one candidate does
+not repeat every older model request. Cache keys include the repository, Jev
+endpoint/model, prompts, and evidence. Changed human comments (including edits
+and deletions) invalidate affected comparisons; the bot's marked status comments
+do not. Discussions are collected in repository-wide pages, including comments
+on closed issues. An incomplete discussion scan stops the pass.
+
+If classification fails or exhausts its budget, completed requests remain
+cached. Retrying resumes the missing work with a fresh per-issue budget. A
+persistent cooldown starts at 60 seconds and doubles to a maximum of one hour;
+changed evidence or configuration can bypass it. The normal polling interval
+still applies. Partial scans never authorize marking or coding. Keep the state
+database across restarts to retain both progress and retry history.
+
 ## Classification and policy
 
 Labels have three independent dimensions: kind, project areas (multiple labels

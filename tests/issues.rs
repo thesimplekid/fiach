@@ -38,6 +38,12 @@ elif path == root + '/issues':
 elif path == root + '/labels':
     result = [{'name':x} for x in s['labels']]
     if method == 'POST': s['labels'].append(body['name']); result = body
+elif path == root + '/issues/comments':
+    query = parse_qs(urlsplit(endpoint).query)
+    page = int(query.get('page',['1'])[0]); size = int(query.get('per_page',['100'])[0])
+    if s.get('fail_comments_page') == page: sys.exit(1)
+    comments = [dict(c, issue_url='https://api.github.com/' + root + '/issues/' + n) for n, cs in s['comments'].items() for c in cs]
+    result = comments[(page-1)*size:page*size]
 elif path.startswith(root + '/issues/comments/'):
     assert method == 'PATCH'
     comment = next(c for cs in s['comments'].values() for c in cs if c['id'] == int(path.split('/')[-1]))
@@ -135,7 +141,12 @@ async fn setup(
     let app = Router::new().route("/v1/systemone", post(move |Json(request): Json<Value>| {
         let received = received.clone();
         async move {
-            received.lock().unwrap().push(request.clone());
+            let fail_once = {
+                let mut requests = received.lock().unwrap();
+                let first = !requests.iter().any(|r| r == &request);
+                requests.push(request.clone());
+                first && request["state"]["candidate"]["body"] == "FAIL_ONCE"
+            };
             let questions = request["questions"].as_object().unwrap();
             let mut answers = serde_json::Map::new();
             for (id, q) in questions {
@@ -144,14 +155,16 @@ async fn setup(
                     "information" => "sufficient",
                     "direction" => "established",
                     "area_2" => "no",
-                    "match" => if request["state"]["pr_diff"].is_string() || request["state"]["candidate"]["is_pr"] == false { matching } else { "uncertain" },
+                    "match" => if request["state"]["candidate"]["comments"].to_string().contains("SAME_NOW") { "same" } else if request["state"]["pr_diff"].is_string() || request["state"]["candidate"]["is_pr"] == false { matching } else { "uncertain" },
                     _ => "yes",
                 };
                 let options = q["criteria"].as_object().unwrap();
                 let probabilities: serde_json::Map<String,Value> = options.keys().map(|k| (k.clone(), json!(if k == selected {1.0} else {0.0}))).collect();
                 answers.insert(id.clone(), json!({"type":"choice","choice":selected,"confidence":1.0,"probabilities":probabilities}));
             }
-            Json(json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":100,"output_tokens":10}}))
+            if fail_once { answers["match"]["probabilities"] = json!({}); }
+            let input_tokens = if request["state"]["issue"]["body"] == "LARGE_USAGE" { 10000 } else { 100 };
+            Json(json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":input_tokens,"output_tokens":10}}))
         }
     }));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -721,8 +734,8 @@ async fn large_history_does_not_block_triage_or_hide_a_late_closed_duplicate() {
     );
     assert_eq!(
         requests.lock().unwrap().len(),
-        3,
-        "closed PRs must not reach Jev"
+        2,
+        "closed PRs must not reach Jev; identical detailed evidence is cached"
     );
     server.abort();
 }
@@ -791,5 +804,179 @@ async fn more_than_one_thousand_closed_issues_are_checked_without_a_history_cap(
             .iter()
             .any(|l| l["name"] == "ready-for-agent")
     );
+    server.abort();
+}
+
+fn save_fixture(dir: &Path, state: &Value) {
+    std::fs::write(dir.join("fixture.json"), serde_json::to_vec(state).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn new_candidates_reuse_old_comparisons_across_process_restarts() {
+    let (dir, server, requests) = setup("bug", "different", false, true).await;
+    let mut state = fixture(dir.path());
+    state["items"][0]["number"] = json!(10);
+    state["items"].as_array_mut().unwrap().push(item(2, false));
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let mut state = fixture(dir.path());
+    state["items"].as_array_mut().unwrap().push(item(3, false));
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    let calls = requests.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2]["state"]["candidate"]["number"], 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn human_candidate_discussion_invalidates_only_affected_comparison() {
+    let (dir, server, requests) = setup("bug", "different", false, true).await;
+    let mut state = fixture(dir.path());
+    state["items"][0]["number"] = json!(10);
+    state["items"]
+        .as_array_mut()
+        .unwrap()
+        .extend([item(2, false), item(3, false)]);
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    let mut state = fixture(dir.path());
+    state["comments"]["2"] = json!([{"id":42,"user":{"login":"fiach-bot"},"body":"<!-- fiach-issue-triage -->\nbot status"}]);
+    state["items"][1]["updated_at"] = json!("bot update");
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    let mut state = fixture(dir.path());
+    state["comments"]["2"].as_array_mut().unwrap().push(json!({"id":43,"user":{"login":"maintainer"},"author_association":"OWNER","body":"SAME_NOW: this has the same root cause"}));
+    state["items"][1]["updated_at"] = json!("human update");
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    assert!(
+        fixture(dir.path())["items"][0]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["name"] == "duplicate")
+    );
+    // An edit changes the decision even if GitHub's timestamp stays the same.
+    let mut state = fixture(dir.path());
+    state["comments"]["2"][1]["body"] = json!("Actually a different cause");
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(requests.lock().unwrap().len(), 5);
+    assert!(
+        !fixture(dir.path())["items"][0]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["name"] == "duplicate")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_comparison_preserves_progress_and_persists_retry_backoff() {
+    let (dir, server, requests) = setup("bug", "different", false, true).await;
+    let mut state = fixture(dir.path());
+    state["items"]
+        .as_array_mut()
+        .unwrap()
+        .extend([item(2, false), item(3, false)]);
+    state["items"][2]["body"] = json!("FAIL_ONCE");
+    save_fixture(dir.path(), &state);
+    assert!(!run(dir.path()).await.status.success());
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert!(
+        fixture(dir.path())["comments"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v.as_array().unwrap().is_empty())
+    );
+    // A new process honors the cooldown and sends no new Jev requests.
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    // A changed budget explicitly bypasses the cooldown without discarding evidence.
+    let path = dir.path().join("fiach.toml");
+    let config = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("max_jev_cost_usd = 1.0", "max_jev_cost_usd = 1.1");
+    std::fs::write(path, config).unwrap();
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    assert_eq!(
+        requests.lock().unwrap()[3]["state"]["candidate"]["number"],
+        3
+    );
+    assert!(
+        !fixture(dir.path())["comments"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v.as_array().unwrap().is_empty())
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn exhausted_budget_resumes_without_repaying_for_completed_requests() {
+    let (dir, server, requests) = setup("bug", "different", false, true).await;
+    let mut state = fixture(dir.path());
+    state["items"][0]["body"] = json!("LARGE_USAGE");
+    state["items"]
+        .as_array_mut()
+        .unwrap()
+        .extend([item(2, false), item(3, false)]);
+    save_fixture(dir.path(), &state);
+    let path = dir.path().join("fiach.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    for (budget, expected_calls, success) in
+        [(0.0005, 1, false), (0.00051, 2, false), (0.00052, 3, true)]
+    {
+        std::fs::write(
+            &path,
+            config.replace(
+                "max_jev_cost_usd = 1.0",
+                &format!("max_jev_cost_usd = {budget}"),
+            ),
+        )
+        .unwrap();
+        let output = run(dir.path()).await;
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(requests.lock().unwrap().len(), expected_calls);
+        if !success {
+            assert!(
+                fixture(dir.path())["comments"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|v| v.as_array().unwrap().is_empty())
+            );
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn incomplete_discussion_inventory_cannot_reuse_a_cached_decision() {
+    let (dir, server, requests) = setup("bug", "different", false, true).await;
+    assert_ok(&run(dir.path()).await);
+    let count = requests.lock().unwrap().len();
+    let mut state = fixture(dir.path());
+    state["fail_comments_page"] = json!(1);
+    save_fixture(dir.path(), &state);
+    std::fs::write(dir.path().join("fixture.json.calls"), "").unwrap();
+    assert!(!run(dir.path()).await.status.success());
+    assert_eq!(requests.lock().unwrap().len(), count);
+    let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+    assert!(!calls.contains("POST"));
     server.abort();
 }

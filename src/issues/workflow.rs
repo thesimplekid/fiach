@@ -15,14 +15,23 @@ use super::{
 };
 
 const RECORDS: TableDefinition<&str, &str> = TableDefinition::new("issue_workflow_v1");
+const ANSWERS: TableDefinition<&str, &str> = TableDefinition::new("issue_jev_answers_v1");
 
 #[derive(Default, Serialize, Deserialize)]
 struct Record {
+    #[serde(default)]
+    retry: Option<Retry>,
     fingerprint: String,
     decision: Option<Decision>,
     attempted: Option<String>,
     pr: Option<String>,
     pending: Option<Publication>,
+}
+#[derive(Serialize, Deserialize)]
+struct Retry {
+    fingerprint: String,
+    failures: u32,
+    not_before: u64,
 }
 #[derive(Serialize, Deserialize)]
 struct Publication {
@@ -36,13 +45,14 @@ struct Publication {
     #[serde(default)]
     area_policy: Option<String>,
 }
-struct Store(Database);
+pub(super) struct Store(Database);
 impl Store {
     fn open(path: &Path) -> Result<Self> {
         let db = Database::create(path)?;
         let tx = db.begin_write()?;
         {
             tx.open_table(RECORDS)?;
+            tx.open_table(ANSWERS)?;
         }
         tx.commit()?;
         Ok(Self(db))
@@ -64,6 +74,23 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    pub(super) fn answer(&self, key: &str) -> Result<Option<jev_sdk::SystemOneResponse>> {
+        let tx = self.0.begin_read()?;
+        let table = tx.open_table(ANSWERS)?;
+        table
+            .get(key)?
+            .map(|v| serde_json::from_str(v.value()).map_err(Into::into))
+            .transpose()
+    }
+    pub(super) fn save_answer(&self, key: &str, answer: &jev_sdk::SystemOneResponse) -> Result<()> {
+        let value = serde_json::to_string(answer)?;
+        let tx = self.0.begin_write()?;
+        {
+            tx.open_table(ANSWERS)?.insert(key, value.as_str())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 pub async fn run(
@@ -79,14 +106,27 @@ pub async fn run(
             "--issue requires exactly one configured repository"
         );
     }
+    tracing::info!(
+        repos = ?config.repos.iter().map(|project| &project.repo).collect::<Vec<_>>(),
+        interval_secs = config.interval_secs,
+        publish = config.publish,
+        auto_fix = config.auto_fix,
+        worker_configured = config.worker.is_some(),
+        watch,
+        issue = ?only,
+        "Starting issue workflow"
+    );
     tokio::fs::create_dir_all(&config.scratch_dir).await?;
     // redb's exclusive file lock also prevents concurrent issue publishers using this state file.
     let store = Store::open(&config.state_path)?;
     let github = Github::new().await?;
     let mut cursors: HashMap<String, u64> = HashMap::new();
     loop {
+        let started = std::time::Instant::now();
+        tracing::info!("Starting issue polling cycle");
         let mut failures = 0;
         for project in &config.repos {
+            tracing::info!(repo = %project.repo, "Collecting issue and PR inventory");
             let inventory = match github.inventory(&project.repo).await {
                 Ok(items) => items,
                 Err(error) => {
@@ -104,7 +144,15 @@ pub async fn run(
                 .filter(|i| i.number > cursor)
                 .chain(targets.filter(|i| i.number <= cursor))
                 .collect();
+            tracing::info!(
+                repo = %project.repo,
+                inventory_items = inventory.len(),
+                eligible_issues = targets.len(),
+                max_items = config.max_items,
+                "Issue inventory collected"
+            );
             let mut processed = 0;
+            let mut cached_or_closed = 0;
             for item in targets {
                 if cancel.is_cancelled() {
                     return Ok(());
@@ -130,16 +178,28 @@ pub async fn run(
                 cursors.insert(project.repo.clone(), item.number);
                 if worked {
                     processed += 1;
+                } else {
+                    cached_or_closed += 1;
                 }
                 if processed >= config.max_items {
                     break;
                 }
             }
+            tracing::info!(repo = %project.repo, processed, cached_or_closed, "Issue repository pass complete");
         }
+        tracing::info!(
+            failures,
+            elapsed_secs = started.elapsed().as_secs(),
+            "Issue polling cycle complete"
+        );
         if !watch {
             ensure!(failures == 0, "{failures} issue workflow operations failed");
             return Ok(());
         }
+        tracing::info!(
+            interval_secs = config.interval_secs,
+            "Waiting for next issue poll"
+        );
         tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(config.interval_secs)) => {} }
     }
 }
@@ -192,7 +252,12 @@ async fn process(
                 "Default branch changed since interrupted publication"
             );
             let inventory = github.inventory(&project.repo).await?;
-            let mut recheck = Triage::new(config.max_jev_cost_usd, &config.jev_base_url)?;
+            let mut recheck = Triage::new(
+                config.max_jev_cost_usd,
+                &config.jev_base_url,
+                store,
+                &project.repo,
+            )?;
             ensure!(
                 recheck
                     .classify(project, &fresh, &inventory, github)
@@ -225,12 +290,53 @@ async fn process(
     let fingerprint = digest(&(
         fingerprint(project, &issue, inventory, config.publish, config.auto_fix)?,
         &config.worker,
+        config.max_jev_cost_usd,
+        &config.jev_base_url,
+        super::triage::CACHE_VERSION,
+        crate::jev::MODEL,
     ))?;
     if record.fingerprint == fingerprint {
         return Ok(false);
     }
-    let mut triage = Triage::new(config.max_jev_cost_usd, &config.jev_base_url)?;
-    let mut decision = triage.classify(project, &issue, inventory, github).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    if let Some(retry) = &record.retry
+        && retry.fingerprint == fingerprint
+        && now < retry.not_before
+    {
+        tracing::info!(repo = %project.repo, issue = number, retry_at = retry.not_before, "Issue retry deferred");
+        return Ok(false);
+    }
+    tracing::info!(repo = %project.repo, issue = number, "Triaging issue");
+    let mut triage = Triage::new(
+        config.max_jev_cost_usd,
+        &config.jev_base_url,
+        store,
+        &project.repo,
+    )?;
+    let mut decision = match triage.classify(project, &issue, inventory, github).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            let failures = record
+                .retry
+                .as_ref()
+                .filter(|r| r.fingerprint == fingerprint)
+                .map_or(1, |r| r.failures.saturating_add(1));
+            let delay = (60_u64 * (1_u64 << failures.saturating_sub(1).min(6))).min(3600);
+            let failed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            record.retry = Some(Retry {
+                fingerprint,
+                failures,
+                not_before: failed_at + delay,
+            });
+            store.put(&key, &record)?;
+            return Err(error);
+        }
+    };
+    record.retry = None;
     // Persist model judgments before any side effect. The fingerprint is committed only after marking succeeds.
     record.decision = Some(decision.clone());
     store.put(&key, &record)?;
@@ -267,7 +373,12 @@ async fn process(
                         "Issue changed during fix; withholding publication"
                     );
                     let inventory = github.inventory(&project.repo).await?;
-                    let mut recheck = Triage::new(config.max_jev_cost_usd, &config.jev_base_url)?;
+                    let mut recheck = Triage::new(
+                        config.max_jev_cost_usd,
+                        &config.jev_base_url,
+                        store,
+                        &project.repo,
+                    )?;
                     decision = recheck
                         .classify(project, &fresh, &inventory, github)
                         .await?;
@@ -429,6 +540,13 @@ async fn process(
     record.fingerprint = fingerprint;
     record.decision = Some(decision);
     store.put(&key, &record)?;
+    tracing::info!(
+        repo = %project.repo,
+        issue = number,
+        route = ?record.decision.as_ref().map(|decision| &decision.route),
+        published = config.publish,
+        "Issue triage complete"
+    );
     Ok(true)
 }
 
@@ -449,7 +567,7 @@ fn links(numbers: &[u64]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-fn digest(value: &impl Serialize) -> Result<String> {
+pub(super) fn digest(value: &impl Serialize) -> Result<String> {
     Ok(sha256::Hash::hash(&serde_json::to_vec(value)?).to_string())
 }
 fn content_key(issue: &Item) -> Result<String> {
@@ -480,6 +598,7 @@ fn fingerprint(
                 &i.body,
                 i.open,
                 i.is_pr,
+                &i.comments,
                 if i.is_pr { i.updated_at.as_str() } else { "" },
             )
         })

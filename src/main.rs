@@ -926,6 +926,7 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
+                tracing::info!("Issue polling disabled: no [issues] configuration");
                 daemon::run_daemon(params, scheduler, cancel_token).await
             }
         }
