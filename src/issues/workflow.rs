@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::Duration,
+};
 
 use anyhow::{Result, ensure};
 use goose_providers::decision::DecisionResponse;
@@ -414,7 +418,7 @@ async fn process(
         && record.pr.is_none()
         && record.pending.is_none()
     {
-        let attempt_key = content_key(&issue)?;
+        let attempt_key = digest(&(content_key(&issue)?, super::triage::CACHE_VERSION))?;
         if record.attempted.as_deref() == Some(&attempt_key) {
             reroute(
                 project,
@@ -425,7 +429,17 @@ async fn process(
         } else if let Some(worker_config) = &config.worker {
             record.attempted = Some(attempt_key);
             store.put(&key, &record)?;
-            match worker::fix(worker_config, &issue, project, &config.scratch_dir, cancel).await {
+            let fix_kind = decision.fix_kind;
+            match worker::fix(
+                worker_config,
+                &issue,
+                project,
+                fix_kind,
+                &config.scratch_dir,
+                cancel,
+            )
+            .await
+            {
                 Ok(fix) if fix.report.status != "candidate" => {
                     let route = if fix.report.status == "needs_info" {
                         Route::NeedsInfo
@@ -462,6 +476,10 @@ async fn process(
                     };
                     decision = result?;
                     if decision.route == Route::Ready {
+                        ensure!(
+                            decision.fix_kind == fix_kind,
+                            "Validation policy changed during fix; withholding publication"
+                        );
                         decision
                             .labels
                             .retain(|label| !project.areas.iter().any(|a| &a.label == label));
@@ -590,7 +608,23 @@ async fn process(
             },
         );
     }
-    let body = render_comment(&decision, record.pr.as_deref());
+    let mut candidates = decision.matches.clone();
+    candidates.extend(&decision.related);
+    if let Some(number) = record
+        .pr
+        .as_deref()
+        .and_then(|url| url.rsplit('/').next()?.parse::<u64>().ok())
+    {
+        candidates.push(number);
+    }
+    let linked = if candidates.is_empty() {
+        HashSet::new()
+    } else {
+        github
+            .linked_work(&project.repo, &issue, &candidates)
+            .await?
+    };
+    let body = render_comment(&decision, record.pr.as_deref(), &linked);
     if config.publish {
         let fresh = github.issue(&project.repo, number).await?;
         ensure!(
@@ -631,22 +665,44 @@ fn reroute(project: &Project, decision: &mut Decision, route: Route, explanation
     decision.explanation = explanation.to_owned();
     decision.guidance = None;
 }
-fn render_comment(decision: &Decision, draft_pr: Option<&str>) -> Option<String> {
+fn render_comment(
+    decision: &Decision,
+    draft_pr: Option<&str>,
+    linked: &HashSet<u64>,
+) -> Option<String> {
+    let matches: Vec<_> = decision
+        .matches
+        .iter()
+        .copied()
+        .filter(|n| !linked.contains(n))
+        .collect();
+    let related: Vec<_> = decision
+        .related
+        .iter()
+        .copied()
+        .filter(|n| !linked.contains(n))
+        .collect();
     let mut parts = Vec::new();
     if let Some(guidance) = &decision.guidance {
         if !guidance.trim().is_empty() {
             parts.push(guidance.clone());
         }
-    } else if decision.route == Route::NeedsInfo || !decision.matches.is_empty() {
+    } else if decision.route == Route::NeedsInfo || !matches.is_empty() {
         parts.push(decision.explanation.clone());
     }
-    if !decision.matches.is_empty() {
-        parts.push(format!("Matching work: {}.", links(&decision.matches)));
+    if !matches.is_empty() {
+        parts.push(format!("Matching work: {}.", links(&matches)));
     }
-    if !decision.related.is_empty() {
-        parts.push(format!("Related work: {}.", links(&decision.related)));
+    if !related.is_empty() {
+        parts.push(format!("Related work: {}.", links(&related)));
     }
-    if let Some(url) = draft_pr {
+    if let Some(url) = draft_pr
+        && !url
+            .rsplit('/')
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| linked.contains(&n))
+    {
         parts.push(format!("Draft PR: {url}"));
     }
     (!parts.is_empty()).then(|| parts.join("\n\n"))
@@ -721,6 +777,7 @@ mod tests {
     #[test]
     fn comments_only_link_confirmed_work() {
         let mut decision = Decision {
+            fix_kind: super::super::FixKind::Bug,
             route: Route::NeedsDecision,
             labels: vec![],
             matches: vec![],
@@ -729,18 +786,21 @@ mod tests {
             guidance: None,
             explanation: "Coverage comparisons remain unresolved.".into(),
         };
-        assert_eq!(render_comment(&decision, None), None);
+        assert_eq!(render_comment(&decision, None, &HashSet::new()), None);
         decision.route = Route::Ready;
-        assert_eq!(render_comment(&decision, None), None);
+        assert_eq!(render_comment(&decision, None, &HashSet::new()), None);
         decision.route = Route::NeedsInfo;
         decision.explanation = "Please provide reproduction steps.".into();
         assert_eq!(
-            render_comment(&decision, None).as_deref(),
+            render_comment(&decision, None, &HashSet::new()).as_deref(),
             Some("Please provide reproduction steps.")
         );
         decision.route = Route::NeedsDecision;
         decision.guidance = Some("Should negative amounts be rejected or clamped to zero?".into());
-        assert_eq!(render_comment(&decision, None), decision.guidance);
+        assert_eq!(
+            render_comment(&decision, None, &HashSet::new()),
+            decision.guidance
+        );
         reroute(
             &project(),
             &mut decision,
@@ -750,15 +810,36 @@ mod tests {
         assert!(decision.guidance.is_none());
         decision.related.push(42);
         assert_eq!(
-            render_comment(&decision, None).as_deref(),
+            render_comment(&decision, None, &HashSet::new()).as_deref(),
             Some("Related work: #42.")
         );
         decision.related.clear();
         decision.matches.push(1834);
         decision.related.push(42);
         assert_eq!(
-            render_comment(&decision, Some("https://example.com/pr")).unwrap(),
+            render_comment(&decision, Some("https://example.com/pr"), &HashSet::new()).unwrap(),
             "Coverage comparisons remain unresolved.\n\nMatching work: #1834.\n\nRelated work: #42.\n\nDraft PR: https://example.com/pr"
+        );
+        assert_eq!(
+            render_comment(&decision, None, &HashSet::from([1834, 42])),
+            None
+        );
+        assert_eq!(
+            render_comment(&decision, None, &HashSet::from([1834])).as_deref(),
+            Some("Related work: #42.")
+        );
+        assert_eq!(
+            render_comment(
+                &decision,
+                Some("https://github.com/owner/repo/pull/1834"),
+                &HashSet::from([1834, 42])
+            ),
+            None
+        );
+        decision.guidance = Some("A specific question still needs an answer.".into());
+        assert_eq!(
+            render_comment(&decision, None, &HashSet::from([1834, 42])),
+            decision.guidance
         );
         let saved = serde_json::to_value(&decision).unwrap();
         assert_eq!(saved["unresolved"], serde_json::json!([1666, 2479]));

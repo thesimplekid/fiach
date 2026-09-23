@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -182,6 +182,59 @@ impl Github {
             2000,
         )
         .await
+    }
+
+    /// Existing references are only a comment deduplication signal, not fix evidence.
+    pub async fn linked_work(
+        &self,
+        repo: &str,
+        issue: &Item,
+        candidates: &[u64],
+    ) -> Result<HashSet<u64>> {
+        let mut linked = HashSet::new();
+        for number in candidates {
+            if std::iter::once(&issue.title)
+                .chain(std::iter::once(&issue.body))
+                .chain(issue.comments.iter())
+                .any(|text| mentions_work(text, repo, *number))
+            {
+                linked.insert(*number);
+            }
+        }
+        for event in pages(
+            &format!("repos/{repo}/issues/{}/timeline", issue.number),
+            2000,
+        )
+        .await?
+        {
+            if matches!(
+                event["event"].as_str(),
+                Some("cross-referenced" | "connected")
+            ) {
+                for url in [
+                    event["source"]["issue"]["html_url"].as_str(),
+                    event["subject"]["url"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    for prefix in [
+                        format!("https://github.com/{repo}/pull/"),
+                        format!("https://github.com/{repo}/issues/"),
+                        format!("https://api.github.com/repos/{repo}/pulls/"),
+                        format!("https://api.github.com/repos/{repo}/issues/"),
+                    ] {
+                        if let Some(number) = url
+                            .strip_prefix(&prefix)
+                            .and_then(|tail| tail.parse::<u64>().ok())
+                        {
+                            linked.insert(number);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(linked)
     }
 
     /// None means the diff exceeded the local or GitHub limit; no partial evidence is returned.
@@ -552,10 +605,34 @@ fn api_output(
     Ok(body.to_vec())
 }
 
+fn mentions_work(text: &str, repo: &str, number: u64) -> bool {
+    [
+        format!("#{number}"),
+        format!("{repo}#{number}"),
+        format!("https://github.com/{repo}/pull/{number}"),
+        format!("https://github.com/{repo}/issues/{number}"),
+    ]
+    .iter()
+    .any(|reference| {
+        text.match_indices(reference).any(|(offset, _)| {
+            let before = text[..offset].chars().next_back();
+            let after = text[offset + reference.len()..].chars().next();
+            before.is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '/' | '_' | '-' | '#' | '='))
+                && after.is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '_' | '-'))
+        })
+    })
+}
+
 async fn pages(endpoint: &str, max: usize) -> Result<Vec<Value>> {
     let mut result = vec![];
+    let separator = if endpoint.contains('?') { '&' } else { '?' };
     for page in 1.. {
-        let value = api(&format!("{endpoint}&per_page=100&page={page}"), "GET", None).await?;
+        let value = api(
+            &format!("{endpoint}{separator}per_page=100&page={page}"),
+            "GET",
+            None,
+        )
+        .await?;
         let values = value.as_array().context("Expected GitHub list")?;
         result.extend(values.iter().cloned());
         ensure!(
@@ -667,6 +744,32 @@ fn candidate_diff(repo: &str, number: u64, output: LimitedOutput) -> Result<Opti
         anyhow::bail!("Fetching diff for {repo}#{number} failed: {stderr}");
     }
     Ok(Some(String::from_utf8(output.stdout)?))
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    #[test]
+    fn references_require_exact_numbers_and_repository() {
+        for text in [
+            "PR: #2504",
+            "See owner/repo#2504.",
+            "[PR](https://github.com/owner/repo/pull/2504)",
+            "https://github.com/owner/repo/issues/2504#issuecomment-1",
+        ] {
+            assert!(mentions_work(text, "owner/repo", 2504), "{text}");
+        }
+        for text in [
+            "#25040",
+            "other/repo#2504",
+            "https://github.com/other/repo/pull/2504",
+            "word#2504",
+            "#2504abc",
+        ] {
+            assert!(!mentions_work(text, "owner/repo", 2504), "{text}");
+        }
+    }
 }
 
 #[cfg(test)]

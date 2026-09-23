@@ -39,6 +39,19 @@ description = "Testing infrastructure and test coverage; not every fix that adds
 paths = ["tests/**", "test-support/**"]
 auto_fix = true
 
+# Routine Rust toolchain updates use existing build/tests rather than a failing
+# regression test. Both the area and these exact paths must be enabled.
+[[issues.repos.areas]]
+label = "area:tooling"
+description = "Rust toolchain version pins and directly required lockfile updates"
+paths = ["rust-toolchain.toml", "rust-toolchain", "flake.nix", "flake.lock", "Cargo.lock"]
+auto_fix = true
+
+# For CDK, also enable an area covering crates/cdk/src/wallet/** and the
+# regression test paths you want the worker to edit. Disabled overlaps win.
+# On deployment, the policy version triggers fresh triage and permits one new
+# attempt under the updated policy; existing/pending PRs are still deduplicated.
+
 # Optional names for managed labels. Other project labels are preserved.
 [issues.repos.labels]
 bug = "bug"

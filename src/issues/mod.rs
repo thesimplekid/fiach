@@ -31,8 +31,19 @@ pub enum Route {
     Ready,
 }
 
+/// Host-selected validation policy; the coder cannot downgrade a bug to maintenance.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FixKind {
+    #[default]
+    Bug,
+    Maintenance,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
+    #[serde(default)]
+    pub fix_kind: FixKind,
     pub route: Route,
     pub labels: Vec<String>,
     pub matches: Vec<u64>,

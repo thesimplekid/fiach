@@ -76,6 +76,7 @@ elif path.startswith(root + '/issues/'):
     tail = path[len(root + '/issues/'):].split('/')
     n = int(tail[0]); issue = next(i for i in s['items'] if i['number'] == n)
     if len(tail) == 1: result = issue
+    elif tail[1] == 'timeline': result = s.get('timeline', {}).get(str(n), [])
     elif tail[1] == 'comments':
         comments = s['comments'].setdefault(str(n), [])
         if method == 'POST':
@@ -341,6 +342,45 @@ async fn unlinked_open_pr_is_marked_and_diff_checked_without_closing_or_duplicat
 }
 
 #[tokio::test]
+async fn already_linked_work_uses_labels_without_repeating_the_link() {
+    for source in ["body", "comment", "timeline", "foreign_timeline"] {
+        let (dir, server, _) = setup("bug", "same", true, true).await;
+        let mut state = fixture(dir.path());
+        match source {
+            "body" => state["items"][0]["body"] = json!("Already tracked in PR: #2"),
+            "comment" => {
+                state["comments"]["1"] = json!([{"id":51,"user":{"login":"maintainer"},"body":"See https://github.com/owner/repo/pull/2"}])
+            }
+            _ => {
+                state["timeline"] = json!({"1":[{"event":"cross-referenced","source":{"issue":{"html_url":if source == "timeline" { "https://github.com/owner/repo/pull/2" } else { "https://github.com/other/repo/pull/2" }}}}]})
+            }
+        }
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        let state = fixture(dir.path());
+        assert!(
+            state["items"][0]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|label| label["name"] == "already-being-addressed")
+        );
+        let comments = state["comments"]["1"].as_array().unwrap();
+        assert_eq!(
+            comments
+                .iter()
+                .filter(|c| c["user"]["login"] == "fiach-bot")
+                .count(),
+            usize::from(source == "foreign_timeline")
+        );
+        if source == "comment" {
+            assert_eq!(comments[0]["id"], 51);
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn dry_run_emits_multiple_areas_without_writing_github() {
     let (dir, server, _) = setup("bug", "same", false, false).await;
     let output = run(dir.path()).await;
@@ -394,7 +434,19 @@ output = next(a.split('=',1)[1].split(':')[0] for a in args if a.startswith('--b
 i = json.load(open(request)); workspace = root + '/workspace'
 with open(os.environ['FIXTURE'] + '.phases','a') as f: f.write(i['phase'] + '\n')
 report = {'status':'candidate','summary':'Fix persisted amount','test_files':['tests/test_amount.py'],'reproduction':['python3','tests/test_amount.py'],'approved':False}
-if i['phase'] == 'code':
+if i['phase'] == 'code' and i['fix_kind'] == 'maintenance':
+    open(workspace + '/rust-toolchain.toml','w').write('[toolchain]\nchannel = "1.98.1"\n')
+    open(workspace + '/flake.lock','w').write('{}\n')
+    report['summary'] = 'Update Rust toolchain'
+    report['test_files'] = []
+    report['reproduction'] = ['python3','-c','import pathlib, py_compile; py_compile.compile("calc.py", doraise=True); assert chr(34)+"1.98.1"+chr(34) in pathlib.Path("rust-toolchain.toml").read_text()']
+    fixture = json.load(open(os.environ['FIXTURE']))
+    if fixture.get('fail_maintenance_check'):
+        report['reproduction'] = ['python3','-c','raise RuntimeError("build failed")']
+    subprocess.check_call(['git','add','-N','.'],cwd=workspace)
+    patch = subprocess.check_output(['git','diff','--binary',i['base']],cwd=workspace)
+    open(output + '/patch.diff','wb').write(patch)
+elif i['phase'] == 'code':
     fixture = json.load(open(os.environ['FIXTURE']))
     if fixture.get('concurrent_pr'):
         fixture['items'].append({'number':2,'title':'Fix funding amount','body':'Already implemented','state':'open','updated_at':'new','labels':[],'pull_request':{'url':'unused'}})
@@ -419,7 +471,8 @@ elif i['phase'] == 'check':
     json.dump({'success':p.returncode==0,'output':p.stdout+p.stderr},open(output + '/check.json','w'))
     sys.exit(0)
 elif i['phase'] == 'verify':
-    assert 'Host regression command' in i['report']['summary']
+    expected = 'Host maintenance build/test command' if i['fix_kind'] == 'maintenance' else 'Host regression command'
+    assert expected in i['report']['summary']
     fixture = json.load(open(os.environ['FIXTURE']))
     report['approved'] = not fixture.get('reject_verifier',False)
     report['status'] = 'verified' if report['approved'] else 'needs_decision'
@@ -502,6 +555,46 @@ async fn verified_fix_runs_real_regression_on_base_and_patch_then_opens_one_draf
     assert_ok(&run(dir.path()).await);
     assert_eq!(fixture(dir.path())["prs"].as_array().unwrap().len(), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn maintenance_requires_passing_checks_and_independent_verification() {
+    for (fail_check, reject_verifier) in [(false, false), (true, false), (false, true)] {
+        let (dir, server, _) = setup("maintenance", "different", false, true).await;
+        enable_worker(dir.path(), reject_verifier).await;
+        let config_path = dir.path().join("fiach.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "paths = [\"calc.py\", \"tests/**\"]",
+            "paths = [\"rust-toolchain.toml\", \"flake.lock\"]",
+        );
+        std::fs::write(config_path, config).unwrap();
+        if fail_check {
+            set_flag(dir.path(), "fail_maintenance_check");
+        }
+        assert_ok(&run(dir.path()).await);
+        let state = fixture(dir.path());
+        if fail_check || reject_verifier {
+            assert!(state.get("prs").is_none());
+        } else {
+            assert_eq!(state["prs"].as_array().unwrap().len(), 1);
+            assert_eq!(state["prs"][0]["draft"], true);
+        }
+        let phases = std::fs::read_to_string(dir.path().join("fixture.json.phases")).unwrap();
+        assert_eq!(
+            phases,
+            if fail_check {
+                "code\ncheck\n"
+            } else {
+                "code\ncheck\nverify\n"
+            }
+        );
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("fixture.json.phases")).unwrap(),
+            phases
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test]

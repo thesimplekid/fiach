@@ -230,7 +230,7 @@ mod tests {
             .unwrap();
         config.validate().unwrap();
         assert!(!config.publish);
-        assert_eq!(config.repos[0].areas.len(), 4);
+        assert_eq!(config.repos[0].areas.len(), 5);
         assert!(!config.repos[0].areas[0].auto_fix);
         assert!(config.repos[0].areas[2].auto_fix);
     }
