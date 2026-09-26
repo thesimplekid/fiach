@@ -65,7 +65,6 @@ impl DiffCache {
 
 pub(super) struct Github {
     pub login: String,
-    candidates: Mutex<HashMap<(String, u64), Item>>,
     diffs: Mutex<DiffCache>,
 }
 
@@ -74,14 +73,12 @@ impl Github {
         let user = api("user", "GET", None).await?;
         Ok(Self {
             login: string(&user, "login")?,
-            candidates: Mutex::new(HashMap::new()),
             diffs: Mutex::new(DiffCache::default()),
         })
     }
 
     pub async fn inventory(&self, repo: &str) -> Result<Vec<Item>> {
         // Each inventory (including pre-publication rechecks) starts a fresh evidence pass.
-        self.candidates.lock().await.clear();
         self.diffs.lock().await.clear();
         let mut result = Vec::new();
         // The work batch limit must not truncate evidence. Stream all pages, discarding
@@ -146,21 +143,6 @@ impl Github {
             "Issue changed while collecting evidence"
         );
         Ok(result)
-    }
-
-    /// Share detailed candidates within one inventory pass; target reads remain fresh.
-    pub async fn candidate(&self, repo: &str, number: u64) -> Result<Item> {
-        let key = (repo.to_owned(), number);
-        if let Some(item) = self.candidates.lock().await.get(&key).cloned() {
-            return Ok(item);
-        }
-        let item = self.issue(repo, number).await?;
-        let mut cache = self.candidates.lock().await;
-        if cache.len() >= 1024 {
-            cache.clear();
-        }
-        cache.insert(key, item.clone());
-        Ok(item)
     }
 
     fn comment_text(&self, comment: &Value) -> Option<String> {
@@ -605,7 +587,7 @@ fn api_output(
     Ok(body.to_vec())
 }
 
-fn mentions_work(text: &str, repo: &str, number: u64) -> bool {
+pub(super) fn mentions_work(text: &str, repo: &str, number: u64) -> bool {
     [
         format!("#{number}"),
         format!("{repo}#{number}"),

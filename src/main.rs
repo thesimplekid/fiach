@@ -135,6 +135,17 @@ enum Commands {
         #[arg(long)]
         issue: Option<u64>,
     },
+    /// Inspect stored coverage judgments in an offline state database (no API calls)
+    IssueCoverage {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        issue: u64,
+        #[arg(long)]
+        candidate: Option<u64>,
+    },
     /// Internal isolated issue worker
     #[command(hide = true)]
     IssueWorker {
@@ -495,6 +506,12 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Missing [issues] configuration"))?;
             fiach::issues::run(issues, watch, issue, cancel_token).await
         }
+        Commands::IssueCoverage {
+            state,
+            repo,
+            issue,
+            candidate,
+        } => fiach::issues::inspect_coverage(&state, &repo, issue, candidate),
         Commands::IssueWorker { input } => fiach::issues::run_child(input, cancel_token).await,
         Commands::Review {
             repo,

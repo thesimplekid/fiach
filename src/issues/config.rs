@@ -16,6 +16,7 @@ pub struct IssueConfig {
     pub max_items: usize,
     pub max_jev_cost_usd: f64,
     pub jev_base_url: String,
+    pub coverage: CoverageConfig,
     pub worker: Option<WorkerConfig>,
 }
 
@@ -32,6 +33,27 @@ impl Default for IssueConfig {
             max_jev_cost_usd: 0.25,
             jev_base_url: "https://api.typesafe.ai".into(),
             worker: None,
+            coverage: CoverageConfig::default(),
+        }
+    }
+}
+
+/// Resource limits for coverage screening and deeper investigation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CoverageConfig {
+    /// Opt in to batches after evaluating against individual comparisons.
+    pub batch_size: usize,
+    pub max_investigations: usize,
+    pub max_investigation_cost_usd: f64,
+}
+
+impl Default for CoverageConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            max_investigations: 16,
+            max_investigation_cost_usd: 0.05,
         }
     }
 }
@@ -164,6 +186,15 @@ impl IssueConfig {
         ensure!(
             self.scratch_dir.is_absolute(),
             "Issue scratch_dir must be absolute"
+        );
+        ensure!(
+            (1..=8).contains(&self.coverage.batch_size),
+            "Coverage batch_size must be between 1 and 8"
+        );
+        ensure!(
+            self.coverage.max_investigation_cost_usd.is_finite()
+                && self.coverage.max_investigation_cost_usd >= 0.0,
+            "Invalid coverage investigation budget"
         );
         let mut repos = HashSet::new();
         for project in &self.repos {

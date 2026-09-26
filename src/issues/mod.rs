@@ -1,12 +1,13 @@
 //! Issue classification, duplicate marking, and independently verified draft fixes.
 pub mod config;
+mod coverage;
 mod github;
 mod triage;
 mod worker;
 mod workflow;
 
 pub use worker::run_child;
-pub use workflow::run;
+pub use workflow::{inspect_coverage, run};
 
 use serde::{Deserialize, Serialize};
 

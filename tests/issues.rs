@@ -188,22 +188,40 @@ async fn setup(
             if request["state"]["candidate"]["body"] == "CONTEXT_LIMIT" && request["state"]["pr_diff"].is_string() {
                 return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"detail":{"error_type":"context_length_exceeded","message":"State plus question exceeds token limit"}})));
             }
+            if let Some(candidates) = request["state"]["candidates"].as_object()
+                && candidates.values().any(|c| c["body"] == "BATCH_CONTEXT_LIMIT") {
+                return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"detail":{"error_type":"context_length_exceeded","message":"State plus question exceeds token limit"}})));
+            }
             let questions = request["questions"].as_object().unwrap();
             let mut answers = serde_json::Map::new();
             for (id, q) in questions {
-                let selected = match id.as_str() {
+                let candidate = id.strip_prefix("candidate_")
+                    .map(|number| &request["state"]["candidates"][number])
+                    .unwrap_or(&request["state"]["candidate"]);
+                let question_kind = if id.starts_with("candidate_") {
+                    if q["criteria"].get("relevant").is_some() { "relevance" } else { "match" }
+                } else { id.as_str() };
+                let selected = match question_kind {
                     "kind" => kind,
                     "information" => if request["state"]["issue"]["body"] == "MISSING_INFO" { "missing_reproduction" } else { "sufficient" },
                     "direction" => if kind == "feature" { "needs_decision" } else { "established" },
                     "area_0" if request["state"]["issue"]["body"] == "UNCERTAIN_AREA" => "uncertain",
                     "area_2" => "no",
-                    "relevance" => if request["state"]["candidate"]["comments"].to_string().contains("RELEVANCE_CONFIRMED") { "relevant" } else if request["state"]["candidate"]["comments"].to_string().contains("RELEVANCE_REJECTED") { "different" } else if request["state"]["candidate"]["body"] == "RELEVANCE_UNCERTAIN" { "uncertain" } else if request["state"]["candidate"]["body"] == "RELEVANCE_DIFFERENT" { "different" } else { "relevant" },
-                    "match" => if request["state"]["candidate"]["comments"].to_string().contains("SAME_NOW") { "same" } else if request["state"]["pr_diff"].is_string() || request["state"]["candidate"]["is_pr"] == false { matching } else { "uncertain" },
+                    "relevance" => if candidate["comments"].to_string().contains("RELEVANCE_CONFIRMED") { "relevant" } else if candidate["comments"].to_string().contains("RELEVANCE_REJECTED") { "different" } else if candidate["body"] == "RELEVANCE_UNCERTAIN" { "uncertain" } else if candidate["body"] == "RELEVANCE_DIFFERENT" { "different" } else { "relevant" },
+                    "match" if candidate["body"] == "MATCH_SAME" => "same",
+                    "match" if candidate["body"] == "MATCH_RELATED" => "related",
+                    "match" if candidate["body"] == "RESOLVE_ISSUE" => if request["state"]["investigate"] == true { "different" } else { "uncertain" },
+                    "match" if candidate["body"] == "LOW_CONFIDENCE" => "different",
+                    "match" => if candidate["comments"].to_string().contains("SAME_NOW") { "same" } else if request["state"]["pr_diff"].is_string() || candidate["is_pr"] == false { matching } else { "uncertain" },
                     _ => "yes",
                 };
                 let options = q["criteria"].as_object().unwrap();
                 let probabilities: serde_json::Map<String,Value> = options.keys().map(|k| (k.clone(), json!(if k == selected {1.0} else {0.0}))).collect();
-                answers.insert(id.clone(), json!({"type":"choice","choice":selected,"confidence":1.0,"probabilities":probabilities}));
+                answers.insert(id.clone(), json!({"type":"choice","choice":selected,"confidence":if candidate["body"] == "LOW_CONFIDENCE" {0.93} else {1.0},"probabilities":probabilities}));
+            }
+            if request["state"]["candidates"].as_object().is_some_and(|cs| cs.values().any(|c| c["body"] == "INCOMPLETE_BATCH")) {
+                let last = answers.keys().next_back().unwrap().clone();
+                answers.remove(&last);
             }
             if fail_once {
                 let key = if questions.contains_key("relevance") { "relevance" } else { "match" };
@@ -1021,7 +1039,7 @@ async fn issue_rate_limit_stops_the_pass_before_other_issues_or_publication() {
     let (dir, server, _) = setup("bug", "same", true, true).await;
     let mut state = fixture(dir.path());
     state["scan_all"] = json!(true);
-    state["rate_limit_endpoint"] = json!("repos/owner/repo/issues/2");
+    state["rate_limit_endpoint"] = json!("repos/owner/repo/pulls/2");
     state["items"].as_array_mut().unwrap().push(item(3, false));
     std::fs::write(
         dir.path().join("fixture.json"),
@@ -1038,7 +1056,7 @@ async fn issue_rate_limit_stops_the_pass_before_other_issues_or_publication() {
     assert_eq!(
         calls
             .iter()
-            .filter(|c| c[3] == "repos/owner/repo/issues/2")
+            .filter(|c| c[3] == "repos/owner/repo/pulls/2")
             .count(),
         1
     );
@@ -1075,8 +1093,8 @@ async fn candidate_details_and_unchanged_diffs_are_shared_across_issues() {
                 .iter()
                 .filter(|c| c[3] == "repos/owner/repo/issues/2")
                 .count(),
-            2,
-            "The candidate should be fetched once, with its pagination consistency reread"
+            0,
+            "The complete inventory already contains candidate bodies and discussion"
         );
         assert_eq!(
             calls
@@ -1098,10 +1116,10 @@ async fn candidate_details_and_unchanged_diffs_are_shared_across_issues() {
 }
 
 #[tokio::test]
-async fn pr_relevance_screens_diffs_without_turning_uncertainty_into_clearance() {
+async fn pr_relevance_investigates_uncertainty_without_turning_it_into_clearance() {
     for (body, discussion, fetch_diff, expected_label) in [
         ("RELEVANCE_DIFFERENT", "", false, "ready-for-agent"),
-        ("RELEVANCE_UNCERTAIN", "", false, "ready-for-agent"),
+        ("RELEVANCE_UNCERTAIN", "", true, "already-being-addressed"),
         (
             "RELEVANCE_UNCERTAIN",
             "RELEVANCE_CONFIRMED",
@@ -1773,6 +1791,364 @@ async fn information_decisions_and_uncertainty_block_workers_for_distinct_reason
             body == "UNCERTAIN_AREA"
         );
         assert!(!dir.path().join("fixture.json.phases").exists());
+        server.abort();
+    }
+}
+
+async fn coverage_records(dir: &Path) -> Value {
+    let number = fixture(dir)["items"][0]["number"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_fiach"))
+        .args(["issue-coverage", "--state"])
+        .arg(dir.join("state.redb"))
+        .args(["--repo", "owner/repo", "--issue", &number])
+        .env_remove("TYPESAFE_API_KEY")
+        .output()
+        .await
+        .unwrap();
+    assert_ok(&output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn coverage_config(dir: &Path, settings: &str) {
+    let path = dir.join("fiach.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, format!("{config}\n[issues.coverage]\n{settings}\n")).unwrap();
+}
+
+#[tokio::test]
+async fn coverage_inspection_retains_raw_scores_and_blocking_reasons_without_api_calls() {
+    let (dir, server, _) = setup("bug", "different", false, false).await;
+    let mut state = fixture(dir.path());
+    let mut candidate = item(2, false);
+    candidate["body"] = json!("LOW_CONFIDENCE");
+    state["items"].as_array_mut().unwrap().push(candidate);
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    let calls = std::fs::read(dir.path().join("fixture.json.calls")).unwrap();
+    let before = std::fs::read(dir.path().join("state.redb")).unwrap();
+    let records = coverage_records(dir.path()).await;
+    assert_eq!(records["decision"]["route"], "ready");
+    assert_eq!(records["decision"]["auto_fix_eligible"], false);
+    assert_eq!(records["comparisons"].as_array().unwrap().len(), 2);
+    for record in records["comparisons"].as_array().unwrap() {
+        assert_eq!(record["selected"], "different");
+        assert_eq!(record["confidence"], 0.93);
+        assert_eq!(record["probability"], 1.0);
+        assert_eq!(record["outcome"], "uncertain");
+        assert_eq!(record["reason"], "low_confidence");
+        assert!(!record["evidence_fingerprint"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(
+        std::fs::read(dir.path().join("state.redb")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("fixture.json.calls")).unwrap(),
+        calls
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn ambiguous_issue_gets_a_distinct_cached_investigation_using_the_snapshot() {
+    let (dir, server, requests) = setup("maintenance", "different", false, true).await;
+    let mut state = fixture(dir.path());
+    let mut candidate = item(2, false);
+    candidate["body"] = json!("RESOLVE_ISSUE");
+    state["items"].as_array_mut().unwrap().push(candidate);
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    let records = coverage_records(dir.path()).await;
+    assert_eq!(records["decision"]["unresolved"], json!([]));
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    let records = records["comparisons"].as_array().unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "screening" && r["reason"] == "model_uncertain")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "investigation" && r["outcome"] == "different")
+    );
+    let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+    assert!(!calls.lines().any(|line| {
+        let args: Value = serde_json::from_str(line).unwrap();
+        args[3]
+            .as_str()
+            .is_some_and(|s| s.starts_with("repos/owner/repo/issues/2"))
+    }));
+    let mut state = fixture(dir.path());
+    state["items"].as_array_mut().unwrap().push(item(3, false));
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        4,
+        "Do not repeat the cached ambiguous screen or investigation"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn batched_screening_matches_individual_routes_and_caches_each_pair() {
+    for size in [1, 4] {
+        let (dir, server, requests) = setup("toolchain_update", "different", false, false).await;
+        coverage_config(dir.path(), &format!("batch_size = {size}"));
+        let mut state = fixture(dir.path());
+        for number in 2..=10 {
+            state["items"]
+                .as_array_mut()
+                .unwrap()
+                .push(item(number, false));
+        }
+        save_fixture(dir.path(), &state);
+        let output = run(dir.path()).await;
+        assert_ok(&output);
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["decision"]["route"], "ready");
+        assert_eq!(result["decision"]["unresolved"], json!([]));
+        let count = requests.lock().unwrap().len();
+        assert_eq!(count, 1 + 9_usize.div_ceil(size));
+        let records = coverage_records(dir.path()).await;
+        assert_eq!(records["comparisons"].as_array().unwrap().len(), 9);
+        // An unrelated candidate must not invalidate or rebill the original batch.
+        state["items"].as_array_mut().unwrap().push(item(11, false));
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(requests.lock().unwrap().len(), count + 1);
+        // Changing grouping policy also preserves individual answer caches.
+        let path = dir.path().join("fiach.toml");
+        let config = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(&format!("batch_size = {size}"), "batch_size = 2");
+        std::fs::write(path, config).unwrap();
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(requests.lock().unwrap().len(), count + 1);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn investigation_limits_preserve_readiness_and_cannot_authorize_workers() {
+    for settings in ["max_investigations = 0", "max_investigation_cost_usd = 0.0"] {
+        let (dir, server, requests) = setup("bug", "uncertain", true, true).await;
+        enable_worker(dir.path(), false).await;
+        coverage_config(dir.path(), settings);
+        assert_ok(&run(dir.path()).await);
+        let records = coverage_records(dir.path()).await;
+        assert_eq!(records["decision"]["route"], "ready");
+        assert_eq!(records["decision"]["unresolved"], json!([2]));
+        assert_eq!(records["decision"]["auto_fix_eligible"], false);
+        assert!(!dir.path().join("fixture.json.phases").exists());
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let expected = if settings.starts_with("max_investigations") {
+            "investigation_limit"
+        } else {
+            "investigation_budget"
+        };
+        assert!(
+            records["comparisons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["reason"] == expected)
+        );
+        let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+        assert!(!calls.contains("\"pr\", \"diff\""));
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn provider_rejected_batches_split_without_losing_candidates() {
+    let (dir, server, requests) = setup("maintenance", "different", false, false).await;
+    coverage_config(dir.path(), "batch_size = 4");
+    let mut state = fixture(dir.path());
+    for number in 2..=5 {
+        let mut candidate = item(number, false);
+        candidate["body"] = json!("BATCH_CONTEXT_LIMIT");
+        state["items"].as_array_mut().unwrap().push(candidate);
+    }
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    let records = coverage_records(dir.path()).await;
+    assert_eq!(records["decision"]["unresolved"], json!([]));
+    assert_eq!(records["comparisons"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        8,
+        "classification, rejected batch and halves, four successful singleton comparisons"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn incomplete_batch_response_cannot_cache_partial_clearance_or_publish() {
+    let (dir, server, requests) = setup("bug", "different", false, true).await;
+    enable_worker(dir.path(), false).await;
+    coverage_config(dir.path(), "batch_size = 4");
+    let mut state = fixture(dir.path());
+    for number in 2..=5 {
+        let mut candidate = item(number, false);
+        candidate["body"] = json!("INCOMPLETE_BATCH");
+        state["items"].as_array_mut().unwrap().push(candidate);
+    }
+    save_fixture(dir.path(), &state);
+    assert!(!run(dir.path()).await.status.success());
+    assert!(!dir.path().join("fixture.json.phases").exists());
+    let records = coverage_records(dir.path()).await;
+    assert!(records["decision"].is_null());
+    assert_eq!(records["comparisons"].as_array().unwrap().len(), 4);
+    assert!(
+        records["comparisons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["reason"] == "provider_error")
+    );
+    // Individual retries must still evaluate every pair: no partial batch was cached.
+    let path = dir.path().join("fiach.toml");
+    let config = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("batch_size = 4", "batch_size = 1");
+    std::fs::write(path, config).unwrap();
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        6,
+        "classification, failed batch, four individual comparisons"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn cached_issue_investigations_leave_allowance_for_later_candidates() {
+    let (dir, server, requests) = setup("maintenance", "different", false, false).await;
+    coverage_config(dir.path(), "max_investigations = 1");
+    let mut state = fixture(dir.path());
+    for number in 2..=3 {
+        let mut candidate = item(number, false);
+        candidate["body"] = json!("RESOLVE_ISSUE");
+        state["items"].as_array_mut().unwrap().push(candidate);
+    }
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(
+        coverage_records(dir.path()).await["decision"]["unresolved"],
+        json!([3])
+    );
+    let count = requests.lock().unwrap().len();
+    // New inventory triggers reconsideration without changing the earlier pair.
+    state["items"].as_array_mut().unwrap().push(item(4, false));
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(
+        coverage_records(dir.path()).await["decision"]["unresolved"],
+        json!([])
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        count + 2,
+        "one new screen and the previously blocked investigation"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn local_batch_byte_limit_keeps_full_evidence_and_all_candidates() {
+    let (dir, server, requests) = setup("maintenance", "different", false, false).await;
+    coverage_config(dir.path(), "batch_size = 8");
+    let mut state = fixture(dir.path());
+    for number in 2..=4 {
+        let mut candidate = item(number, false);
+        candidate["body"] = json!("x".repeat(40 * 1024));
+        state["items"].as_array_mut().unwrap().push(candidate);
+    }
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    let received = requests.lock().unwrap();
+    assert_eq!(received.len(), 4);
+    for request in &received[1..] {
+        assert_eq!(
+            request["state"]["candidate"]["body"]
+                .as_str()
+                .unwrap()
+                .len(),
+            40 * 1024
+        );
+        assert!(serde_json::to_vec(request).unwrap().len() < 64 * 1024);
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn explicit_references_get_investigation_first_without_dropping_other_candidates() {
+    let (dir, server, _) = setup("bug", "uncertain", true, false).await;
+    coverage_config(dir.path(), "max_investigations = 1");
+    let mut state = fixture(dir.path());
+    let mut referenced = item(3, true);
+    referenced["body"] = json!("Follow-up for #1");
+    state["items"].as_array_mut().unwrap().push(referenced);
+    save_fixture(dir.path(), &state);
+    assert_ok(&run(dir.path()).await);
+    let records = coverage_records(dir.path()).await;
+    assert_eq!(records["comparisons"].as_array().unwrap().len(), 4);
+    assert!(
+        records["comparisons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["candidate"] == 2 && r["reason"] == "investigation_limit")
+    );
+    let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+    let diffs: Vec<Value> = calls
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|c| c[0] == "pr" && c[1] == "diff")
+        .collect();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0][2], "3");
+    server.abort();
+}
+
+#[tokio::test]
+async fn mixed_batch_answers_remain_bound_to_their_candidates_and_match_individual_results() {
+    for size in [1, 4] {
+        let (dir, server, _) = setup("maintenance", "different", false, false).await;
+        coverage_config(dir.path(), &format!("batch_size = {size}"));
+        let mut state = fixture(dir.path());
+        state["items"][0]["number"] = json!(10);
+        for (number, pr, body) in [
+            (2, false, "MATCH_SAME"),
+            (3, false, "MATCH_RELATED"),
+            (4, true, "RELEVANCE_UNCERTAIN"),
+            (5, true, "RELEVANCE_DIFFERENT"),
+            (6, false, "LOW_CONFIDENCE"),
+            (7, false, "RESOLVE_ISSUE"),
+        ] {
+            let mut candidate = item(number, pr);
+            candidate["body"] = json!(body);
+            state["items"].as_array_mut().unwrap().push(candidate);
+        }
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        let records = coverage_records(dir.path()).await;
+        assert_eq!(records["decision"]["route"], "duplicate");
+        assert_eq!(records["decision"]["matches"], json!([2]));
+        assert_eq!(records["decision"]["related"], json!([3]));
+        assert_eq!(records["decision"]["unresolved"], json!([6]));
+        assert!(
+            records["comparisons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["task_kind"] == "maintenance")
+        );
         server.abort();
     }
 }

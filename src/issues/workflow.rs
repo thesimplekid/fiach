@@ -4,22 +4,26 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use goose_providers::decision::DecisionResponse;
 use nostr::hashes::{Hash, sha256};
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, TableHandle,
+};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     Decision, Item, Route,
     config::{IssueConfig, Project},
+    coverage::ComparisonRecord,
     github::{self, Github, git},
     triage::{Triage, route_label},
     worker,
 };
 
 const RECORDS: TableDefinition<&str, &str> = TableDefinition::new("issue_workflow_v1");
+const COMPARISONS: TableDefinition<&str, &str> = TableDefinition::new("issue_coverage_v1");
 const ANSWERS: TableDefinition<&str, &str> = TableDefinition::new("issue_jev_answers_v1");
 
 #[derive(Default, Serialize, Deserialize)]
@@ -58,6 +62,7 @@ impl Store {
         {
             tx.open_table(RECORDS)?;
             tx.open_table(ANSWERS)?;
+            tx.open_table(COMPARISONS)?;
         }
         tx.commit()?;
         Ok(Self(db))
@@ -79,6 +84,23 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    pub(super) fn save_comparison(&self, record: &ComparisonRecord) -> Result<()> {
+        let key = format!(
+            "{}#{}/{}/{:?}",
+            record.repo, record.issue, record.candidate, record.stage
+        );
+        let value = serde_json::to_string(record)?;
+        let tx = self.0.begin_write()?;
+        {
+            let mut table = tx.open_table(COMPARISONS)?;
+            if table.get(key.as_str())?.is_some_and(|v| v.value() == value) {
+                return Ok(());
+            }
+            table.insert(key.as_str(), value.as_str())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub(super) fn answer(&self, key: &str) -> Result<Option<DecisionResponse>> {
         let tx = self.0.begin_read()?;
         let table = tx.open_table(ANSWERS)?;
@@ -96,6 +118,46 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Read an offline state database without creating files or contacting providers.
+pub fn inspect_coverage(path: &Path, repo: &str, issue: u64, candidate: Option<u64>) -> Result<()> {
+    ensure!(super::config::valid_repo(repo), "Invalid repository");
+    let db = ReadOnlyDatabase::open(path)
+        .context("Open issue state for read-only inspection; stop its writer or use a consistent offline snapshot")?;
+    let tx = db.begin_read()?;
+    let records = tx.open_table(RECORDS)?;
+    let key = format!("{repo}#{issue}");
+    let decision = records
+        .get(key.as_str())?
+        .map(|v| serde_json::from_str::<Record>(v.value()))
+        .transpose()?
+        .and_then(|r| r.decision);
+    let mut comparisons = Vec::new();
+    if tx
+        .list_tables()?
+        .any(|table| table.name() == "issue_coverage_v1")
+    {
+        let table = tx.open_table(COMPARISONS)?;
+        let prefix = format!("{key}/");
+        for row in table.range(prefix.as_str()..)? {
+            let (key, value) = row?;
+            if !key.value().starts_with(&prefix) {
+                break;
+            }
+            let record: ComparisonRecord = serde_json::from_str(value.value())?;
+            if candidate.is_none_or(|id| id == record.candidate) {
+                comparisons.push(record);
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "repo": repo, "issue": issue, "decision": decision, "comparisons": comparisons
+        }))?
+    );
+    Ok(())
 }
 
 pub async fn run(
@@ -313,6 +375,7 @@ async fn process(
                 &config.jev_base_url,
                 store,
                 &project.repo,
+                &config.coverage,
             )?;
             let Some(decision) = cancel
                 .run_until_cancelled(recheck.classify(project, &fresh, &inventory, github))
@@ -354,6 +417,7 @@ async fn process(
     let fingerprint = digest(&(
         fingerprint(project, &issue, inventory, config.publish, config.auto_fix)?,
         &config.worker,
+        &config.coverage,
         config.max_jev_cost_usd,
         &config.jev_base_url,
         super::triage::CACHE_VERSION,
@@ -378,6 +442,7 @@ async fn process(
         &config.jev_base_url,
         store,
         &project.repo,
+        &config.coverage,
     )?;
     // Cancel only read-only evidence work. Publication and worker cleanup keep
     // their existing journal/cleanup paths rather than being dropped mid-write.
@@ -469,6 +534,7 @@ async fn process(
                         &config.jev_base_url,
                         store,
                         &project.repo,
+                        &config.coverage,
                     )?;
                     let Some(result) = cancel
                         .run_until_cancelled(recheck.classify(project, &fresh, &inventory, github))

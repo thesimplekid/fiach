@@ -10,6 +10,12 @@ scratch_dir = "/data/rust/tmp"
 max_items = 1000 # Changed issues per pass; complete duplicate evidence is still collected.
 max_jev_cost_usd = 0.25 # Per issue classification pass, including duplicate comparisons.
 
+# Keep singleton screening until batched accuracy is evaluated on real pairs.
+[issues.coverage]
+batch_size = 1 # 1..8; batches also have an encoded-byte limit.
+max_investigations = 16
+max_investigation_cost_usd = 0.05 # Also subject to the overall per-issue budget.
+
 [[issues.repos]]
 repo = "owner/repo"
 

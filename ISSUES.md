@@ -40,11 +40,12 @@ state files for the same repositories.
 Validated Jev responses are saved individually in that database. Comparisons
 reuse unchanged evidence across passes and restarts; adding one candidate does
 not repeat every older model request. Cache keys include the repository, Jev
-endpoint/model, prompts, and evidence. Triage policy version 10 invalidates both
-model-answer caches and whole-issue decisions, so unchanged issues are reclassified
-after deployment without deleting state or losing publication journals. Changed
-human comments (including edits and deletions) invalidate affected comparisons; the bot's marked status comments
-do not. Discussions are collected in repository-wide pages, including comments
+endpoint/model, prompts, task kind, comparison stage, and complete evidence.
+Triage policy version 11 invalidates whole-issue decisions so unchanged issues
+are reconsidered after deployment. Model answers use independent schema versions:
+a routing-only change does not discard unchanged comparisons. Changed human
+comments (including edits and deletions) invalidate affected comparisons; the
+bot's marked status comments do not. Discussions are collected in repository-wide pages, including comments
 on closed issues. An incomplete discussion scan stops the pass.
 
 If classification fails or exhausts its budget, completed requests remain
@@ -84,8 +85,12 @@ verification rules support only Rust toolchain updates; broader maintenance need
 its own validation policy before execution can be enabled.
 
 Duplicate comparisons use both open/closed issues and open PRs. Fiach compares
-each entry in the complete inventory; plausible candidates get full discussion,
-and PR coverage requires a diff. Definite partial overlap is reported as related
+each entry in the complete inventory, including its full discussion. Duplicate
+questions compare the requested work; PR coverage requires a diff and must address
+the entire task. Bug comparisons consider failure conditions and root cause,
+Rust updates consider target versions and tooling, and mutation reports consider
+specific survivors and requested tests. A PR addressing one survivor is partial
+overlap, not coverage of an entire report. Definite partial overlap is reported as related
 work. Uncertain coverage blocks automatic execution but does not change a clear
 task's `ready-for-agent` classification.
 A confirmed duplicate is marked and linked, never closed. An open covering PR
@@ -101,10 +106,75 @@ failures stop that attempt instead of interpreting incomplete evidence as permis
 to fix. Progress logs identify comparison milestones and candidate PR evidence
 fetches.
 
-GitHub candidate details are reused within an inventory pass. PR diffs are reused
-only after checking that the PR is still open and both its head and base revisions
-match. Every new inventory, including checks before fix publication, clears these
-bounded in-memory caches; target-issue reads and publication checks stay fresh.
+Screening uses the complete inventory snapshot rather than rereading each
+candidate through the issue and comment endpoints. The inventory is still
+collected in full on every pass. PR diffs are reused only after checking that the
+PR is still open and both its head and base revisions match. Every new inventory,
+including checks before fix publication, clears the bounded diff cache;
+target-issue reads and publication checks stay fresh.
+
+### Coverage investigation and diagnostics
+
+Every candidate is screened, with explicit references and shared path mentions
+prioritized. These hints affect ordering only and never exclude evidence. An uncertain
+issue comparison gets one distinct, task-specific investigation of the supplied
+evidence. Relevant or uncertain PRs get complete diff evidence, including changed
+paths, for their investigation. No partial diff or path summary can authorize a
+covering-PR result. Completed uncertain model answers are cached, so unchanged
+inputs do not cause repeated paid requests.
+
+`[issues.coverage]` configures resource limits:
+
+```toml
+[issues.coverage]
+batch_size = 1
+max_investigations = 16
+max_investigation_cost_usd = 0.05
+```
+
+Investigation has both a candidate limit and an additional cost limit, still
+subject to the overall `max_jev_cost_usd`. A limit or exhausted investigation
+budget records an unresolved comparison and blocks execution without changing a
+clear task's readiness. Cached issue investigations consume no new investigation
+allowance. PR investigations still require fresh revision checks and count toward
+the candidate limit. Increasing limits allows previously blocked work to proceed.
+Incomplete screening due to an overall budget or provider failure stops marking;
+successful earlier answers survive retries.
+
+Batch sizes from 1 to 8 are supported. Multiple candidate questions share the
+target issue while requiring a separate validated answer for each candidate ID.
+Batches are bounded at 64 KiB of encoded request data; larger individual
+candidates are sent alone, subject to the existing request limit. Provider context
+rejections split batches down to single candidates without truncating evidence.
+Each answer is cached independently, so changing one candidate or the grouping
+size does not invalidate its neighbors. Batch size remains 1 by default until
+real comparisons have been evaluated for accuracy. For evaluation, use separate
+state files with `publish = false`, identical evidence, and batch sizes 1 and 8;
+compare outcomes and scores before enabling batching in production. Sharing a
+state file would reuse the first run's answers rather than evaluate both modes.
+The test suite checks grouping, completeness, and cache behavior with controlled
+model responses; it does not establish live model accuracy.
+
+Inspect structured comparisons without GitHub or provider access:
+
+```sh
+fiach issue-coverage --state /path/to/issues.redb --repo cashubtc/cdk --issue 2587
+# Add --candidate 2605 to inspect one pair.
+```
+
+Use an offline database: stop its writer or inspect a consistent snapshot. The
+command opens redb read-only and never creates a missing database. Existing
+pre-diagnostics databases show an empty comparison list until reclassification.
+Records contain the task kind, stage, evidence fingerprints, selected answer,
+full probability distribution, confidence, threshold, policy outcome, cache status
+and blocking reason.
+Reasons distinguish low confidence, explicit model uncertainty, request/context
+limits, unavailable diffs, investigation limits, exhausted budgets, and provider
+errors. The latest record per candidate and stage is retained, including partial
+failed passes; compare evidence fingerprints when inspecting old stages or
+removed candidates. The decision's `unresolved` list identifies its blockers.
+Per-issue completion logs include request/cache counts, investigation count,
+reason counts by stage observation, unresolved count, and cost.
 
 The issue workflow honors GitHub's rate-limit reset and Retry-After headers. It
 stops the pass when quota is exhausted and, in watch mode, waits until requests
