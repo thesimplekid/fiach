@@ -53,7 +53,7 @@ pub struct Area {
     pub description: String,
     #[serde(default)]
     pub paths: Vec<String>,
-    /// If false, issues touching this area always require a maintainer.
+    /// Permission to execute fixes; does not determine issue readiness.
     #[serde(default)]
     pub auto_fix: bool,
 }
@@ -69,6 +69,7 @@ pub struct Labels {
     pub addressed: String,
     pub needs_info: String,
     pub needs_decision: String,
+    pub needs_review: String,
     pub ready: String,
 }
 
@@ -83,6 +84,7 @@ impl Default for Labels {
             addressed: "already-being-addressed".into(),
             needs_info: "needs-info".into(),
             needs_decision: "needs-decision".into(),
+            needs_review: "needs-review".into(),
             ready: "ready-for-agent".into(),
         }
     }
@@ -100,6 +102,7 @@ impl Project {
             &l.addressed,
             &l.needs_info,
             &l.needs_decision,
+            &l.needs_review,
             &l.ready,
         ]
         .into_iter()

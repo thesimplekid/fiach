@@ -321,7 +321,7 @@ async fn process(
                 return Ok(false);
             };
             ensure!(
-                decision?.route == Route::Ready,
+                decision?.ready_for_execution(),
                 "Issue no longer eligible for interrupted publication"
             );
             record.pr = Some(
@@ -414,7 +414,7 @@ async fn process(
     store.put(&key, &record)?;
     if config.publish
         && config.auto_fix
-        && decision.route == Route::Ready
+        && decision.ready_for_execution()
         && record.pr.is_none()
         && record.pending.is_none()
     {
@@ -423,7 +423,7 @@ async fn process(
             reroute(
                 project,
                 &mut decision,
-                Route::NeedsDecision,
+                Route::NeedsReview,
                 "A fix was already attempted for this issue content. A maintainer must inspect the previous run before another attempt.",
             );
         } else if let Some(worker_config) = &config.worker {
@@ -443,8 +443,10 @@ async fn process(
                 Ok(fix) if fix.report.status != "candidate" => {
                     let route = if fix.report.status == "needs_info" {
                         Route::NeedsInfo
-                    } else {
+                    } else if fix.report.status == "needs_decision" {
                         Route::NeedsDecision
+                    } else {
+                        Route::NeedsReview
                     };
                     reroute(project, &mut decision, route, &fix.report.summary);
                     decision.guidance = Some(fix.report.summary.clone());
@@ -475,7 +477,7 @@ async fn process(
                         return Ok(false);
                     };
                     decision = result?;
-                    if decision.route == Route::Ready {
+                    if decision.ready_for_execution() {
                         ensure!(
                             decision.fix_kind == fix_kind,
                             "Validation policy changed during fix; withholding publication"
@@ -573,7 +575,7 @@ async fn process(
                     reroute(
                         project,
                         &mut decision,
-                        Route::NeedsDecision,
+                        Route::NeedsReview,
                         "The automatic investigation or independent verification did not complete successfully. A maintainer must inspect the worker results.",
                     );
                 }
@@ -584,7 +586,7 @@ async fn process(
         reroute(
             project,
             &mut decision,
-            Route::NeedsDecision,
+            Route::NeedsReview,
             "Pending fix publication is paused because automatic fixes or the worker are disabled.",
         );
     }
@@ -599,7 +601,7 @@ async fn process(
             if open {
                 Route::Addressed
             } else {
-                Route::NeedsDecision
+                Route::NeedsReview
             },
             if open {
                 "A Fiach draft PR already exists for this issue. Further changes require maintainer review."
@@ -662,6 +664,7 @@ fn reroute(project: &Project, decision: &mut Decision, route: Route, explanation
         .labels
         .push(route_label(project, &route).to_owned());
     decision.route = route;
+    decision.auto_fix_eligible = false;
     decision.explanation = explanation.to_owned();
     decision.guidance = None;
 }
@@ -779,6 +782,8 @@ mod tests {
         let mut decision = Decision {
             fix_kind: super::super::FixKind::Bug,
             route: Route::NeedsDecision,
+            auto_fix_eligible: false,
+            area_uncertain: false,
             labels: vec![],
             matches: vec![],
             related: vec![],

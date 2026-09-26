@@ -54,6 +54,7 @@ auto_fix = true
 
 # Optional names for managed labels. Other project labels are preserved.
 [issues.repos.labels]
+needs_review = "needs-review" # Uncertain evidence or execution limits, not a product choice.
 bug = "bug"
 feature = "enhancement"
 documentation = "documentation"

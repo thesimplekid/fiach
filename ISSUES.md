@@ -40,8 +40,10 @@ state files for the same repositories.
 Validated Jev responses are saved individually in that database. Comparisons
 reuse unchanged evidence across passes and restarts; adding one candidate does
 not repeat every older model request. Cache keys include the repository, Jev
-endpoint/model, prompts, and evidence. Changed human comments (including edits
-and deletions) invalidate affected comparisons; the bot's marked status comments
+endpoint/model, prompts, and evidence. Triage policy version 10 invalidates both
+model-answer caches and whole-issue decisions, so unchanged issues are reclassified
+after deployment without deleting state or losing publication journals. Changed
+human comments (including edits and deletions) invalidate affected comparisons; the bot's marked status comments
 do not. Discussions are collected in repository-wide pages, including comments
 on closed issues. An incomplete discussion scan stops the pass.
 
@@ -64,21 +66,37 @@ Deletes and both sides of renames are checked. Description-only areas are valid
 for triage, but automatic fixes require explicit paths for every area.
 Every applicable area must permit automation, at least one area
 must match, and no area's applicability may be uncertain before coding starts.
-Unknown applicability, missing context, and product-direction choices go back to
-maintainers. A detailed feature request does not establish project intent.
+Readiness is independent of permissions: disabled global or area automation does
+not imply an unresolved maintainer choice. `ready-for-agent` means sufficient
+context and established direction; it does not authorize execution. The stored
+`auto_fix_eligible` judgment additionally requires confirmed area applicability,
+area permissions, resolved coverage, and a supported worker policy. Launch and
+publication also require global `auto_fix`, `publish`, and a configured worker.
+A detailed feature request does not by itself establish project intent.
+
+Routine Rust updates with an explicit target and affected tooling are actionable.
+Routine test maintenance, including concrete mutation-survivor investigation, is
+also actionable: selecting useful tests and assessing equivalent mutations are
+engineering work. A survivor is evidence to investigate, not proof of a production
+bug. Test maintenance currently uses `fix_kind = "investigation"` and cannot run
+automatically, even with all permissions enabled. The maintenance worker and its
+verification rules support only Rust toolchain updates; broader maintenance needs
+its own validation policy before execution can be enabled.
 
 Duplicate comparisons use both open/closed issues and open PRs. Fiach compares
 each entry in the complete inventory; plausible candidates get full discussion,
 and PR coverage requires a diff. Definite partial overlap is reported as related
-work. Uncertain coverage requires a maintainer decision and prevents a new fix.
+work. Uncertain coverage blocks automatic execution but does not change a clear
+task's `ready-for-agent` classification.
 A confirmed duplicate is marked and linked, never closed. An open covering PR
 gets `already-being-addressed`. Related-work judgments require both selected
 probability and confidence of at least 0.95; shared topics alone are insufficient.
 Low-confidence comparisons and oversized PR diffs are recorded internally as
 unresolved coverage and never published as related links. Other comparisons
-continue; unresolved coverage
-requires a maintainer decision unless another candidate establishes a duplicate or
-covering PR. It never authorizes an automatic fix. Pagination, command, or Jev
+continue; unresolved coverage is retained in the decision's `unresolved` list.
+Uncertain or unassigned areas are recorded as `area_uncertain`. Neither changes
+task readiness, and both block automatic execution. A confirmed duplicate or
+covering PR still overrides readiness. Pagination, command, or Jev
 failures stop that attempt instead of interpreting incomplete evidence as permission
 to fix. Progress logs identify comparison milestones and candidate PR evidence
 fetches.
@@ -105,10 +123,16 @@ remain uncertain. Missing options, invalid values, and larger or unexplained
 discrepancies still stop the attempt with a question-specific diagnostic.
 
 Only the configured managed labels are reconciled. Unrelated human labels remain.
-Missing configured labels are created. `needs-decision` indicates maintainer review;
-`bug` plus `ready-for-agent` indicates eligibility for investigation, not an estimate
-of fix complexity. The bot edits only a comment bearing its marker **and** authored
-by the authenticated account. When a re-evaluated issue needs labels only, it
+Missing configured labels are created. `needs-decision` is reserved for a concrete
+unresolved maintainer choice or conflicting requirements. `needs-info` requests
+essential missing information. `needs-review` represents uncertainty about the task
+itself (kind, sufficient context, or intended direction), context limits, and
+execution/verification failures. Area or coverage uncertainty alone leaves a clear
+task ready and sets `auto_fix_eligible = false`.
+Its name is configurable with `labels.needs_review`. Operational blocks do not
+establish a product decision. `bug` plus `ready-for-agent` indicates actionable
+investigation, not an estimate of fix complexity or permission to execute. The bot
+edits only a comment bearing its marker **and** authored by the authenticated account. When a re-evaluated issue needs labels only, it
 removes its own marked triage comments while preserving human and unrelated bot
 comments. Use a dedicated bot account.
 
@@ -117,8 +141,14 @@ comments. Use a dedicated bot account.
 The host clones the default branch before starting an isolated Goose coding
 session. The agent must either explain what information/decision is missing, or
 return a patch, separate regression-test paths, and a reproduction command.
-The host applies the patch to a pristine checkout and rejects protected paths
-(hidden top-level paths, Git metadata, agent instructions, and Cargo.lock).
+For toolchain updates (`fix_kind = "maintenance"`), the host permits only scoped
+Rust toolchain, Nix and Cargo lock changes. Existing relevant tests/builds must
+pass under the requested toolchain and an independent verifier must approve the
+patch; no failing baseline or fabricated regression is required. This policy
+must not be used for test maintenance.
+
+For bugs, the host applies the patch to a pristine checkout and rejects protected
+paths (hidden top-level paths, Git metadata, agent instructions, and Cargo.lock).
 
 Two fresh containers run the identical regression command: first on the original
 code with only regression tests applied (must fail), then on the complete patch
@@ -138,7 +168,7 @@ Paused publication is retained and can resume after re-enabling automation. The
 area policy must match the policy under which the patch was checked; old journals
 without that evidence or changed policies require maintainer intervention.
 A missing or changed pending branch stops for inspection.
-Closed prior bot PRs require a maintainer decision rather than another PR.
+Closed prior bot PRs receive `needs-review` and do not trigger another PR.
 
 Failed/interrupted coding attempts are not repeated for unchanged issue content.
 A substantive issue/comment update permits another investigation. Keep the state

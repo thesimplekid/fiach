@@ -193,8 +193,9 @@ async fn setup(
             for (id, q) in questions {
                 let selected = match id.as_str() {
                     "kind" => kind,
-                    "information" => "sufficient",
-                    "direction" => "established",
+                    "information" => if request["state"]["issue"]["body"] == "MISSING_INFO" { "missing_reproduction" } else { "sufficient" },
+                    "direction" => if kind == "feature" { "needs_decision" } else { "established" },
+                    "area_0" if request["state"]["issue"]["body"] == "UNCERTAIN_AREA" => "uncertain",
                     "area_2" => "no",
                     "relevance" => if request["state"]["candidate"]["comments"].to_string().contains("RELEVANCE_CONFIRMED") { "relevant" } else if request["state"]["candidate"]["comments"].to_string().contains("RELEVANCE_REJECTED") { "different" } else if request["state"]["candidate"]["body"] == "RELEVANCE_UNCERTAIN" { "uncertain" } else if request["state"]["candidate"]["body"] == "RELEVANCE_DIFFERENT" { "different" } else { "relevant" },
                     "match" => if request["state"]["candidate"]["comments"].to_string().contains("SAME_NOW") { "same" } else if request["state"]["pr_diff"].is_string() || request["state"]["candidate"]["is_pr"] == false { matching } else { "uncertain" },
@@ -560,7 +561,7 @@ async fn verified_fix_runs_real_regression_on_base_and_patch_then_opens_one_draf
 #[tokio::test]
 async fn maintenance_requires_passing_checks_and_independent_verification() {
     for (fail_check, reject_verifier) in [(false, false), (true, false), (false, true)] {
-        let (dir, server, _) = setup("maintenance", "different", false, true).await;
+        let (dir, server, _) = setup("toolchain_update", "different", false, true).await;
         enable_worker(dir.path(), reject_verifier).await;
         let config_path = dir.path().join("fiach.toml");
         let config = std::fs::read_to_string(&config_path).unwrap().replace(
@@ -609,7 +610,7 @@ async fn verifier_rejection_marks_for_maintainer_and_does_not_retry_unchanged_is
             .as_array()
             .unwrap()
             .iter()
-            .any(|l| l["name"] == "needs-decision")
+            .any(|l| l["name"] == "needs-review")
     );
     let phases = std::fs::read_to_string(dir.path().join("fixture.json.phases")).unwrap();
     assert_ok(&run(dir.path()).await);
@@ -763,7 +764,7 @@ async fn disabled_automation_pauses_pending_publication_and_can_resume() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|l| l["name"] == "needs-decision")
+                .any(|l| l["name"] == "needs-review")
         );
         assert!(state["comments"]["1"].as_array().unwrap().is_empty());
         std::fs::write(&config_path, enabled).unwrap();
@@ -822,7 +823,7 @@ auto_fix = false
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|l| l["name"] == "needs-decision")
+                .any(|l| l["name"] == "needs-review")
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("fixture.json.phases")).unwrap(),
@@ -1100,7 +1101,7 @@ async fn candidate_details_and_unchanged_diffs_are_shared_across_issues() {
 async fn pr_relevance_screens_diffs_without_turning_uncertainty_into_clearance() {
     for (body, discussion, fetch_diff, expected_label) in [
         ("RELEVANCE_DIFFERENT", "", false, "ready-for-agent"),
-        ("RELEVANCE_UNCERTAIN", "", false, "needs-decision"),
+        ("RELEVANCE_UNCERTAIN", "", false, "ready-for-agent"),
         (
             "RELEVANCE_UNCERTAIN",
             "RELEVANCE_CONFIRMED",
@@ -1206,7 +1207,7 @@ async fn oversized_initial_classification_is_marked_once_without_starting_worker
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|l| l["name"] == "needs-decision")
+                .any(|l| l["name"] == "needs-review")
         );
         assert!(state["comments"]["1"].as_array().unwrap().is_empty());
         assert!(!dir.path().join("fixture.json.phases").exists());
@@ -1308,7 +1309,7 @@ async fn oversized_candidate_evidence_preserves_uncertainty_and_continues_compar
         let expected = if matching == "same" {
             "already-being-addressed"
         } else {
-            "needs-decision"
+            "ready-for-agent"
         };
         assert!(
             state["items"][0]["labels"]
@@ -1647,4 +1648,131 @@ async fn incomplete_discussion_inventory_cannot_reuse_a_cached_decision() {
     let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
     assert!(!calls.contains("POST"));
     server.abort();
+}
+
+#[tokio::test]
+async fn actionable_tasks_keep_readiness_separate_from_execution_permissions() {
+    for (kind, coverage) in ["bug", "toolchain_update", "maintenance"]
+        .into_iter()
+        .flat_map(|kind| ["different", "uncertain"].map(move |coverage| (kind, coverage)))
+    {
+        for (global, areas) in [(false, false), (false, true), (true, false), (true, true)] {
+            // Existing worker tests cover executable bugs and toolchain updates.
+            if global && areas && kind != "maintenance" && coverage == "different" {
+                continue;
+            }
+            let (dir, server, requests) =
+                setup(kind, coverage, coverage == "uncertain", true).await;
+            enable_worker(dir.path(), false).await;
+            let path = dir.path().join("fiach.toml");
+            let mut config = std::fs::read_to_string(&path).unwrap();
+            if !areas {
+                config = config.replace("auto_fix = true", "auto_fix = false");
+            }
+            config = config.replacen(
+                if areas {
+                    "auto_fix = true"
+                } else {
+                    "auto_fix = false"
+                },
+                if global {
+                    "auto_fix = true"
+                } else {
+                    "auto_fix = false"
+                },
+                1,
+            );
+            std::fs::write(path, config).unwrap();
+            let mut state = fixture(dir.path());
+            state["items"][0]["body"] = json!(if kind == "toolchain_update" {
+                "Update Rust to 1.98.1 in rust-toolchain.toml and flake.nix; refresh flake.lock."
+            } else if kind == "maintenance" {
+                "Investigate survivors in crates/cashu/src/nuts/nut16.rs: replacing current_index with 0. Add useful tests and assess equivalent mutations."
+            } else {
+                "Expected stored amount, got zero. Reproduction supplied."
+            });
+            save_fixture(dir.path(), &state);
+            let output = run(dir.path()).await;
+            assert_ok(&output);
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["decision"]["route"], "ready");
+            assert_eq!(
+                result["decision"]["auto_fix_eligible"],
+                areas && kind != "maintenance" && coverage == "different"
+            );
+            assert_eq!(
+                result["decision"]["unresolved"],
+                if coverage == "uncertain" {
+                    json!([2])
+                } else {
+                    json!([])
+                }
+            );
+            assert!(!dir.path().join("fixture.json.phases").exists());
+            assert!(fixture(dir.path()).get("prs").is_none());
+            assert!(
+                !result["decision"]["labels"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("needs-decision"))
+            );
+            assert_eq!(
+                result["decision"]["fix_kind"],
+                if kind == "toolchain_update" {
+                    "maintenance"
+                } else if kind == "maintenance" {
+                    "investigation"
+                } else {
+                    "bug"
+                }
+            );
+            // Permissions are not model evidence of intent.
+            assert!(
+                requests.lock().unwrap()[0]["state"]["areas"][0]
+                    .get("auto_fix")
+                    .is_none()
+            );
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn information_decisions_and_uncertainty_block_workers_for_distinct_reasons() {
+    for (kind, body, coverage, pr, expected) in [
+        (
+            "feature",
+            "Choose reject or clamp for negative amounts",
+            "different",
+            false,
+            "needs_decision",
+        ),
+        ("bug", "MISSING_INFO", "different", false, "needs_info"),
+        ("bug", "UNCERTAIN_AREA", "different", false, "ready"),
+        (
+            "uncertain",
+            "Unclear classification",
+            "different",
+            false,
+            "needs_review",
+        ),
+        ("bug", "Concrete bug", "uncertain", true, "ready"),
+    ] {
+        let (dir, server, _) = setup(kind, coverage, pr, true).await;
+        enable_worker(dir.path(), false).await;
+        let mut state = fixture(dir.path());
+        state["items"][0]["body"] = json!(body);
+        save_fixture(dir.path(), &state);
+        let output = run(dir.path()).await;
+        assert_ok(&output);
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["decision"]["route"], expected);
+        assert_eq!(result["decision"]["auto_fix_eligible"], false);
+        assert_eq!(
+            result["decision"]["area_uncertain"],
+            body == "UNCERTAIN_AREA"
+        );
+        assert!(!dir.path().join("fixture.json.phases").exists());
+        server.abort();
+    }
 }
