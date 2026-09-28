@@ -1215,6 +1215,7 @@ fn log_summon_tool_request(
 /// 4. Appends the selected persona to the system prompt (extras mode)
 /// 5. Loads the `developer` Platform extension (in-process, no subprocess)
 /// 6. Sends the review request and streams the agent's response to stdout
+#[tracing::instrument(skip_all, fields(repo = %params.repo, pr = params.pr_number, provider = %params.provider, stage = "finder"))]
 pub async fn run_review(
     params: ReviewParams,
     cancel_token: CancellationToken,
@@ -1902,6 +1903,9 @@ pub async fn run_review(
                                                     break;
                                                 }
                                                 Err(e) => {
+                                                    if is_fatal_error(&e) {
+                                                        return Err(e).context("Fatal provider error sending budget nudge");
+                                                    }
                                                     tracing::error!(
                                                         "Failed to send budget nudge: {}, retrying...",
                                                         e
@@ -3023,6 +3027,7 @@ async fn restrict_coordinator_to_reporting(agent: &Agent, session_id: &str) -> R
     Ok(())
 }
 
+#[tracing::instrument(skip_all, fields(repo = params.repo, pr = params.pr_number, provider = params.provider_name, stage = "duplicate_suppression"))]
 async fn resume_coordinator_for_duplicates(params: DedupeParams<'_>) -> Result<()> {
     let agent = params.agent;
     let session_config = params.session_config;
@@ -3236,6 +3241,7 @@ struct VerificationParams<'a> {
     cancel_token: CancellationToken,
 }
 
+#[tracing::instrument(skip_all, fields(repo = params.repo, pr = params.pr_number, provider = params.provider_name, stage = "verifier"))]
 async fn run_verification_pass(params: VerificationParams<'_>) -> Result<VerificationStats> {
     if cost_budget_reached(Some(0.0), params.max_cost_usd) {
         return Ok(VerificationStats {
@@ -3582,7 +3588,7 @@ fn fatal_error_message(msg: &str) -> bool {
 /// but should not stop the daemon.
 pub fn is_nonfatal_review_completion_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string().to_lowercase();
-    if fatal_error_message(&msg) {
+    if is_fatal_error(e) {
         return false;
     }
 
@@ -3593,8 +3599,9 @@ pub fn is_nonfatal_review_completion_error(e: &anyhow::Error) -> bool {
 
 /// Returns true if the error is a non-transient failure that should not be retried.
 pub fn is_fatal_error(e: &anyhow::Error) -> bool {
-    let msg = e.to_string().to_lowercase();
-    fatal_error_message(&msg)
+    crate::request_diagnostics::permanent_rejection(e)
+        || e.chain()
+            .any(|cause| fatal_error_message(&cause.to_string().to_lowercase()))
 }
 
 #[cfg(test)]
@@ -3738,6 +3745,20 @@ Reviewed the PR and found no vulnerabilities.
 
             assert!(!is_nonfatal_review_completion_error(&error));
             assert!(is_fatal_error(&error));
+        }
+    }
+
+    #[test]
+    fn rejected_requests_are_terminal_through_context_and_sandbox_errors() {
+        for message in [
+            "Bad request (400): invalid max_tokens",
+            "Request failed with status 422 Unprocessable Entity",
+        ] {
+            let error = anyhow::anyhow!(message).context("Fatal provider error");
+            assert!(is_fatal_error(&error));
+            assert!(!is_nonfatal_review_completion_error(&error));
+            let sandbox = anyhow::anyhow!("Sandboxed review failed: {error:#}");
+            assert!(is_fatal_error(&sandbox));
         }
     }
 

@@ -41,7 +41,15 @@ struct Retry {
     fingerprint: String,
     failures: u32,
     not_before: u64,
+    #[serde(default)]
+    permanent: bool,
 }
+impl Retry {
+    fn blocks(&self, fingerprint: &str, now: u64) -> bool {
+        self.fingerprint == fingerprint && (self.permanent || now < self.not_before)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Publication {
     branch: String,
@@ -430,10 +438,9 @@ async fn process(
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     if let Some(retry) = &record.retry
-        && retry.fingerprint == fingerprint
-        && now < retry.not_before
+        && retry.blocks(&fingerprint, now)
     {
-        tracing::info!(repo = %project.repo, issue = number, retry_at = retry.not_before, "Issue retry deferred");
+        tracing::info!(repo = %project.repo, issue = number, retry_at = retry.not_before, permanent = retry.permanent, "Issue retry deferred");
         return Ok(false);
     }
     tracing::info!(repo = %project.repo, issue = number, "Triaging issue");
@@ -468,6 +475,7 @@ async fn process(
                 fingerprint,
                 failures,
                 not_before: failed_at + delay,
+                permanent: crate::request_diagnostics::permanent_rejection(&error),
             });
             store.put(&key, &record)?;
             return Err(error);
@@ -825,6 +833,22 @@ fn fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_request_waits_for_changed_evidence_and_legacy_retries_expire() {
+        let mut retry: super::Retry = serde_json::from_value(serde_json::json!({
+            "fingerprint": "a", "failures": 1, "not_before": 100
+        }))
+        .unwrap();
+        assert!(retry.blocks("a", 99));
+        assert!(!retry.blocks("a", 100));
+        retry.permanent = true;
+        let retry: super::Retry =
+            serde_json::from_slice(&serde_json::to_vec(&retry).unwrap()).unwrap();
+        assert!(retry.blocks("a", u64::MAX));
+        assert!(!retry.blocks("b", 0));
+    }
+
     fn item() -> Item {
         Item {
             number: 1,

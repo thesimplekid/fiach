@@ -202,6 +202,7 @@ pub(crate) async fn evaluate(
             remaining.as_secs_f64().ceil()
         );
     }
+    let question_count = request.questions.len();
     let response = match client
         .inner
         .create_decision(&DecisionRequest {
@@ -213,6 +214,16 @@ pub(crate) async fn evaluate(
     {
         Ok(response) => response,
         Err(error) => {
+            tracing::warn!(
+                provider = "typesafe",
+                model = MODEL,
+                requested_output_tokens = "not_sent",
+                input_bytes = bytes,
+                input_size_kind = "serialized_payload_bytes",
+                question_count,
+                failure_kind = crate::request_diagnostics::failure_kind(&error.to_string()),
+                "Decision request failed"
+            );
             if let Some(retry_after) = overload_retry_delay(&error) {
                 let mut cooldown = client
                     .provider
@@ -222,8 +233,10 @@ pub(crate) async fn evaluate(
                 let now = Instant::now();
                 let delay = cooldown.overload(now).max(retry_after);
                 cooldown.until = now.checked_add(delay).or(cooldown.until);
-                tracing::warn!(error = %error, cooldown_secs = delay.as_secs(),
-                    "Jev overloaded; pausing provider requests");
+                tracing::warn!(
+                    cooldown_secs = delay.as_secs(),
+                    "Jev overloaded; pausing provider requests"
+                );
             }
             return Err(error.into());
         }

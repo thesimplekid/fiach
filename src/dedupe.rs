@@ -181,6 +181,7 @@ pub(crate) async fn evaluate(
     outcome
 }
 
+#[tracing::instrument(skip_all, fields(stage = "jev_duplicate_suppression"))]
 async fn evaluate_with_client(
     client: &jev::Client,
     findings: &[AcceptedFinding],

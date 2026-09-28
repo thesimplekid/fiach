@@ -12,6 +12,7 @@ mod lane_selection;
 pub mod persona;
 pub mod process;
 pub mod reporting;
+pub mod request_diagnostics;
 pub mod review;
 pub mod scheduler;
 pub mod server;

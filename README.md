@@ -90,6 +90,22 @@ nix flake check --no-write-lock-file -L
 
 ## 📖 Usage Examples
 
+### Provider request diagnostics
+
+At the default `info` log level, provider request spans record the model,
+serialized payload bytes, and output-token limit actually sent. Review and issue
+stages attach repository and PR/issue context. Jev decision errors explicitly
+report `requested_output_tokens="not_sent"`. These diagnostics omit request and
+response bodies, credentials, and raw provider error text. Payload bytes include
+tools and settings; they are not input token counts. Error categories distinguish
+explicit context/output limits and leave ambiguous token-limit errors unspecified.
+
+Fiach treats HTTP 400/422 request rejections as terminal. PR reviews use the
+existing fatal-error policy (including stopping the daemon). Issue triage persists
+the rejection until its evidence/configuration fingerprint changes; transient
+failures retain timed backoff. Screening can still split oversized batches into
+smaller requests. Goose's own bounded transport retries remain separate.
+
 ### Review cost limits
 
 `max_cost_usd` (CLI: `--max-cost`, NixOS: `maxCostUsd`) limits observed spending

@@ -99,6 +99,7 @@ impl<'a> Triage<'a> {
         Ok(response)
     }
 
+    #[tracing::instrument(skip_all, fields(repo = %project.repo, issue = issue.number, stage = "issue_classification"))]
     pub async fn classify(
         &mut self,
         project: &Project,

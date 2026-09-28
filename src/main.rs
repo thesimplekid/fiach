@@ -481,6 +481,8 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
+    fiach::request_diagnostics::install()?;
+
     let cli = Cli::parse();
 
     // Load config

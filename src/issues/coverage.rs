@@ -269,6 +269,7 @@ impl<'a> Coverage<'a> {
         Ok(work)
     }
 
+    #[tracing::instrument(skip_all, fields(repo = self.scope.1, issue = issue.number, stage = "coverage_screening", candidate_kind = kind, batch_size = batch.len()))]
     async fn screen_batch(
         &mut self,
         issue: &Item,
@@ -391,6 +392,7 @@ impl<'a> Coverage<'a> {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(repo = self.scope.1, issue = issue.number, candidate = candidate.number, stage = "coverage_investigation", candidate_kind = kind))]
     async fn investigate(
         &mut self,
         issue: &Item,

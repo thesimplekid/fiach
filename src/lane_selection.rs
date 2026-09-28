@@ -227,6 +227,7 @@ pub(crate) async fn select(
     .await
 }
 
+#[tracing::instrument(skip_all, fields(stage = "lane_selection"))]
 async fn select_with_client(
     workspace: &Path,
     base: &str,
