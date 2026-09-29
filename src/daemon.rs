@@ -1327,9 +1327,9 @@ async fn process_daemon_job(
                 if cancel_token.is_cancelled() {
                     return Err(e);
                 }
-                tracing::error!("Failed to review PR {} in {}: {}", pr.number, repo, e);
+                tracing::error!(repo = %repo, pr = pr.number, error = %e, "Failed to review PR");
                 if !crate::review::is_nonfatal_review_completion_error(&e)
-                    && crate::review::is_fatal_error(&e)
+                    && crate::review::is_fatal_provider_error(&e)
                 {
                     tracing::error!("Fatal error encountered, stopping daemon");
                     return Err(e);

@@ -1708,8 +1708,14 @@ pub async fn run_review(
             budget_exceeded = true;
             return Ok(());
         }
-        let mut retries = 0;
-        let mut delay = params.retry_delay_secs;
+        let mut retry = ReplyRetry::new(
+            &agent,
+            &session_config,
+            &phase_cancel_token,
+            "finder",
+            params.max_retries,
+            params.retry_delay_secs,
+        );
         let mut budget_nudged = false;
         let mut cost_unavailable_warned = false;
         let mut last_assistant_text: Option<String> = None;
@@ -1718,44 +1724,7 @@ pub async fn run_review(
             .unwrap_or_else(Instant::now);
         let mut summon_log_state = SummonLaneLogState::default();
 
-        let mut stream = loop {
-            let user_message_clone = user_message.clone();
-            let session_config_clone = session_config.clone();
-
-            match agent
-                .reply(
-                    user_message_clone,
-                    session_config_clone,
-                    state_machine::enabled(),
-                    Some(phase_cancel_token.clone()),
-                )
-                .await
-            {
-                Ok(s) => break s,
-                Err(e) => {
-                    if is_fatal_error(&e) {
-                        return Err(e).context("Fatal provider error");
-                    }
-                    if retries >= params.max_retries {
-                        return Err(anyhow::anyhow!(
-                            "Failed to start agent reply stream after {} retries: {}",
-                            retries,
-                            e
-                        ));
-                    }
-                    tracing::info!(
-                        "Failed to start agent reply stream (attempt {}/{}): {}. Retrying in {}s...",
-                        retries + 1,
-                        params.max_retries,
-                        e,
-                        delay
-                    );
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    retries += 1;
-                    delay *= 2; // exponential backoff
-                }
-            }
-        };
+        let mut stream = retry.start(user_message.clone()).await?;
 
         let mut budget_poll = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -1886,49 +1855,14 @@ pub async fn run_review(
                                             "Nudging agent to finalize before reaching the cost budget"
                                         );
 
-                                        let mut s_opt = None;
-                                        let mut last_err = None;
-                                        while retries <= params.max_retries {
-                                            match agent
-                                                .reply(
-                                                    follow_up_message.clone(),
-                                                    session_config.clone(),
-                                                    state_machine::enabled(),
-                                                    Some(phase_cancel_token.clone()),
-                                                )
-                                                .await
-                                            {
-                                                Ok(s) => {
-                                                    s_opt = Some(s);
-                                                    break;
-                                                }
-                                                Err(e) => {
-                                                    if is_fatal_error(&e) {
-                                                        return Err(e).context("Fatal provider error sending budget nudge");
-                                                    }
-                                                    tracing::error!(
-                                                        "Failed to send budget nudge: {}, retrying...",
-                                                        e
-                                                    );
-                                                    last_err = Some(e);
-                                                    retries += 1;
-                                                    tokio::time::sleep(Duration::from_secs(delay))
-                                                        .await;
-                                                    delay *= 2;
-                                                }
-                                            }
-                                        }
-                                        match s_opt {
-                                            Some(s) => {
+                                        match retry.start(follow_up_message).await {
+                                            Ok(s) => {
                                                 stream = s;
                                                 continue;
                                             }
-                                            None => {
-                                                if let Some(err) = last_err {
-                                                    tracing::warn!("Failed to restart stream for budget nudge after retries. Last error: {}", err);
-                                                } else {
-                                                    tracing::warn!("Failed to restart stream for budget nudge after retries.");
-                                                }
+                                            Err(e) if is_fatal_provider_error(&e) => return Err(e),
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "Failed to restart stream for budget nudge after retries");
                                                 return Ok(());
                                             }
                                         }
@@ -1940,14 +1874,8 @@ pub async fn run_review(
                             // Other event types (e.g., tool calls) — skip for now
                         }
                         Some(Err(e)) => {
-                            if is_fatal_error(&e) {
-                                return Err(e).context("Fatal error during agent stream");
-                            }
-                            tracing::error!("Agent stream error: {e}");
-
-                            if retries >= params.max_retries {
-                                return Err(anyhow::anyhow!("Stream failed after {} retries: {}", retries, e));
-                            }
+                            let e = retry.stream_error(e)?;
+                            tracing::error!(error = %e, "Agent stream error");
 
                             let follow_up_text = match last_assistant_text.as_deref() {
                                 Some(text) if !text.trim().is_empty() => format!(
@@ -1964,55 +1892,14 @@ pub async fn run_review(
                                 review_kind = %params.review_kind,
                                 phase = "finder",
                                 session_id = %session_config.id,
-                                attempt = retries + 1,
-                                max_retries = params.max_retries,
+                                attempt = retry.retries + 1,
+                                max_retries = retry.max_retries,
                                 "Stream interrupted; retrying with a follow-up prompt"
                             );
 
                             let follow_up_message = Message::user().with_text(&follow_up_text);
 
-                            retries += 1;
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                            delay *= 2;
-
-                            let mut s_opt = None;
-                            let mut last_err = None;
-                            while retries <= params.max_retries {
-                                match agent
-                                    .reply(
-                                        follow_up_message.clone(),
-                                        session_config.clone(),
-                                        state_machine::enabled(),
-                                        Some(phase_cancel_token.clone()),
-                                    )
-                                    .await
-                                {
-                                    Ok(s) => {
-                                        s_opt = Some(s);
-                                        break;
-                                    }
-                                    Err(start_err) => {
-                                        if is_fatal_error(&start_err) {
-                                            return Err(start_err).context("Fatal error restarting stream");
-                                        }
-                                        tracing::error!("Failed to restart stream after interruption: {}, retrying...", start_err);
-                                        last_err = Some(start_err);
-                                        retries += 1;
-                                        tokio::time::sleep(Duration::from_secs(delay)).await;
-                                        delay *= 2;
-                                    }
-                                }
-                            }
-                            match s_opt {
-                                Some(s) => { stream = s; continue; },
-                                None => {
-                                    if let Some(err) = last_err {
-                                        return Err(anyhow::anyhow!("Reached max retries while trying to restart stream. Last error: {}", err));
-                                    } else {
-                                        return Err(anyhow::anyhow!("Reached max retries while trying to restart stream"));
-                                    }
-                                }
-                            }
+                            stream = retry.restart(follow_up_message).await?;
                         }
                         None => {
                             if reporting_artifact
@@ -2023,11 +1910,11 @@ pub async fn run_review(
                                 return Ok(()); // Stream finished successfully
                             }
 
-                            if budget_nudged && retries > 0 {
+                            if budget_nudged && retry.retries > 0 {
                                 return Ok(());
                             }
 
-                            if retries >= params.max_retries {
+                            if retry.exhausted() {
                                 tracing::warn!(
                                     repo = %params.repo,
                                     pr = params.pr_number,
@@ -2058,55 +1945,14 @@ pub async fn run_review(
                                 review_kind = %params.review_kind,
                                 phase = "finder",
                                 session_id = %session_config.id,
-                                attempt = retries + 1,
-                                max_retries = params.max_retries,
+                                attempt = retry.retries + 1,
+                                max_retries = retry.max_retries,
                                 "Agent stream ended before structured findings were submitted; retrying with a follow-up prompt"
                             );
 
                             let follow_up_message = Message::user().with_text(&follow_up_text);
 
-                            retries += 1;
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                            delay *= 2;
-
-                            let mut s_opt = None;
-                            let mut last_err = None;
-                            while retries <= params.max_retries {
-                                match agent
-                                    .reply(
-                                        follow_up_message.clone(),
-                                        session_config.clone(),
-                                        state_machine::enabled(),
-                                        Some(phase_cancel_token.clone()),
-                                    )
-                                    .await
-                                {
-                                    Ok(s) => {
-                                        s_opt = Some(s);
-                                        break;
-                                    }
-                                    Err(start_err) => {
-                                        if is_fatal_error(&start_err) {
-                                            return Err(start_err).context("Fatal error after premature stop");
-                                        }
-                                        tracing::error!("Failed to restart agent after premature stop: {}, retrying...", start_err);
-                                        last_err = Some(start_err);
-                                        retries += 1;
-                                        tokio::time::sleep(Duration::from_secs(delay)).await;
-                                        delay *= 2;
-                                    }
-                                }
-                            }
-                            match s_opt {
-                                Some(s) => { stream = s; continue; },
-                                None => {
-                                    if let Some(err) = last_err {
-                                        return Err(anyhow::anyhow!("Reached max retries while trying to restart stream. Last error: {}", err));
-                                    } else {
-                                        return Err(anyhow::anyhow!("Reached max retries while trying to restart stream"));
-                                    }
-                                }
-                            }
+                            stream = retry.restart(follow_up_message).await?;
                         }
                     }
                 }
@@ -3081,43 +2927,17 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
 
     let phase_cancel_token = params.cancel_token.child_token();
     let dedupe_future = async {
-        let mut retries = 0;
-        let mut delay = params.retry_delay_secs;
-        let mut stream = loop {
-            match agent
-                .reply(
-                    Message::user().with_text(&dedupe_prompt),
-                    session_config.clone(),
-                    state_machine::enabled(),
-                    Some(phase_cancel_token.clone()),
-                )
-                .await
-            {
-                Ok(stream) => break stream,
-                Err(e) => {
-                    if is_fatal_error(&e) {
-                        return Err(e).context("Fatal provider error during duplicate suppression");
-                    }
-                    if retries >= params.max_retries {
-                        return Err(anyhow::anyhow!(
-                            "Failed to start duplicate suppression after {} retries: {}",
-                            retries,
-                            e
-                        ));
-                    }
-                    tracing::info!(
-                        "Failed to start duplicate suppression (attempt {}/{}): {}. Retrying in {}s...",
-                        retries + 1,
-                        params.max_retries,
-                        e,
-                        delay
-                    );
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    retries += 1;
-                    delay *= 2;
-                }
-            }
-        };
+        let mut retry = ReplyRetry::new(
+            agent,
+            session_config,
+            &phase_cancel_token,
+            "duplicate suppression",
+            params.max_retries,
+            params.retry_delay_secs,
+        );
+        let mut stream = retry
+            .start(Message::user().with_text(&dedupe_prompt))
+            .await?;
 
         loop {
             tokio::select! {
@@ -3154,52 +2974,21 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
-                            if is_fatal_error(&e) {
-                                return Err(e).context("Fatal provider error during duplicate suppression stream");
-                            }
-                            if retries >= params.max_retries {
-                                return Err(anyhow::anyhow!(
-                                    "Duplicate suppression stream failed after {} retries: {}",
-                                    retries,
-                                    e
-                                ));
-                            }
+                            let e = retry.stream_error(e)?;
                             let retry_prompt = format!(
                                 "The duplicate suppression stream was interrupted due to this error: {e}. Continue and call `submit_duplicate_decision` exactly once for every remaining verified finding."
                             );
-                            retries += 1;
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                            delay *= 2;
-                            stream = agent
-                                .reply(
-                                    Message::user().with_text(&retry_prompt),
-                                    session_config.clone(),
-                                    state_machine::enabled(),
-                                    Some(phase_cancel_token.clone()),
-                                )
-                                .await
-                                .context("Failed to restart duplicate suppression stream")?;
+                            stream = retry.restart(Message::user().with_text(&retry_prompt)).await?;
                         }
                         None => {
                             if dedupe_complete(&params.artifact, &expected_ids).await {
                                 return Ok(());
                             }
-                            if retries >= params.max_retries {
+                            if retry.exhausted() {
                                 return Ok(());
                             }
                             let retry_prompt = "You stopped before submitting duplicate decisions for all verified findings. Continue and call `submit_duplicate_decision` exactly once for every remaining finding.".to_string();
-                            retries += 1;
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                            delay *= 2;
-                            stream = agent
-                                .reply(
-                                    Message::user().with_text(&retry_prompt),
-                                    session_config.clone(),
-                                    state_machine::enabled(),
-                                    Some(phase_cancel_token.clone()),
-                                )
-                                .await
-                                .context("Failed to restart duplicate suppression stream")?;
+                            stream = retry.restart(Message::user().with_text(&retry_prompt)).await?;
                         }
                     }
                 }
@@ -3325,43 +3114,17 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     let phase_cancel_token = params.cancel_token.child_token();
     let mut budget_exceeded = false;
     let verifier_future = async {
-        let mut retries = 0;
-        let mut delay = params.retry_delay_secs;
-        let mut stream = loop {
-            match agent
-                .reply(
-                    Message::user().with_text(&verifier_prompt),
-                    session_config.clone(),
-                    state_machine::enabled(),
-                    Some(phase_cancel_token.clone()),
-                )
-                .await
-            {
-                Ok(stream) => break stream,
-                Err(e) => {
-                    if is_fatal_error(&e) {
-                        return Err(e).context("Fatal provider error during verifier pass");
-                    }
-                    if retries >= params.max_retries {
-                        return Err(anyhow::anyhow!(
-                            "Failed to start verifier pass after {} retries: {}",
-                            retries,
-                            e
-                        ));
-                    }
-                    tracing::info!(
-                        "Failed to start verifier pass (attempt {}/{}): {}. Retrying in {}s...",
-                        retries + 1,
-                        params.max_retries,
-                        e,
-                        delay
-                    );
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    retries += 1;
-                    delay *= 2;
-                }
-            }
-        };
+        let mut retry = ReplyRetry::new(
+            &agent,
+            &session_config,
+            &phase_cancel_token,
+            "verifier",
+            params.max_retries,
+            params.retry_delay_secs,
+        );
+        let mut stream = retry
+            .start(Message::user().with_text(&verifier_prompt))
+            .await?;
 
         loop {
             tokio::select! {
@@ -3399,52 +3162,21 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
-                            if is_fatal_error(&e) {
-                                return Err(e).context("Fatal provider error during verifier stream");
-                            }
-                            if retries >= params.max_retries {
-                                return Err(anyhow::anyhow!(
-                                    "Verifier stream failed after {} retries: {}",
-                                    retries,
-                                    e
-                                ));
-                            }
+                            let e = retry.stream_error(e)?;
                             let retry_prompt = format!(
                                 "The verifier stream was interrupted due to this error: {e}. Continue verification and call `submit_verdict` exactly once for every candidate before stopping."
                             );
-                            retries += 1;
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                            delay *= 2;
-                            stream = agent
-                                .reply(
-                                    Message::user().with_text(&retry_prompt),
-                                    session_config.clone(),
-                                    state_machine::enabled(),
-                                    Some(phase_cancel_token.clone()),
-                                )
-                                .await
-                                .context("Failed to restart verifier stream")?;
+                            stream = retry.restart(Message::user().with_text(&retry_prompt)).await?;
                         }
                         None => {
                             if params.artifact.lock().await.verifier_complete() {
                                 return Ok(());
                             }
-                            if retries >= params.max_retries {
+                            if retry.exhausted() {
                                 return Ok(());
                             }
                             let retry_prompt = "You stopped before submitting verdicts for all candidate findings. Continue verification and call `submit_verdict` exactly once for every remaining candidate.".to_string();
-                            retries += 1;
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                            delay *= 2;
-                            stream = agent
-                                .reply(
-                                    Message::user().with_text(&retry_prompt),
-                                    session_config.clone(),
-                                    state_machine::enabled(),
-                                    Some(phase_cancel_token.clone()),
-                                )
-                                .await
-                                .context("Failed to restart verifier stream")?;
+                            stream = retry.restart(Message::user().with_text(&retry_prompt)).await?;
                         }
                     }
                 }
@@ -3602,6 +3334,129 @@ pub fn is_fatal_error(e: &anyhow::Error) -> bool {
     crate::request_diagnostics::permanent_rejection(e)
         || e.chain()
             .any(|cause| fatal_error_message(&cause.to_string().to_lowercase()))
+}
+
+/// Context marking a provider failure that must stop the daemon. It survives the
+/// sandbox boundary as text in the child's final error output.
+const FATAL_PROVIDER_ERROR: &str = "Fatal provider error";
+
+fn fatal_provider_error(error: anyhow::Error, phase: &str) -> anyhow::Error {
+    error.context(format!("{FATAL_PROVIDER_ERROR} during {phase}"))
+}
+
+/// Returns true only for provider failures classified during an agent phase.
+/// Auth-looking errors elsewhere (e.g. a GitHub 403 for one repository) fail
+/// that review without stopping the daemon.
+pub fn is_fatal_provider_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.to_string().contains(FATAL_PROVIDER_ERROR))
+}
+
+/// Retry budget shared by every reply-stream (re)start within one agent phase.
+struct ReplyRetry<'a> {
+    agent: &'a Agent,
+    session_config: &'a SessionConfig,
+    cancel_token: &'a CancellationToken,
+    phase: &'static str,
+    max_retries: u32,
+    retries: u32,
+    delay_secs: u64,
+}
+
+type ReplyStream<'a> = futures::stream::BoxStream<'a, Result<AgentEvent>>;
+
+impl<'a> ReplyRetry<'a> {
+    fn new(
+        agent: &'a Agent,
+        session_config: &'a SessionConfig,
+        cancel_token: &'a CancellationToken,
+        phase: &'static str,
+        max_retries: u32,
+        delay_secs: u64,
+    ) -> Self {
+        Self {
+            agent,
+            session_config,
+            cancel_token,
+            phase,
+            max_retries,
+            retries: 0,
+            delay_secs,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.retries >= self.max_retries
+    }
+
+    /// Classifies a mid-stream error: fatal provider errors are marked, and
+    /// transient ones fail only once the retry budget is spent.
+    fn stream_error(&self, error: anyhow::Error) -> Result<anyhow::Error> {
+        if is_fatal_error(&error) {
+            return Err(fatal_provider_error(error, self.phase));
+        }
+        if self.exhausted() {
+            return Err(error).with_context(|| {
+                format!(
+                    "{} stream failed after {} retries",
+                    self.phase, self.retries
+                )
+            });
+        }
+        Ok(error)
+    }
+
+    async fn backoff(&mut self) {
+        tokio::time::sleep(Duration::from_secs(self.delay_secs)).await;
+        self.retries += 1;
+        self.delay_secs *= 2;
+    }
+
+    /// Starts a reply stream, retrying transient failures within the shared budget.
+    async fn start(&mut self, message: Message) -> Result<ReplyStream<'a>> {
+        loop {
+            match self
+                .agent
+                .reply(
+                    message.clone(),
+                    self.session_config.clone(),
+                    state_machine::enabled(),
+                    Some(self.cancel_token.clone()),
+                )
+                .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(error) if is_fatal_error(&error) => {
+                    return Err(fatal_provider_error(error, self.phase));
+                }
+                Err(error) => {
+                    if self.exhausted() {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "Failed to start {} reply stream after {} retries",
+                                self.phase, self.retries
+                            )
+                        });
+                    }
+                    tracing::info!(
+                        phase = self.phase,
+                        attempt = self.retries + 1,
+                        max_retries = self.max_retries,
+                        delay_secs = self.delay_secs,
+                        error = %error,
+                        "Failed to start agent reply stream; retrying"
+                    );
+                    self.backoff().await;
+                }
+            }
+        }
+    }
+
+    /// Backs off, then restarts the stream with a follow-up prompt.
+    async fn restart(&mut self, message: Message) -> Result<ReplyStream<'a>> {
+        self.backoff().await;
+        self.start(message).await
+    }
 }
 
 #[cfg(test)]
@@ -3797,6 +3652,25 @@ Reviewed the PR and found no vulnerabilities.
 
         assert!(!is_nonfatal_review_completion_error(&error));
         assert!(is_fatal_error(&error));
+    }
+
+    #[test]
+    fn only_marked_provider_errors_stop_the_daemon() {
+        let github =
+            anyhow::anyhow!("HTTP 403: Forbidden").context("Failed to clone owner/private-repo");
+        assert!(is_fatal_error(&github));
+        assert!(!is_fatal_provider_error(&github));
+
+        let provider = fatal_provider_error(anyhow::anyhow!("401 unauthorized"), "finder");
+        assert!(is_fatal_provider_error(&provider));
+        assert!(!is_nonfatal_review_completion_error(&provider));
+
+        let sandbox = anyhow::anyhow!(
+            "Sandboxed review failed with status: exit status: 1; recent output:\n\
+             Error: Fatal provider error during verifier\n\n\
+             Caused by:\n    quota exceeded"
+        );
+        assert!(is_fatal_provider_error(&sandbox));
     }
 
     #[test]
