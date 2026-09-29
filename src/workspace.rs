@@ -113,12 +113,14 @@ pub async fn prepare(
             .context("Failed to remove stale workspace")?;
     }
 
-    std::fs::create_dir_all(&parent_dir).with_context(|| {
-        format!(
-            "Failed to create workspace parent directory at {}",
-            parent_dir.display()
-        )
-    })?;
+    tokio::fs::create_dir_all(&parent_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create workspace parent directory at {}",
+                parent_dir.display()
+            )
+        })?;
 
     let repo_name = repo.split('/').next_back().unwrap_or(repo);
     let workspace_dir = parent_dir.join(repo_name);

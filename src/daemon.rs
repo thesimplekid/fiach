@@ -1558,7 +1558,7 @@ async fn run_sandboxed_review(
         review_params.pr_number,
         &review_params.review_kind,
     )?;
-    std::fs::create_dir_all(&run_dir).with_context(|| {
+    tokio::fs::create_dir_all(&run_dir).await.with_context(|| {
         format!(
             "Failed to create sandbox run directory at {}",
             run_dir.display()
@@ -1581,7 +1581,7 @@ async fn run_sandboxed_review(
         "/root/.local/state/goose/logs",
     ] {
         let path = runtime_rootfs.join(dir.trim_start_matches('/'));
-        std::fs::create_dir_all(&path).with_context(|| {
+        tokio::fs::create_dir_all(&path).await.with_context(|| {
             format!(
                 "Failed to create sandbox runtime directory at {}",
                 path.display()
@@ -1956,7 +1956,7 @@ async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<
 
     for dir in ["tmp", "run", "var/tmp"] {
         let path = runtime_rootfs.join(dir);
-        std::fs::create_dir_all(&path).with_context(|| {
+        tokio::fs::create_dir_all(&path).await.with_context(|| {
             format!(
                 "Failed to create runtime rootfs directory at {}",
                 path.display()

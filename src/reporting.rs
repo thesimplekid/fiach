@@ -1058,20 +1058,25 @@ pub fn validate_artifact(artifact: &mut ReportingArtifact) -> Result<()> {
     Ok(())
 }
 
+/// Unwraps a `json!` object literal without panicking.
+fn json_object(value: Value) -> JsonObject {
+    match value {
+        Value::Object(object) => object,
+        _ => JsonObject::new(),
+    }
+}
+
 fn object_schema(properties: Vec<(&str, JsonObject)>, required: Vec<&str>) -> JsonObject {
     let mut props = serde_json::Map::new();
     for (name, schema) in properties {
         props.insert(name.to_string(), Value::Object(schema));
     }
-    json!({
+    json_object(json!({
         "type": "object",
         "properties": props,
         "required": required,
         "additionalProperties": false
-    })
-    .as_object()
-    .unwrap()
-    .clone()
+    }))
 }
 
 fn location_schema() -> JsonObject {
@@ -1103,31 +1108,19 @@ fn command_transcript_schema() -> JsonObject {
 }
 
 fn string_schema(description: &str) -> JsonObject {
-    json!({"type": "string", "description": description})
-        .as_object()
-        .unwrap()
-        .clone()
+    json_object(json!({"type": "string", "description": description}))
 }
 
 fn bool_schema(description: &str) -> JsonObject {
-    json!({"type": "boolean", "description": description})
-        .as_object()
-        .unwrap()
-        .clone()
+    json_object(json!({"type": "boolean", "description": description}))
 }
 
 fn number_schema(description: &str) -> JsonObject {
-    json!({"type": "integer", "minimum": 1, "description": description})
-        .as_object()
-        .unwrap()
-        .clone()
+    json_object(json!({"type": "integer", "minimum": 1, "description": description}))
 }
 
 fn array_schema(items: JsonObject) -> JsonObject {
-    json!({"type": "array", "items": items})
-        .as_object()
-        .unwrap()
-        .clone()
+    json_object(json!({"type": "array", "items": items}))
 }
 
 fn validate_required(field: &str, value: &str) -> Result<()> {

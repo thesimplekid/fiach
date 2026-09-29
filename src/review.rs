@@ -2082,7 +2082,8 @@ pub async fn run_review(
         let mut cost_usd = direct_call_cost_usd;
         add_known_cost(&mut cost_usd, main_session_cost_usd);
 
-        let diff_content = std::fs::read_to_string(workspace.path.join(".pr_diff.txt"))
+        let diff_content = tokio::fs::read_to_string(workspace.path.join(".pr_diff.txt"))
+            .await
             .unwrap_or_else(|_| String::new());
         let policy = reporting::DisclosurePolicy {
             pr_context: workspace.pr_context.clone(),

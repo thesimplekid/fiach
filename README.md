@@ -4,7 +4,7 @@
 
 **Fiach** (Irish for *Hunter* or *Seeker*) is an autonomous, AI-powered PR reviewer built in Rust using the [goose](https://github.com/block/goose) agent framework. 
 
-It acts as a background daemon that monitors configured GitHub repositories, checks out active Pull Requests, and uses an LLM (via OpenRouter) to review the code against a fully customizable **Persona**. If the agent finds actionable issues (like security vulnerabilities or code quality violations), `fiach` can automatically report them by commenting on the PR or opening a dedicated disclosure PR on a centralized tracking repository.
+It acts as a background daemon that monitors configured GitHub repositories, checks out active Pull Requests, and uses an LLM (OpenRouter by default, or OpenAI, Anthropic, or Google directly) to review the code against a fully customizable **Persona**. If the agent finds actionable issues (like security vulnerabilities or code quality violations), `fiach` can automatically report them by commenting on the PR or opening a dedicated disclosure PR on a centralized tracking repository.
 
 ---
 

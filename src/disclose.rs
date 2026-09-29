@@ -504,7 +504,8 @@ async fn post_pr_review(
     };
 
     let input = tempfile::NamedTempFile::new().context("Failed to create review payload file")?;
-    std::fs::write(input.path(), serde_json::to_vec(&payload)?)
+    tokio::fs::write(input.path(), serde_json::to_vec(&payload)?)
+        .await
         .context("Failed to write review payload")?;
 
     let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
@@ -721,9 +722,12 @@ async fn post_pr_comment(
         return Ok(url);
     }
 
-    let report = std::fs::read_to_string(report_path).context("Failed to read report file")?;
+    let report = tokio::fs::read_to_string(report_path)
+        .await
+        .context("Failed to read report file")?;
     let body = tempfile::NamedTempFile::new().context("Failed to create comment body file")?;
-    std::fs::write(body.path(), format!("{report}\n\n{marker}\n"))
+    tokio::fs::write(body.path(), format!("{report}\n\n{marker}\n"))
+        .await
         .context("Failed to write comment body file")?;
     let report_path_str = body
         .path()
@@ -792,8 +796,9 @@ async fn create_sync_pr(
         bail!("Failed to clone sync repo {}: {}", sync_repo, stderr);
     }
 
-    let report_content =
-        std::fs::read_to_string(report_path).context("Failed to read report file")?;
+    let report_content = tokio::fs::read_to_string(report_path)
+        .await
+        .context("Failed to read report file")?;
 
     // Extract title from frontmatter (basic parsing)
     let title = extract_title(&report_content)
@@ -826,7 +831,8 @@ async fn create_sync_pr(
         .join(sync_report_file_name(pr_number, review_kind));
 
     let final_report_content = if existing_report_path.exists() {
-        let old_content = std::fs::read_to_string(&existing_report_path)
+        let old_content = tokio::fs::read_to_string(&existing_report_path)
+            .await
             .context("Failed to read existing report")?;
         if old_content == report_content {
             tracing::info!("Report content is identical to existing report, skipping update");
@@ -845,14 +851,17 @@ async fn create_sync_pr(
 
     let dest_dir = repo_dir.join(repo);
 
-    std::fs::create_dir_all(&dest_dir).with_context(|| {
-        format!(
-            "Failed to create destination directories at {}",
-            dest_dir.display()
-        )
-    })?;
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create destination directories at {}",
+                dest_dir.display()
+            )
+        })?;
 
-    std::fs::write(&existing_report_path, final_report_content)
+    tokio::fs::write(&existing_report_path, final_report_content)
+        .await
         .context("Failed to write report file")?;
 
     // Git add
