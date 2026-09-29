@@ -102,7 +102,8 @@
             };
 
             nativeBuildInputs = with pkgs; [ pkg-config protobuf ];
-            nativeCheckInputs = with pkgs; [ git python3 ];
+            # cacert sets SSL_CERT_FILE; TLS clients built in tests need a CA store.
+            nativeCheckInputs = with pkgs; [ cacert git python3 ];
             buildInputs = with pkgs; [ openssl sqlite zlib ] ++ libsDarwin;
           };
 
