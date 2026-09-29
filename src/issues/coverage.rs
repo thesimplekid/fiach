@@ -21,8 +21,6 @@ use super::{
 
 // Independent of routing policy. Prompts, task kind and full evidence also enter keys.
 const ANSWER_SCHEMA: &str = "issue-coverage-v1";
-// Large single candidates are sent individually, never truncated to fit a batch.
-const BATCH_BYTES: usize = 64 * 1024;
 const BATCH_QUESTION: &str = r#"Compare only state.candidates["{candidate}"] with state.issue. Other candidates are independent questions, not evidence for this comparison. {question}"#;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -226,7 +224,8 @@ impl<'a> Coverage<'a> {
                 request,
                 key,
             });
-            if batch.len() > 1 && batch_request(&batch)?.encoded_len()? > BATCH_BYTES {
+            // Large single candidates are sent individually, never truncated to fit a batch.
+            if batch.len() > 1 && !self.client.fits(&batch_request(&batch)?)? {
                 let last = batch.pop().context("Nonempty coverage batch")?;
                 self.screen_batch(issue, kind, std::mem::take(&mut batch), &mut screened)
                     .await?;
