@@ -463,6 +463,10 @@ enum Commands {
     },
 }
 
+// Goose logs failed provider responses verbatim at warn from http_status, and
+// they can echo prompt content. Fiach logs metadata-only request diagnostics.
+const DEFAULT_LOG_FILTER: &str = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Dependency feature unification enables both built-in Rustls providers.
@@ -474,9 +478,10 @@ async fn main() -> Result<()> {
 
     // Initialize tracing (respects RUST_LOG env var, defaults to info)
     fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn")
-        }))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)),
+        )
         .with_target(false)
         .with_ansi(false)
         .init();
@@ -1011,6 +1016,41 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_log_filter_drops_raw_provider_responses_only() {
+        use std::{
+            io::Write,
+            sync::{Arc, Mutex},
+        };
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let sink = bytes.clone();
+        let subscriber = fmt()
+            .with_env_filter(EnvFilter::new(DEFAULT_LOG_FILTER))
+            .with_writer(move || Writer(sink.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "goose_providers::http_status", "private-response");
+            tracing::error!(target: "goose_providers::http_status", "http-status-error");
+            tracing::warn!(target: "goose_providers::api_client", "provider-warning");
+            tracing::warn!(target: "goose::agents", "agent-warning");
+        });
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("private-response"), "{output}");
+        for kept in ["http-status-error", "provider-warning", "agent-warning"] {
+            assert!(output.contains(kept), "missing {kept}: {output}");
+        }
+    }
 
     #[test]
     fn buzz_defaults_to_public_and_security_personas() {

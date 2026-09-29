@@ -478,7 +478,7 @@
 
             logFilter = lib.mkOption {
               type = lib.types.str;
-              default = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn";
+              default = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error";
               description = "Tracing filter passed to RUST_LOG for the daemon and sandboxed review children.";
             };
 

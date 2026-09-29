@@ -548,7 +548,7 @@ In your `flake.nix` or `configuration.nix`:
             environmentFile = "/run/secrets/fiach-env";
 
             # Optional tracing filter. Use fiach=debug or fiach=trace when debugging.
-            logFilter = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn";
+            logFilter = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error";
 
             # Sandbox Isolation (Highly Recommended)
             # Isolates each PR review inside a systemd-nspawn container.
@@ -664,7 +664,7 @@ The following options are available under `services.fiach`:
 | `verifierProvider` | string or null | `null` | Provider to use for the verifier pass. Defaults to `provider` when unset. |
 | `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
 | `environmentFile` | path | *none* | Path to an environment file containing host-only `GITHUB_TOKEN`, read-only `FIACH_REVIEW_GITHUB_TOKEN` when sandboxing is enabled, the selected provider API key, and optionally `FIACH_SERVER_TOKEN`. |
-| `logFilter` | string | `"fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
+| `logFilter` | string | `"fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
 | `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |
 | `reviewLanes` | list of string | `[]` | Focused review lanes to run as Goose subagents inside each persona review before the parent finder submits one combined structured result. |
