@@ -520,7 +520,7 @@ async fn sandbox(
         if let Some(key) = key
             && let Ok(value) = std::env::var(key)
         {
-            cmd.arg(format!("--setenv={key}={value}"));
+            crate::daemon::forward_sandbox_secret(&mut cmd, key, &value);
         }
     }
     cmd.args([

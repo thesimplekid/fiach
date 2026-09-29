@@ -1518,6 +1518,14 @@ fn validate_sandbox_review_token<'a>(
     Ok(review_token)
 }
 
+/// Passes a secret into the container by name only. `systemd-nspawn --setenv=NAME`
+/// copies the value from its own environment, so the secret never appears in the
+/// command line, which any local user can read from `/proc/<pid>/cmdline`.
+pub(crate) fn forward_sandbox_secret(cmd: &mut Command, name: &str, value: &str) {
+    cmd.env(name, value);
+    cmd.arg(format!("--setenv={name}"));
+}
+
 async fn run_sandboxed_review(
     params: &DaemonParams,
     review_params: &ReviewParams,
@@ -1643,20 +1651,16 @@ async fn run_sandboxed_review(
     }
 
     // Provider credentials are required by Goose inside the review sandbox.
-    if let Ok(val) = std::env::var("OPENROUTER_API_KEY") {
-        cmd.arg(format!("--setenv=OPENROUTER_API_KEY={}", val));
-    }
-    if let Ok(val) = std::env::var("OPENAI_API_KEY") {
-        cmd.arg(format!("--setenv=OPENAI_API_KEY={}", val));
-    }
-    if let Ok(val) = std::env::var("ANTHROPIC_API_KEY") {
-        cmd.arg(format!("--setenv=ANTHROPIC_API_KEY={}", val));
-    }
-    if let Ok(val) = std::env::var("GOOGLE_API_KEY") {
-        cmd.arg(format!("--setenv=GOOGLE_API_KEY={}", val));
-    }
-    if let Ok(val) = std::env::var("TYPESAFE_API_KEY") {
-        cmd.arg(format!("--setenv=TYPESAFE_API_KEY={}", val));
+    for key in [
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "TYPESAFE_API_KEY",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            forward_sandbox_secret(&mut cmd, key, &value);
+        }
     }
     // Never expose the host disclosure token to the model-controlled review
     // process. This token must be separately provisioned with read-only access
@@ -1667,7 +1671,7 @@ async fn run_sandboxed_review(
     let host_github_token = std::env::var("GITHUB_TOKEN").ok();
     let review_github_token =
         validate_sandbox_review_token(&review_github_token, host_github_token.as_deref())?;
-    cmd.arg(format!("--setenv=GITHUB_TOKEN={review_github_token}"));
+    forward_sandbox_secret(&mut cmd, "GITHUB_TOKEN", review_github_token);
     if let Ok(val) = std::env::var("RUST_LOG") {
         cmd.arg(format!("--setenv=RUST_LOG={}", val));
     }
@@ -2669,5 +2673,20 @@ mod tests {
         );
         assert!(validate_sandbox_review_token("", Some("host-write")).is_err());
         assert!(validate_sandbox_review_token("shared-token", Some("shared-token")).is_err());
+    }
+
+    #[test]
+    fn sandbox_secrets_are_forwarded_by_name_not_on_command_line() {
+        let mut cmd = Command::new("systemd-nspawn");
+        forward_sandbox_secret(&mut cmd, "OPENROUTER_API_KEY", "sk-secret");
+
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(args, ["--setenv=OPENROUTER_API_KEY"]);
+        assert!(
+            cmd.as_std()
+                .get_envs()
+                .any(|(key, value)| key == "OPENROUTER_API_KEY"
+                    && value == Some(std::ffi::OsStr::new("sk-secret")))
+        );
     }
 }
