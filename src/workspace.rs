@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use tempfile::{Builder, TempDir};
 use tokio::process::Command;
 
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT, output_limited};
@@ -20,10 +21,8 @@ const MAX_MATERIALIZED_DIFF_BYTES: usize = 16 * 1024 * 1024;
 pub struct PreparedWorkspace {
     /// Path to the workspace directory (the agent's working directory).
     pub path: PathBuf,
-    /// Path to the parent directory (which will be cleaned up).
-    pub parent_dir: PathBuf,
-    /// Whether this is a temporary directory we created (should be cleaned up).
-    pub is_temp: bool,
+    /// Owns this execution's directory, including cleanup on drop.
+    directory: TempDir,
     /// The commit hash of the checked-out PR branch.
     pub commit_hash: String,
     /// The base commit hash the PR was branched from.
@@ -59,29 +58,33 @@ struct DefaultBranchRef {
     name: String,
 }
 
-impl Drop for PreparedWorkspace {
-    fn drop(&mut self) {
-        if self.is_temp && self.parent_dir.exists() {
-            tracing::info!(path = %self.parent_dir.display(), "Cleaning up workspace on drop");
-            if let Err(e) = std::fs::remove_dir_all(&self.parent_dir) {
-                tracing::error!("Failed to remove workspace directory: {}", e);
-            }
-        }
+impl PreparedWorkspace {
+    /// Clean up only the temporary directory owned by this execution.
+    pub async fn cleanup(self) -> Result<()> {
+        tokio::task::spawn_blocking(move || self.directory.close())
+            .await
+            .context("Workspace cleanup task failed")?
+            .context("Failed to remove workspace directory")
     }
 }
 
-impl PreparedWorkspace {
-    /// Clean up the workspace if it was a temporary directory.
-    pub async fn cleanup(mut self) -> Result<()> {
-        if self.is_temp && self.parent_dir.exists() {
-            tracing::info!(path = %self.parent_dir.display(), "Cleaning up workspace");
-            tokio::fs::remove_dir_all(&self.parent_dir)
-                .await
-                .context("Failed to remove workspace directory")?;
-            self.is_temp = false; // Prevent double cleanup on drop
+fn create_workspace_directory(
+    repo: &str,
+    pr_number: u64,
+    base_dir: Option<&Path>,
+) -> Result<TempDir> {
+    let safe_name = repo.replace('/', "_");
+    let prefix = format!("ctf-review-{safe_name}-PR{pr_number}-");
+    let mut builder = Builder::new();
+    builder.prefix(&prefix);
+    match base_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).context("Failed to create workspace base directory")?;
+            builder.tempdir_in(dir)
         }
-        Ok(())
+        None => builder.tempdir(),
     }
+    .context("Failed to create unique workspace directory")
 }
 
 /// Prepare a workspace by cloning the repo and checking out the PR.
@@ -99,28 +102,9 @@ pub async fn prepare(
     base_dir: Option<&Path>,
     context_groups: Option<&crate::config::ContextGroup>,
 ) -> Result<PreparedWorkspace> {
-    let safe_name = repo.replace('/', "_");
-    let parent_dir = match base_dir {
-        Some(dir) => dir.join(format!("ctf-review-{safe_name}-PR{pr_number}")),
-        None => std::env::temp_dir().join(format!("ctf-review-{safe_name}-PR{pr_number}")),
-    };
-
-    // Clean up any stale workspace from a previous run
-    if parent_dir.exists() {
-        tracing::debug!(path = %parent_dir.display(), "Removing stale workspace");
-        tokio::fs::remove_dir_all(&parent_dir)
-            .await
-            .context("Failed to remove stale workspace")?;
-    }
-
-    tokio::fs::create_dir_all(&parent_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create workspace parent directory at {}",
-                parent_dir.display()
-            )
-        })?;
+    // Keep ownership throughout preparation so errors and cancellation also clean up.
+    let directory = create_workspace_directory(repo, pr_number, base_dir)?;
+    let parent_dir = directory.path();
 
     let repo_name = repo.split('/').next_back().unwrap_or(repo);
     let workspace_dir = parent_dir.join(repo_name);
@@ -342,8 +326,7 @@ fi
 
     Ok(PreparedWorkspace {
         path: workspace_dir,
-        parent_dir,
-        is_temp: true,
+        directory,
         commit_hash: commit_hash.clone(),
         base_commit,
         pr_context: crate::reporting::PrContext {
@@ -360,6 +343,71 @@ fi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared(directory: TempDir) -> PreparedWorkspace {
+        PreparedWorkspace {
+            path: directory.path().join("repo"),
+            directory,
+            commit_hash: "head".to_string(),
+            base_commit: "base".to_string(),
+            pr_context: crate::reporting::PrContext {
+                state: "OPEN".to_string(),
+                merged: false,
+                base_ref_name: "main".to_string(),
+                default_branch: "main".to_string(),
+                base_commit: "base".to_string(),
+                head_commit: "head".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_reviews_own_independent_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("ctf-review-owner_repo-PR42");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("sentinel"), "legacy").unwrap();
+
+        let first =
+            prepared(create_workspace_directory("owner/repo", 42, Some(root.path())).unwrap());
+        let first_path = first.directory.path().to_path_buf();
+        std::fs::write(first_path.join("sentinel"), "first").unwrap();
+        let second =
+            prepared(create_workspace_directory("owner/repo", 42, Some(root.path())).unwrap());
+        let second_path = second.directory.path().to_path_buf();
+        std::fs::write(second_path.join("sentinel"), "second").unwrap();
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            std::fs::read_to_string(first_path.join("sentinel")).unwrap(),
+            "first"
+        );
+        first.cleanup().await.unwrap();
+        assert!(!first_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(second_path.join("sentinel")).unwrap(),
+            "second"
+        );
+        drop(second);
+        assert!(!second_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("sentinel")).unwrap(),
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn workspace_base_can_be_created_but_cannot_be_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("new/base");
+        let directory = create_workspace_directory("owner/repo", 42, Some(&nested)).unwrap();
+        assert_eq!(directory.path().parent(), Some(nested.as_path()));
+
+        let file = root.path().join("file");
+        std::fs::write(&file, "preserve").unwrap();
+        assert!(create_workspace_directory("owner/repo", 42, Some(&file)).is_err());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "preserve");
+    }
 
     #[test]
     fn pr_context_fields_use_gh_supported_merged_timestamp() {
