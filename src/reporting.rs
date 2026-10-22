@@ -657,7 +657,7 @@ pub fn reporting_tools() -> Vec<Tool> {
                     ("confirmed", bool_schema("Whether the finding is confirmed")),
                     (
                         "introduced_by_pr",
-                        bool_schema("Whether the PR introduced the issue"),
+                        bool_schema("Whether changed code introduces a failure or materially worsens its reachability or impact; worsening requires specific changed code and a concrete base-versus-PR comparison. Unchanged pre-existing issues do not qualify. Keep base/default presence fields truthful."),
                     ),
                     (
                         "present_on_pr_branch",
@@ -690,7 +690,7 @@ pub fn reporting_tools() -> Vec<Tool> {
                         "command_transcripts",
                         array_schema(command_transcript_schema()),
                     ),
-                    ("rationale", string_schema("Verifier rationale")),
+                    ("rationale", string_schema("Classify evidence as reproduced, established by inspection, or unresolved; explain the failure path, counterevidence, and base-versus-PR comparison. Unresolved assumptions require suppression.")),
                 ],
                 vec![
                     "finding_id",
@@ -1310,6 +1310,76 @@ mod tests {
             findings,
             verdicts,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn review_policy_examples_preserve_disclosure_gates() {
+        // These fixtures exercise host handling of verifier decisions, not model reasoning.
+        for (name, confirmed, introduced, disclose, rationale, expected) in [
+            (
+                "worsened",
+                true,
+                true,
+                "disclose",
+                "Established by inspection: base checks authorization before the unsafe helper; the PR adds a reachable caller bypassing that guard.",
+                1,
+            ),
+            (
+                "unchanged",
+                true,
+                false,
+                "suppress",
+                "Established by inspection: the same caller and impact exist on base and PR; changed code does not worsen the failure.",
+                0,
+            ),
+            (
+                "effective guard",
+                false,
+                false,
+                "suppress",
+                "Established by inspection: all callers validate the input before reaching the alleged failure.",
+                0,
+            ),
+            (
+                "inspection only",
+                true,
+                true,
+                "disclose",
+                "Established by inspection: the added caller passes zero to an unconditional division; the cited caller and callee establish the complete failure path. No reproduction executed.",
+                1,
+            ),
+            (
+                "unresolved",
+                false,
+                false,
+                "suppress",
+                "Unresolved: caller reachability has not been established.",
+                0,
+            ),
+        ] {
+            let mut artifact = accepted_artifact(1);
+            let verdict = &mut artifact.verdicts[0];
+            verdict.confirmed = confirmed;
+            verdict.introduced_by_pr = introduced;
+            verdict.present_on_base = name == "worsened" || name == "unchanged";
+            verdict.present_on_default_branch = verdict.present_on_base;
+            verdict.disclosure_decision = disclose.to_string();
+            verdict.rationale = rationale.to_string();
+            verdict.command_transcripts = vec![CommandTranscript {
+                command: "git show base:src/lib.rs; git show head:src/lib.rs".to_string(),
+                branch_or_commit: "base and head".to_string(),
+                key_output: "fixture: caller and callee source at both revisions".to_string(),
+                interpretation: rationale.to_string(),
+            }];
+            let accepted = artifact.accepted_findings(&policy());
+            assert_eq!(accepted.len(), expected, "{name}");
+            if let Some(finding) = accepted.first() {
+                assert_eq!(finding.verdict.rationale, rationale);
+                assert_eq!(finding.verdict.present_on_base, name == "worsened");
+            }
+            artifact.verdicts[0].command_transcripts.clear();
+            assert!(artifact.accepted_findings(&policy()).is_empty(), "{name}");
         }
     }
 
