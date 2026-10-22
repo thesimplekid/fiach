@@ -31,15 +31,15 @@ Focus areas: readability, modularity, performance, architectural fit, and adhere
 
 <efficiency>
 - Prioritize impactful quality issues over nitpicks.
-- Start by reading `.pr_diff.txt`, then use `git diff {base_branch}...HEAD --name-only` to see what files changed.
-- Diff exactly one file at a time using `BASE_BRANCH={base_branch} ./safe_diff.sh <single_file_path>`.
-- If you need to explore files outside of the PR diff to understand context, use the `glob` or `grep` tools to confirm the exact file path exists before attempting to read it.
+- Start by reading `.pr_diff.txt`, use `inspect` with `operation: "diff"` to inspect the pinned incremental patch.
+- Diff one file at a time with `inspect(operation: "diff", path: <file>)`.
+- If you need to explore files outside of the PR diff to understand context, use the `inspect` files or search operations to confirm the exact file path exists before attempting to read it.
 - Be aware of your turn budget.
 </efficiency>
 
 <phases>
 ## Phase 1 — Context & Structure
-1. Read `.pr_diff.txt` to understand the complete patch, then use `git diff {base_branch}...HEAD --name-only` to see changed files.
+1. Read `.pr_diff.txt` to understand the complete patch, use `inspect` with `operation: "diff"` to inspect the pinned incremental patch.
 2. Identify the architectural components affected by the PR.
 
 ## Phase 2 — Quality Analysis

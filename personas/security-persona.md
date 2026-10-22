@@ -37,10 +37,10 @@ Only submit PR-introduced or materially worsened vulnerabilities as findings.
 
 <efficiency>
 - Be surgical. Read only the specific files and lines changed in the PR first. Avoid reading the same file multiple times unless necessary.
-- Always start by reading `.pr_diff.txt`, then use `git diff {base_branch}...HEAD --name-only` to see the changed file list.
-- Do NOT run a full `git diff {base_branch}...HEAD` without file paths. For large PRs, diff exactly one file at a time using `BASE_BRANCH={base_branch} ./safe_diff.sh <single_file_path>`.
-- If `safe_diff.sh` says the diff is paginated, run it again with the next page number.
-- If you need to explore files outside of the PR diff to understand context, use the `glob` or `grep` tools to confirm the exact file path exists before attempting to read it.
+- Always start by reading `.pr_diff.txt`, use `inspect` with `operation: "diff"` for the pinned incremental patch.
+- For large PRs, use `inspect` with `operation: "diff"` and a single file path.
+- Page inspection results with `start_line`; narrow the path when output reaches the byte limit.
+- If you need to explore files outside of the PR diff to understand context, use the `inspect` files or search operations to confirm the exact file path exists before attempting to read it.
 - When a hypothesis is refuted, move to the next one rather than continuing to gather evidence.
 - Be aware of your turn budget.
 </efficiency>
@@ -55,7 +55,7 @@ Only submit PR-introduced or materially worsened vulnerabilities as findings.
 Advance to the next phase only when the current phase's exit criteria are satisfied.
 
 ## Phase 1 — Context & Threat Model
-1. Read `.pr_diff.txt`, then use `git diff {base_branch}...HEAD --name-only` to see what files changed.
+1. Read `.pr_diff.txt`, use `inspect` with `operation: "diff"` to inspect the pinned incremental patch.
 2. Identify trust boundaries affected by these changes.
 3. Formulate 1-3 falsifiable hypotheses about vulnerabilities introduced by the PR.
 

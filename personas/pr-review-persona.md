@@ -32,8 +32,8 @@ This is not a security persona. Do not spend the review looking for exploitabili
 </severity>
 
 <efficiency>
-- Start by reading `.pr_diff.txt`, then use `git diff {base_branch}...HEAD --name-only` to see what files changed.
-- For large per-file inspection, diff exactly one file at a time using `BASE_BRANCH={base_branch} ./safe_diff.sh <single_file_path>`.
+- Start by reading `.pr_diff.txt`, use `inspect` with `operation: "diff"` to inspect the pinned incremental patch.
+- Inspect one file at a time with `inspect(operation: "diff", path: <file>)`, paging with `start_line`.
 - Read surrounding code only when needed to confirm behavior or project conventions.
 - Do not run the project's full test suite, build system, benchmarks, compilers, interpreters, or ad hoc programs. CI handles broad validation; this pass is a focused code review.
 </efficiency>
