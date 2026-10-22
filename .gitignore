@@ -1,4 +1,6 @@
 /target
+/result
+/result-*
 .env
 reports/
 fiach.redb

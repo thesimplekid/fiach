@@ -13,12 +13,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
-    runs-on: ubuntu-latest
+  rust-checks:
+    name: Rust checks
+    runs-on: rith-nix
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      # rith-nix supplies Nix and the Attic substituters/keys through NixOS.
+      - name: Show Nix caches
+        run: nix config show substituters
       - name: Rust checks
         run: nix develop --command just check
+
+  flake-checks:
+    name: Flake checks
+    runs-on: rith-nix
+    steps:
+      - uses: actions/checkout@v4
+      # rith-nix supplies Nix and the Attic substituters/keys through NixOS.
+      - name: Show Nix caches
+        run: nix config show substituters
       - name: Flake checks
         run: nix flake check --no-write-lock-file -L
