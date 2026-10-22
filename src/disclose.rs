@@ -262,16 +262,9 @@ pub async fn handle_structured_disclosure_idempotent(
                 "{}\n\n{marker}",
                 crate::reporting::review_summary_body(&accepted)
             );
-            post_pr_review(
-                target.repo,
-                target.pr_number,
-                &body,
-                comments,
-                &marker,
-                recovering,
-            )
-            .await
-            .map(Some)
+            post_pr_review(target, &body, comments, &marker, recovering)
+                .await
+                .map(Some)
         }
         StructuredDisclosureRoute::SyncPr => {
             let sync_repo = config
@@ -464,19 +457,42 @@ struct ReviewCommentPayload {
 
 #[derive(Serialize)]
 struct ReviewPayload {
+    commit_id: String,
     event: &'static str,
     body: String,
     comments: Vec<ReviewCommentPayload>,
 }
 
+fn review_payload(
+    target: DisclosureTarget<'_>,
+    body: &str,
+    comments: Vec<InlineComment>,
+) -> ReviewPayload {
+    ReviewPayload {
+        commit_id: target.commit_hash.to_string(),
+        event: "COMMENT",
+        body: body.to_string(),
+        comments: comments
+            .into_iter()
+            .map(|comment| ReviewCommentPayload {
+                path: comment.path,
+                line: comment.line,
+                side: "RIGHT",
+                body: comment.body,
+            })
+            .collect(),
+    }
+}
+
 async fn post_pr_review(
-    repo: &str,
-    pr_number: u64,
+    target: DisclosureTarget<'_>,
     body: &str,
     comments: Vec<InlineComment>,
     marker: &str,
     recovering: bool,
 ) -> Result<String> {
+    let repo = target.repo;
+    let pr_number = target.pr_number;
     tracing::info!(
         repo = %repo,
         pr = pr_number,
@@ -489,19 +505,7 @@ async fn post_pr_review(
         return Ok(url);
     }
 
-    let payload = ReviewPayload {
-        event: "COMMENT",
-        body: body.to_string(),
-        comments: comments
-            .into_iter()
-            .map(|comment| ReviewCommentPayload {
-                path: comment.path,
-                line: comment.line,
-                side: "RIGHT",
-                body: comment.body,
-            })
-            .collect(),
-    };
+    let payload = review_payload(target, body, comments);
 
     let input = tempfile::NamedTempFile::new().context("Failed to create review payload file")?;
     tokio::fs::write(input.path(), serde_json::to_vec(&payload)?)
@@ -1225,6 +1229,32 @@ fn extract_title(content: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn review_payload_pins_inline_and_summary_reviews_to_reviewed_commit() {
+        let target = DisclosureTarget {
+            repo: "owner/repo",
+            pr_number: 42,
+            commit_hash: "reviewed-sha",
+            review_kind: "security",
+        };
+        for comments in [
+            vec![],
+            vec![InlineComment {
+                path: "src/lib.rs".to_string(),
+                line: 12,
+                body: "Finding".to_string(),
+            }],
+        ] {
+            let value = serde_json::to_value(review_payload(target, "Summary", comments)).unwrap();
+            assert_eq!(value["commit_id"], "reviewed-sha");
+            assert_eq!(value["event"], "COMMENT");
+            if !value["comments"].as_array().unwrap().is_empty() {
+                assert_eq!(value["comments"][0]["line"], 12);
+                assert_eq!(value["comments"][0]["side"], "RIGHT");
+            }
+        }
+    }
 
     use crate::reporting::{
         AffectedLocation, CommandTranscript, DisclosurePolicy, DuplicateDecision, Finding,
