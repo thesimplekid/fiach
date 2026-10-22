@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::github::{GhCli, GitHub};
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
 use crate::reporting::{DisclosurePolicy, InlineComment, ReportingArtifact};
 
@@ -171,6 +172,7 @@ pub async fn handle_disclosure_idempotent(
             }
             let marker = disclosure_marker(target, config);
             post_pr_comment(
+                &GhCli::default(),
                 report_path,
                 target.repo,
                 target.pr_number,
@@ -178,7 +180,6 @@ pub async fn handle_disclosure_idempotent(
                 recovering,
             )
             .await
-            .map(Some)
         }
         ReportMode::SyncPr => {
             if !findings_found && !config.notify_on_empty {
@@ -211,6 +212,7 @@ pub async fn handle_disclosure_idempotent(
             if policy_comments_allowed(target.review_kind) {
                 let marker = disclosure_marker(target, config);
                 post_pr_comment(
+                    &GhCli::default(),
                     report_path,
                     target.repo,
                     target.pr_number,
@@ -218,7 +220,6 @@ pub async fn handle_disclosure_idempotent(
                     recovering,
                 )
                 .await
-                .map(Some)
             } else {
                 Ok(None)
             }
@@ -262,9 +263,15 @@ pub async fn handle_structured_disclosure_idempotent(
                 "{}\n\n{marker}",
                 crate::reporting::review_summary_body(&accepted)
             );
-            post_pr_review(target, &body, comments, &marker, recovering)
-                .await
-                .map(Some)
+            post_pr_review(
+                &GhCli::default(),
+                target,
+                &body,
+                comments,
+                &marker,
+                recovering,
+            )
+            .await
         }
         StructuredDisclosureRoute::SyncPr => {
             let sync_repo = config
@@ -391,32 +398,48 @@ fn policy_comments_allowed(review_kind: &str) -> bool {
         || review_kind == "builtin:pr-review"
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum LivePrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+#[derive(Debug, Deserialize)]
+struct LivePrLifecycle {
+    state: LivePrState,
+    // Require the field even when null: incomplete responses must fail closed.
+    #[serde(rename = "mergedAt", deserialize_with = "Deserialize::deserialize")]
+    merged_at: Option<String>,
+}
+
+async fn live_comments_allowed(github: &dyn GitHub, repo: &str, pr_number: u64) -> Result<bool> {
+    let lifecycle: LivePrLifecycle = serde_json::from_value(
+        github
+            .pr_context(repo, pr_number)
+            .await
+            .context("Failed to refresh PR lifecycle before publication")?,
+    )
+    .context("Invalid PR lifecycle response before publication")?;
+    let allowed = matches!(lifecycle.state, LivePrState::Open) && lifecycle.merged_at.is_none();
+    if !allowed {
+        tracing::info!(repo, pr = pr_number, state = ?lifecycle.state, "PR no longer open; skipping publication");
+    }
+    Ok(allowed)
+}
+
 async fn find_existing_disclosure(
+    github: &dyn GitHub,
     repo: &str,
     pr_number: u64,
     marker: &str,
     recovering: bool,
 ) -> Result<Option<String>> {
-    let result = async {
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &pr_number.to_string(),
-                "--repo",
-                repo,
-                "--json",
-                "comments,reviews",
-            ])
-            .output_bounded("checking for an existing Fiach disclosure")
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("gh pr view failed while checking disclosure history: {stderr}");
-        }
-
-        let discussion: ExistingDiscussion = serde_json::from_slice(&output.stdout)
-            .context("Failed to parse pull request disclosure history")?;
+    let result: Result<Option<String>> = async {
+        let discussion: ExistingDiscussion =
+            serde_json::from_value(github.discussion(repo, pr_number).await?)
+                .context("Failed to parse pull request disclosure history")?;
         Ok(discussion
             .comments
             .into_iter()
@@ -485,12 +508,13 @@ fn review_payload(
 }
 
 async fn post_pr_review(
+    github: &dyn GitHub,
     target: DisclosureTarget<'_>,
     body: &str,
     comments: Vec<InlineComment>,
     marker: &str,
     recovering: bool,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let repo = target.repo;
     let pr_number = target.pr_number;
     tracing::info!(
@@ -500,40 +524,27 @@ async fn post_pr_review(
         "Posting structured PR review"
     );
 
-    if let Some(url) = find_existing_disclosure(repo, pr_number, marker, recovering).await? {
+    if let Some(url) = find_existing_disclosure(github, repo, pr_number, marker, recovering).await?
+    {
         tracing::info!(repo = %repo, pr = pr_number, url = %url, "Reusing existing structured PR review");
-        return Ok(url);
+        return Ok(Some(url));
     }
 
     let payload = review_payload(target, body, comments);
 
-    let input = tempfile::NamedTempFile::new().context("Failed to create review payload file")?;
-    tokio::fs::write(input.path(), serde_json::to_vec(&payload)?)
-        .await
-        .context("Failed to write review payload")?;
-
-    let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
-    let output = Command::new("gh")
-        .args(["api", &endpoint, "--method", "POST", "--input"])
-        .arg(input.path())
-        .output_bounded("posting a structured pull request review")
-        .await
-        .context("Failed to run `gh api` for PR review")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh api PR review failed: {stderr}");
+    if !live_comments_allowed(github, repo, pr_number).await? {
+        return Ok(None);
     }
-
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("Failed to parse PR review response")?;
+    let value = github
+        .publish_review(repo, pr_number, &serde_json::to_value(payload)?)
+        .await?;
     let url = value
         .get("html_url")
         .and_then(|value| value.as_str())
         .unwrap_or("unknown")
         .to_string();
     tracing::info!("Successfully posted structured PR review: {}", url);
-    Ok(url)
+    Ok(Some(url))
 }
 
 pub async fn post_pr_reaction(repo: &str, pr_number: u64, reaction: &str) -> Result<()> {
@@ -709,21 +720,23 @@ fn normalize_reaction_content(reaction: &str) -> Result<&'static str> {
 }
 
 async fn post_pr_comment(
+    github: &dyn GitHub,
     report_path: &Path,
     repo: &str,
     pr_number: u64,
     marker: &str,
     recovering: bool,
-) -> Result<String> {
+) -> Result<Option<String>> {
     tracing::info!(
         repo = %repo,
         pr = pr_number,
         "Posting comment to PR"
     );
 
-    if let Some(url) = find_existing_disclosure(repo, pr_number, marker, recovering).await? {
+    if let Some(url) = find_existing_disclosure(github, repo, pr_number, marker, recovering).await?
+    {
         tracing::info!(repo = %repo, pr = pr_number, url = %url, "Reusing existing PR comment");
-        return Ok(url);
+        return Ok(Some(url));
     }
 
     let report = tokio::fs::read_to_string(report_path)
@@ -737,6 +750,10 @@ async fn post_pr_comment(
         .path()
         .to_str()
         .context("Report path must be valid UTF-8")?;
+
+    if !live_comments_allowed(github, repo, pr_number).await? {
+        return Ok(None);
+    }
 
     let output = Command::new("gh")
         .args([
@@ -759,7 +776,7 @@ async fn post_pr_comment(
 
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     tracing::info!("Successfully posted comment to PR #{}: {}", pr_number, url);
-    Ok(url)
+    Ok(Some(url))
 }
 
 async fn create_sync_pr(
@@ -1229,6 +1246,203 @@ fn extract_title(content: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::github::{DiscoveryRequest, GitHubFuture, PullRequestSummary, SyncPullRequest};
+
+    struct PublicationGitHub {
+        lifecycle: serde_json::Value,
+        fail_context: bool,
+        existing: bool,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+        payload: std::sync::Mutex<Option<serde_json::Value>>,
+    }
+
+    impl PublicationGitHub {
+        fn new(lifecycle: serde_json::Value) -> Self {
+            Self {
+                lifecycle,
+                fail_context: false,
+                existing: false,
+                calls: Default::default(),
+                payload: Default::default(),
+            }
+        }
+    }
+
+    impl GitHub for PublicationGitHub {
+        fn pr_context<'a>(&'a self, _: &'a str, _: u64) -> GitHubFuture<'a, serde_json::Value> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("context");
+                if self.fail_context {
+                    bail!("lookup unavailable");
+                }
+                Ok(self.lifecycle.clone())
+            })
+        }
+        fn discussion<'a>(&'a self, _: &'a str, _: u64) -> GitHubFuture<'a, serde_json::Value> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("discussion");
+                Ok(if self.existing {
+                    serde_json::json!({"comments": [], "reviews": [{"body": "marker", "url": "existing"}]})
+                } else {
+                    serde_json::json!({"comments": [], "reviews": []})
+                })
+            })
+        }
+        fn publish_review<'a>(
+            &'a self,
+            _: &'a str,
+            _: u64,
+            payload: &'a serde_json::Value,
+        ) -> GitHubFuture<'a, serde_json::Value> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("publish");
+                *self.payload.lock().unwrap() = Some(payload.clone());
+                Ok(serde_json::json!({"html_url": "published"}))
+            })
+        }
+        fn discover<'a>(
+            &'a self,
+            _: DiscoveryRequest<'a>,
+        ) -> GitHubFuture<'a, Vec<PullRequestSummary>> {
+            panic!("unexpected discovery")
+        }
+        fn react<'a>(&'a self, _: &'a str, _: u64, _: &'a str) -> GitHubFuture<'a, ()> {
+            panic!("unexpected reaction")
+        }
+        fn clone_workspace<'a>(&'a self, _: &'a str, _: u64, _: &'a Path) -> GitHubFuture<'a, ()> {
+            panic!("unexpected clone")
+        }
+        fn create_sync_pr<'a>(&'a self, _: SyncPullRequest<'a>) -> GitHubFuture<'a, String> {
+            panic!("unexpected sync")
+        }
+    }
+
+    fn publication_target() -> DisclosureTarget<'static> {
+        DisclosureTarget {
+            repo: "owner/repo",
+            pr_number: 42,
+            commit_hash: "reviewed-sha",
+            review_kind: "security",
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_refreshes_lifecycle_and_keeps_reviewed_sha_when_head_moves() {
+        let github = PublicationGitHub::new(
+            serde_json::json!({"state": "OPEN", "mergedAt": null, "headRefOid": "new-sha"}),
+        );
+        for recovering in [false, true] {
+            github.calls.lock().unwrap().clear();
+            let url = post_pr_review(
+                &github,
+                publication_target(),
+                "summary",
+                vec![],
+                "marker",
+                recovering,
+            )
+            .await
+            .unwrap();
+            assert_eq!(url.as_deref(), Some("published"));
+            assert_eq!(
+                *github.calls.lock().unwrap(),
+                ["discussion", "context", "publish"]
+            );
+            assert_eq!(
+                github.payload.lock().unwrap().as_ref().unwrap()["commit_id"],
+                "reviewed-sha"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_or_merged_prs_receive_neither_reviews_nor_legacy_comments() {
+        let report = tempfile::NamedTempFile::new().unwrap();
+        for lifecycle in [
+            serde_json::json!({"state": "CLOSED", "mergedAt": null}),
+            serde_json::json!({"state": "MERGED", "mergedAt": "2026-10-22T00:00:00Z"}),
+            serde_json::json!({"state": "OPEN", "mergedAt": "2026-10-22T00:00:00Z"}),
+        ] {
+            let github = PublicationGitHub::new(lifecycle);
+            assert!(
+                post_pr_review(
+                    &github,
+                    publication_target(),
+                    "summary",
+                    vec![],
+                    "marker",
+                    false
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                post_pr_comment(&github, report.path(), "owner/repo", 42, "marker", false)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                *github.calls.lock().unwrap(),
+                ["discussion", "context", "discussion", "context"]
+            );
+            assert!(github.payload.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_errors_fail_closed_and_recovery_reuses_existing_receipt() {
+        let report = tempfile::NamedTempFile::new().unwrap();
+        for lifecycle in [
+            serde_json::json!({}),
+            serde_json::json!({"state": "OPEN"}),
+            serde_json::json!({"state": "UNKNOWN", "mergedAt": null}),
+            serde_json::json!({"state": "OPEN", "mergedAt": false}),
+            serde_json::json!({"state": "OPEN", "mergedAt": null}),
+        ] {
+            let mut github = PublicationGitHub::new(lifecycle);
+            github.fail_context = github.lifecycle["state"] == "OPEN"
+                && github.lifecycle.get("mergedAt") == Some(&serde_json::Value::Null);
+            assert!(
+                post_pr_review(
+                    &github,
+                    publication_target(),
+                    "summary",
+                    vec![],
+                    "marker",
+                    true
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                post_pr_comment(&github, report.path(), "owner/repo", 42, "marker", true)
+                    .await
+                    .is_err()
+            );
+            assert!(github.payload.lock().unwrap().is_none());
+
+            github.existing = true;
+            github.calls.lock().unwrap().clear();
+            assert_eq!(
+                post_pr_review(
+                    &github,
+                    publication_target(),
+                    "summary",
+                    vec![],
+                    "marker",
+                    true
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                Some("existing")
+            );
+            assert_eq!(*github.calls.lock().unwrap(), ["discussion"]);
+        }
+    }
 
     #[test]
     fn review_payload_pins_inline_and_summary_reviews_to_reviewed_commit() {
