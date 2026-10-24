@@ -239,7 +239,7 @@ struct ShouldReviewInput<'a> {
     current_hash: &'a str,
     review_kind: &'a str,
     force: bool,
-    timeout_mins: u64,
+    stale_after_secs: u64,
     max_failed_retries: Option<u32>,
 }
 
@@ -397,7 +397,7 @@ pub fn should_review(
     current_hash: &str,
     review_kind: &str,
     force: bool,
-    timeout_mins: u64,
+    stale_after_secs: u64,
 ) -> Result<ReviewDecision> {
     should_review_inner(ShouldReviewInput {
         db_path,
@@ -406,7 +406,7 @@ pub fn should_review(
         current_hash,
         review_kind,
         force,
-        timeout_mins,
+        stale_after_secs,
         max_failed_retries: None,
     })
 }
@@ -418,7 +418,7 @@ pub fn should_review_with_retry_limit(
     pr: u64,
     current_hash: &str,
     review_kind: &str,
-    timeout_mins: u64,
+    stale_after_secs: u64,
     max_failed_retries: u32,
 ) -> Result<ReviewDecision> {
     should_review_inner(ShouldReviewInput {
@@ -428,7 +428,7 @@ pub fn should_review_with_retry_limit(
         current_hash,
         review_kind,
         force: false,
-        timeout_mins,
+        stale_after_secs,
         max_failed_retries: Some(max_failed_retries),
     })
 }
@@ -441,7 +441,7 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
         current_hash,
         review_kind,
         force,
-        timeout_mins,
+        stale_after_secs,
         max_failed_retries,
     } = input;
 
@@ -478,14 +478,12 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                     if metadata.status == "in_progress" {
                         let now = time::OffsetDateTime::now_utc().unix_timestamp();
                         let age_secs = now.saturating_sub(metadata.timestamp);
-                        let timeout_secs = (timeout_mins + 10) * 60; // 10 min grace period
-
-                        if age_secs as u64 > timeout_secs {
+                        if age_secs as u64 > stale_after_secs {
                             tracing::warn!(
                                 repo,
                                 pr,
                                 age_secs,
-                                timeout_secs,
+                                stale_after_secs,
                                 "Found stale in_progress lock, proceeding with review"
                             );
                             if metadata.commit_hash == current_hash {
@@ -504,7 +502,7 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                             {
                                 let now = time::OffsetDateTime::now_utc().unix_timestamp();
                                 let age_secs = now.saturating_sub(metadata.timestamp);
-                                let retry_cooldown_secs = (timeout_mins + 10) * 60;
+                                let retry_cooldown_secs = stale_after_secs;
 
                                 if age_secs as u64 <= retry_cooldown_secs {
                                     tracing::warn!(
@@ -613,7 +611,7 @@ pub fn lock_for_review(
     pr: u64,
     commit_hash: &str,
     review_kind: &str,
-    timeout_mins: u64,
+    stale_after_secs: u64,
 ) -> Result<bool> {
     if !db_path.exists() {
         // Proceed and let open_database create it.
@@ -634,16 +632,14 @@ pub fn lock_for_review(
                     if metadata.status == "in_progress" {
                         let now = time::OffsetDateTime::now_utc().unix_timestamp();
                         let age_secs = now - metadata.timestamp;
-                        let timeout_secs = (timeout_mins + 10) * 60; // 10 min grace period
-
-                        if age_secs as u64 <= timeout_secs {
+                        if age_secs as u64 <= stale_after_secs {
                             return Ok(false);
                         } else {
                             tracing::warn!(
                                 repo,
                                 pr,
                                 age_secs,
-                                timeout_secs,
+                                stale_after_secs,
                                 "Overwriting stale in_progress lock"
                             );
                         }
@@ -1008,7 +1004,7 @@ impl RedbStateStore {
         .context("State recovery task failed")?
     }
 
-    pub async fn try_claim(&self, mut record: ReviewRecord, timeout_mins: u64) -> Result<bool> {
+    pub async fn try_claim(&self, mut record: ReviewRecord, stale_after_secs: u64) -> Result<bool> {
         let database = Arc::clone(&self.database);
         tokio::task::spawn_blocking(move || {
             let write = database.begin_write()?;
@@ -1023,7 +1019,7 @@ impl RedbStateStore {
                             .unix_timestamp()
                             .saturating_sub(previous.timestamp)
                             as u64;
-                        if age <= (timeout_mins + 10) * 60 {
+                        if age <= stale_after_secs {
                             return Ok(false);
                         }
                     }
@@ -1208,6 +1204,8 @@ fn to_absolute(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    const STALE_AFTER_SECS: u64 = 2_400;
+
     fn metadata(commit_hash: &str, status: &str, retry_count: u32) -> ReviewMetadata {
         metadata_with_timestamp(
             commit_hash,
@@ -1306,11 +1304,29 @@ mod tests {
         mark_reviewed(&db_path, repo, pr, &metadata(commit, "failed", 2)).unwrap();
 
         assert_eq!(
-            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
+            should_review_with_retry_limit(
+                &db_path,
+                repo,
+                pr,
+                commit,
+                review_kind,
+                STALE_AFTER_SECS,
+                3
+            )
+            .unwrap(),
             ReviewDecision::RetryFailed
         );
         assert_eq!(
-            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 2).unwrap(),
+            should_review_with_retry_limit(
+                &db_path,
+                repo,
+                pr,
+                commit,
+                review_kind,
+                STALE_AFTER_SECS,
+                2
+            )
+            .unwrap(),
             ReviewDecision::Skip
         );
     }
@@ -1333,7 +1349,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
+            should_review_with_retry_limit(
+                &db_path,
+                repo,
+                pr,
+                commit,
+                review_kind,
+                STALE_AFTER_SECS,
+                3
+            )
+            .unwrap(),
             ReviewDecision::RetryFailed
         );
     }
@@ -1356,7 +1381,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
+            should_review_with_retry_limit(
+                &db_path,
+                repo,
+                pr,
+                commit,
+                review_kind,
+                STALE_AFTER_SECS,
+                3
+            )
+            .unwrap(),
             ReviewDecision::RetryFailed
         );
     }
@@ -1373,8 +1407,68 @@ mod tests {
         mark_reviewed(&db_path, repo, pr, &metadata(commit, "in_progress", 0)).unwrap();
 
         assert_eq!(
-            should_review_with_retry_limit(&db_path, repo, pr, commit, review_kind, 30, 3).unwrap(),
+            should_review_with_retry_limit(
+                &db_path,
+                repo,
+                pr,
+                commit,
+                review_kind,
+                STALE_AFTER_SECS,
+                3
+            )
+            .unwrap(),
             ReviewDecision::Skip
+        );
+    }
+
+    #[test]
+    fn in_progress_claim_holds_until_stale_after_elapses() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let repo = "owner/repo";
+        let pr = 42;
+        let commit = "abcdef";
+        let review_kind = "security";
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let stale_after = STALE_AFTER_SECS as i64;
+
+        let live = metadata_with_timestamp(commit, "in_progress", 0, now - stale_after + 60);
+        mark_reviewed(&db_path, repo, pr, &live).unwrap();
+        assert_eq!(
+            should_review_with_retry_limit(
+                &db_path,
+                repo,
+                pr,
+                commit,
+                review_kind,
+                STALE_AFTER_SECS,
+                3
+            )
+            .unwrap(),
+            ReviewDecision::Skip
+        );
+        // A newer commit must not take over a claim that may still be running.
+        assert!(
+            !lock_for_review(&db_path, repo, pr, "newer", review_kind, STALE_AFTER_SECS).unwrap()
+        );
+
+        let abandoned = metadata_with_timestamp(commit, "in_progress", 0, now - stale_after - 60);
+        mark_reviewed(&db_path, repo, pr, &abandoned).unwrap();
+        assert_eq!(
+            should_review_with_retry_limit(
+                &db_path,
+                repo,
+                pr,
+                commit,
+                review_kind,
+                STALE_AFTER_SECS,
+                3
+            )
+            .unwrap(),
+            ReviewDecision::RetryFailed
+        );
+        assert!(
+            lock_for_review(&db_path, repo, pr, "newer", review_kind, STALE_AFTER_SECS).unwrap()
         );
     }
 
@@ -1393,7 +1487,17 @@ mod tests {
         });
         mark_reviewed(&db_path, repo, pr, &first).unwrap();
 
-        assert!(lock_for_review(&db_path, repo, pr, "new-commit", review_kind, 30).unwrap());
+        assert!(
+            lock_for_review(
+                &db_path,
+                repo,
+                pr,
+                "new-commit",
+                review_kind,
+                STALE_AFTER_SECS
+            )
+            .unwrap()
+        );
         let locked = get_pr_review(&db_path, repo, pr, review_kind)
             .unwrap()
             .unwrap();
@@ -1461,7 +1565,9 @@ mod tests {
 
         mark_reviewed(&db_path, repo, pr, &metadata(commit, "failed", 0)).unwrap();
 
-        assert!(lock_for_review(&db_path, repo, pr, commit, review_kind, 30).unwrap());
+        assert!(
+            lock_for_review(&db_path, repo, pr, commit, review_kind, STALE_AFTER_SECS).unwrap()
+        );
 
         let locked = get_pr_review(&db_path, repo, pr, review_kind)
             .unwrap()
@@ -1487,7 +1593,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(lock_for_review(&db_path, repo, pr, commit, review_kind, 30).unwrap());
+        assert!(
+            lock_for_review(&db_path, repo, pr, commit, review_kind, STALE_AFTER_SECS).unwrap()
+        );
 
         let locked = get_pr_review(&db_path, repo, pr, review_kind)
             .unwrap()
@@ -1506,7 +1614,16 @@ mod tests {
         mark_reviewed(&db_path, "owner/repo", 42, &record).unwrap();
 
         assert_eq!(
-            should_review(&db_path, "owner/repo", 42, "abcdef", "security", false, 30,).unwrap(),
+            should_review(
+                &db_path,
+                "owner/repo",
+                42,
+                "abcdef",
+                "security",
+                false,
+                STALE_AFTER_SECS
+            )
+            .unwrap(),
             ReviewDecision::Skip
         );
         assert_eq!(list_reviews(&db_path).unwrap().len(), 1);
@@ -1521,8 +1638,8 @@ mod tests {
         record.pr_number = 7;
 
         let (first, second) = tokio::join!(
-            store.try_claim(record.clone(), 30),
-            store.try_claim(record, 30)
+            store.try_claim(record.clone(), STALE_AFTER_SECS),
+            store.try_claim(record, STALE_AFTER_SECS)
         );
         assert_ne!(first.unwrap(), second.unwrap());
         assert_eq!(

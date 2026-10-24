@@ -940,6 +940,14 @@ pub async fn run_daemon(
     Ok(())
 }
 
+fn claim_stale_after_secs(params: &DaemonParams) -> u64 {
+    crate::review::claim_stale_after_secs(
+        params.timeout_mins,
+        params.verify_findings,
+        params.dedupe_existing_comments,
+    )
+}
+
 fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
     #[allow(clippy::collapsible_if)]
     if let Ok(decision) = crate::state::should_review(
@@ -949,7 +957,7 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
         &job.pr.head_ref_oid,
         &job.review_kind,
         false,
-        params.timeout_mins,
+        claim_stale_after_secs(params),
     ) {
         if decision != crate::state::ReviewDecision::Skip {
             let meta = crate::state::ReviewMetadata {
@@ -1091,7 +1099,7 @@ async fn process_daemon_job(
         pr.number,
         &pr.head_ref_oid,
         &job.review_kind,
-        params.timeout_mins,
+        claim_stale_after_secs(params),
         params.max_retries,
     );
 
@@ -1145,7 +1153,7 @@ async fn process_daemon_job(
                 pr.number,
                 &pr.head_ref_oid,
                 &job.review_kind,
-                params.timeout_mins,
+                claim_stale_after_secs(params),
             ) {
                 Ok(true) => {
                     tracing::debug!(
@@ -1827,18 +1835,11 @@ async fn run_sandboxed_review(
         );
     }
 
-    // The child now includes coordinator duplicate adjudication as well as finding
-    // and verification. Allow each enabled phase its configured timeout plus setup.
-    let phase_count = 1
-        + u64::from(review_params.verify_findings)
-        + u64::from(review_params.verify_findings && review_params.dedupe_existing_comments);
-    let timeout_duration = std::time::Duration::from_secs(
-        review_params
-            .timeout_mins
-            .saturating_mul(60)
-            .saturating_mul(phase_count)
-            .saturating_add(300),
-    );
+    let timeout_duration = std::time::Duration::from_secs(crate::review::hard_timeout_secs(
+        review_params.timeout_mins,
+        review_params.verify_findings,
+        review_params.dedupe_existing_comments,
+    ));
 
     tokio::select! {
         status_res = tokio::time::timeout(timeout_duration, child.wait()) => {

@@ -429,6 +429,37 @@ pub struct ReviewParams {
     pub execution: ReviewExecution,
 }
 
+/// Allowance for workspace preparation and sandbox startup outside phase timeouts.
+const REVIEW_SETUP_SECS: u64 = 300;
+/// Extra age beyond the hard timeout before an in-progress claim counts as abandoned.
+const CLAIM_STALE_GRACE_SECS: u64 = 600;
+
+/// Upper bound on one review's wall-clock time. Each enabled phase (finder,
+/// verifier, and duplicate adjudication) has its own `timeout_mins` limit.
+pub fn hard_timeout_secs(
+    timeout_mins: u64,
+    verify_findings: bool,
+    dedupe_existing_comments: bool,
+) -> u64 {
+    let phase_count =
+        1 + u64::from(verify_findings) + u64::from(verify_findings && dedupe_existing_comments);
+    timeout_mins
+        .saturating_mul(60)
+        .saturating_mul(phase_count)
+        .saturating_add(REVIEW_SETUP_SECS)
+}
+
+/// Age after which another worker may take over an in-progress review claim.
+/// It must exceed the hard timeout so a live review is never reclaimed.
+pub fn claim_stale_after_secs(
+    timeout_mins: u64,
+    verify_findings: bool,
+    dedupe_existing_comments: bool,
+) -> u64 {
+    hard_timeout_secs(timeout_mins, verify_findings, dedupe_existing_comments)
+        .saturating_add(CLAIM_STALE_GRACE_SECS)
+}
+
 pub async fn answer_buzz_review_question(
     provider_name: &str,
     model: &str,
@@ -1304,7 +1335,11 @@ pub async fn run_review(
             &workspace.commit_hash,
             &params.review_kind,
             params.force,
-            params.timeout_mins,
+            claim_stale_after_secs(
+                params.timeout_mins,
+                params.verify_findings,
+                params.dedupe_existing_comments,
+            ),
         )?;
 
         if decision == state::ReviewDecision::Skip {
@@ -3640,6 +3675,35 @@ impl<'a> ReplyRetry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_timeout_covers_each_enabled_phase() {
+        assert_eq!(
+            hard_timeout_secs(30, false, true),
+            30 * 60 + REVIEW_SETUP_SECS
+        );
+        assert_eq!(
+            hard_timeout_secs(30, true, false),
+            2 * 30 * 60 + REVIEW_SETUP_SECS
+        );
+        assert_eq!(
+            hard_timeout_secs(30, true, true),
+            3 * 30 * 60 + REVIEW_SETUP_SECS
+        );
+        assert_eq!(hard_timeout_secs(u64::MAX, true, true), u64::MAX);
+    }
+
+    #[test]
+    fn claims_are_not_reclaimed_while_a_review_can_still_run() {
+        for (verify, dedupe) in [(false, false), (true, false), (true, true)] {
+            assert!(
+                claim_stale_after_secs(30, verify, dedupe) > hard_timeout_secs(30, verify, dedupe)
+            );
+        }
+        // The previous fixed window was timeout + 10 minutes, shorter than a
+        // three-phase review.
+        assert!(claim_stale_after_secs(30, true, true) > (30 + 10) * 60);
+    }
 
     const SAMPLE_REPORT_WITH_FINDINGS: &str = r#"---
 title: "Token bypass via unchecked signature"
