@@ -138,6 +138,15 @@ enum Commands {
         #[arg(long)]
         head: String,
     },
+    /// Internal sandbox entrypoint that relays model broker sockets to
+    /// loopback ports and runs a command with provider variables set.
+    #[command(hide = true)]
+    BrokerBridge {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Triage issues and optionally publish labels and verified draft fixes
     Issues {
         /// Poll continuously instead of processing once
@@ -493,6 +502,19 @@ async fn main() -> Result<()> {
     {
         return fiach::inspection::serve(workspace, read_root, base, head).await;
     }
+    // The bridge only relays sockets and runs the job; the job loads its own
+    // configuration and tracing.
+    if let Commands::BrokerBridge { manifest, command } = &cli.command {
+        let cancel = CancellationToken::new();
+        let signal_cancel = cancel.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_cancel.cancel();
+            }
+        });
+        let status = fiach::broker::run_bridge(manifest, command, cancel).await?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
     // Dependency feature unification enables both built-in Rustls providers.
     // Select one before any TLS client or server configuration is constructed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -528,7 +550,8 @@ async fn main() -> Result<()> {
     });
 
     match cli.command {
-        Commands::InspectionServer { .. } => Ok(()), // Handled before app initialization.
+        // Handled before app initialization.
+        Commands::InspectionServer { .. } | Commands::BrokerBridge { .. } => Ok(()),
         Commands::Issues { watch, issue } => {
             let config = FiachConfig::load(cli.config.as_deref())?;
             let issues = config
@@ -1039,6 +1062,27 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broker_bridge_passes_the_job_command_through() {
+        let cli = Cli::try_parse_from([
+            "fiach",
+            "broker-bridge",
+            "--manifest",
+            "/run/fiach-broker/manifest.json",
+            "--",
+            "/bin/fiach",
+            "review",
+            "--sandbox-child",
+        ])
+        .unwrap();
+        let Commands::BrokerBridge { manifest, command } = cli.command else {
+            panic!("expected broker-bridge");
+        };
+        assert_eq!(manifest, PathBuf::from("/run/fiach-broker/manifest.json"));
+        assert_eq!(command, ["/bin/fiach", "review", "--sandbox-child"]);
+        assert!(Cli::try_parse_from(["fiach", "broker-bridge", "--manifest", "/m"]).is_err());
+    }
 
     #[test]
     fn default_log_filter_drops_raw_provider_responses_only() {

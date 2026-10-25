@@ -8,6 +8,15 @@
 //! one from the host environment and forwards the request to a fixed upstream.
 //! Responses stream back unchanged while the broker reads token usage from
 //! them to enforce the job's cost budget.
+//!
+//! The sandbox key doubles as a canary: it only exists inside the sandbox, so
+//! seeing it (or any real credential) in a request body or URL means the job
+//! tried to send a secret to the model. The broker then refuses that request
+//! and every later one, and the host treats the job as quarantined.
+//!
+//! Inside the sandbox, `fiach broker-bridge` exposes the broker's Unix
+//! sockets on loopback TCP ports and starts the job with each route's host
+//! and key variables set.
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -26,7 +35,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -55,7 +64,7 @@ const FORWARDED_RESPONSE_HEADERS: &[&str] =
     &["content-type", "request-id", "retry-after", "x-request-id"];
 const FORWARDED_RESPONSE_HEADER_PREFIXES: &[&str] = &["anthropic-ratelimit-", "x-ratelimit-"];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     OpenRouter,
@@ -311,6 +320,26 @@ pub struct BrokerConfig {
     pub max_cost_usd: Option<f64>,
     /// JSONL request log; bodies are never written.
     pub log_path: Option<PathBuf>,
+    /// Planted secrets beyond the routes' own keys, such as a fake GitHub
+    /// token in the sandbox's `gh` config. Seeing one quarantines the job.
+    pub canaries: Vec<Canary>,
+}
+
+/// A secret whose appearance in a request means the job is leaking it.
+#[derive(Clone, Debug)]
+pub struct Canary {
+    /// Names the secret in reports without revealing it.
+    pub label: String,
+    pub value: Credential,
+}
+
+/// Why the broker stopped serving a job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Quarantine {
+    pub provider: Provider,
+    pub path: String,
+    /// Which secret appeared, by label.
+    pub canary: String,
 }
 
 /// Where a running route accepts connections.
@@ -345,9 +374,44 @@ struct Shared {
     ledger: Mutex<Ledger>,
     max_cost_usd: Option<f64>,
     log: Option<Mutex<std::fs::File>>,
+    canaries: Vec<Canary>,
+    quarantine: Mutex<Option<Quarantine>>,
 }
 
 impl Shared {
+    fn quarantined(&self) -> bool {
+        self.quarantine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Returns the label of the first canary found in the request.
+    fn find_canary(&self, uri: &Uri, body: &[u8]) -> Option<&str> {
+        let body = String::from_utf8_lossy(body);
+        let uri = uri.to_string();
+        self.canaries
+            .iter()
+            .find(|canary| {
+                let value = canary.value.expose();
+                !value.is_empty() && (body.contains(value) || uri.contains(value))
+            })
+            .map(|canary| canary.label.as_str())
+    }
+
+    fn quarantine(&self, quarantine: Quarantine) {
+        let mut current = self.quarantine.lock().unwrap_or_else(|e| e.into_inner());
+        if current.is_none() {
+            tracing::error!(
+                provider = %quarantine.provider,
+                path = %quarantine.path,
+                canary = %quarantine.canary,
+                "Model broker saw a secret in a sandbox request; quarantining job"
+            );
+            *current = Some(quarantine);
+        }
+    }
+
     fn budget_exhausted(&self) -> bool {
         let ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
         self.max_cost_usd
@@ -424,6 +488,9 @@ pub struct BrokerReport {
     pub usage: Usage,
     /// Requests with usage for models without pricing; not charged.
     pub unpriced_requests: u64,
+    /// Set when the job tried to send a secret; its results must not be
+    /// disclosed.
+    pub quarantine: Option<Quarantine>,
 }
 
 pub struct Broker {
@@ -462,10 +529,23 @@ impl Broker {
             )),
             None => None,
         };
+        let mut canaries = config.canaries;
+        for route in &config.routes {
+            canaries.push(Canary {
+                label: format!("{} sandbox key", route.provider),
+                value: route.sandbox_key.clone(),
+            });
+            canaries.push(Canary {
+                label: format!("{} credential", route.provider),
+                value: route.credential.clone(),
+            });
+        }
         let shared = Arc::new(Shared {
             ledger: Mutex::new(Ledger::default()),
             max_cost_usd: config.max_cost_usd,
             log,
+            canaries,
+            quarantine: Mutex::new(None),
         });
         let cancel = CancellationToken::new();
         let mut endpoints = Vec::new();
@@ -526,6 +606,56 @@ impl Broker {
         &self.endpoints
     }
 
+    /// Environment for a client that reaches the routes over TCP directly.
+    pub fn sandbox_env(&self) -> Vec<(&'static str, String)> {
+        self.endpoints
+            .iter()
+            .filter_map(|route| match &route.endpoint {
+                Endpoint::Tcp(addr) => Some([
+                    (route.provider.host_env(), format!("http://{addr}")),
+                    (
+                        route.provider.key_env(),
+                        route.sandbox_key.expose().to_owned(),
+                    ),
+                ]),
+                Endpoint::Unix(_) => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Writes the manifest `fiach broker-bridge` reads inside the sandbox.
+    /// Socket paths are relative to the manifest's directory, so the host
+    /// can bind that directory anywhere in the sandbox.
+    pub fn write_manifest(&self, path: &Path) -> Result<()> {
+        let mut routes = Vec::new();
+        for route in &self.endpoints {
+            let Endpoint::Unix(socket) = &route.endpoint else {
+                bail!("Bridge manifests need Unix socket routes");
+            };
+            let socket = socket
+                .file_name()
+                .context("Broker socket has no file name")?
+                .to_string_lossy()
+                .into_owned();
+            routes.push(BridgeRoute {
+                provider: route.provider,
+                socket,
+                sandbox_key: route.sandbox_key.expose().to_owned(),
+            });
+        }
+        std::fs::write(path, serde_json::to_vec(&BridgeManifest { routes })?)
+            .with_context(|| format!("Writing broker manifest {}", path.display()))
+    }
+
+    pub fn quarantine(&self) -> Option<Quarantine> {
+        self.shared
+            .quarantine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn usage(&self) -> Usage {
         self.shared
             .ledger
@@ -542,10 +672,12 @@ impl Broker {
         for task in std::mem::take(&mut self.tasks) {
             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         }
+        let quarantine = self.quarantine();
         let ledger = self.shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
         BrokerReport {
             usage: ledger.usage.clone(),
             unpriced_requests: ledger.unpriced_requests,
+            quarantine,
         }
     }
 }
@@ -638,6 +770,9 @@ async fn forward(
     if presented != Some(route.sandbox_key.expose()) {
         return record.finish_denied(StatusCode::UNAUTHORIZED, "invalid sandbox key");
     }
+    if route.shared.quarantined() {
+        return record.finish_denied(StatusCode::FORBIDDEN, "job quarantined");
+    }
     if route.shared.budget_exhausted() {
         return record.finish_denied(StatusCode::FORBIDDEN, "job cost budget exhausted");
     }
@@ -646,6 +781,14 @@ async fn forward(
         Err(_) => return record.finish_denied(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
     };
     record.request_bytes = body.len();
+    if let Some(canary) = route.shared.find_canary(&uri, &body) {
+        route.shared.quarantine(Quarantine {
+            provider: route.provider,
+            path: path.clone(),
+            canary: canary.to_owned(),
+        });
+        return record.finish_denied(StatusCode::FORBIDDEN, "job quarantined");
+    }
     let model = match location {
         ModelLocation::None => None,
         ModelLocation::Path(model) => Some(model),
@@ -942,6 +1085,127 @@ impl UsageScan {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct BridgeManifest {
+    routes: Vec<BridgeRoute>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BridgeRoute {
+    provider: Provider,
+    /// File name of the route's socket next to the manifest.
+    socket: String,
+    sandbox_key: String,
+}
+
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+
+/// Loopback listeners inside the sandbox that relay to the broker sockets.
+pub struct Bridge {
+    env: Vec<(&'static str, String)>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Bridge {
+    pub async fn start(manifest_path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(manifest_path)
+            .with_context(|| format!("Reading broker manifest {}", manifest_path.display()))?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= MAX_MANIFEST_BYTES,
+            "Invalid broker manifest {}",
+            manifest_path.display()
+        );
+        let manifest: BridgeManifest = serde_json::from_slice(&std::fs::read(manifest_path)?)
+            .context("Parsing broker manifest")?;
+        let dir = manifest_path
+            .parent()
+            .context("Broker manifest has no directory")?;
+        let mut env = Vec::new();
+        let mut tasks = Vec::new();
+        for route in manifest.routes {
+            ensure!(
+                !route.socket.is_empty()
+                    && !route.socket.contains('/')
+                    && route.socket != "."
+                    && route.socket != "..",
+                "Invalid broker socket name {}",
+                route.socket
+            );
+            let socket = dir.join(&route.socket);
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .context("Binding broker bridge listener")?;
+            let addr = listener.local_addr()?;
+            tasks.push(tokio::spawn(relay(listener, socket)));
+            env.push((route.provider.host_env(), format!("http://{addr}")));
+            env.push((route.provider.key_env(), route.sandbox_key));
+        }
+        Ok(Self { env, tasks })
+    }
+
+    pub fn env(&self) -> &[(&'static str, String)] {
+        &self.env
+    }
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+async fn relay(listener: tokio::net::TcpListener, socket: PathBuf) {
+    loop {
+        let Ok((mut client, _)) = listener.accept().await else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(mut upstream) => {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                }
+                Err(error) => {
+                    tracing::warn!(socket = %socket.display(), error = %error, "Broker bridge could not reach the broker");
+                }
+            }
+        });
+    }
+}
+
+/// Runs `command` with the bridge's provider variables and returns its
+/// exit status. Provider variables already in the environment are replaced.
+pub async fn run_bridge(
+    manifest_path: &Path,
+    command: &[String],
+    cancel: CancellationToken,
+) -> Result<std::process::ExitStatus> {
+    let (program, args) = command
+        .split_first()
+        .context("broker-bridge needs a command to run")?;
+    let bridge = Bridge::start(manifest_path).await?;
+    let mut child = tokio::process::Command::new(program);
+    child.args(args).kill_on_drop(true);
+    for provider in Provider::ALL {
+        child.env_remove(provider.key_env());
+        child.env_remove(provider.host_env());
+    }
+    child.envs(bridge.env().iter().map(|(name, value)| (*name, value)));
+    let mut child = child
+        .spawn()
+        .with_context(|| format!("Starting {program} under the broker bridge"))?;
+    tokio::select! {
+        status = child.wait() => Ok(status?),
+        _ = cancel.cancelled() => {
+            let _ = child.kill().await;
+            bail!("broker-bridge cancelled")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1035,6 +1299,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_cost_usd,
             log_path: None,
+            canaries: Vec::new(),
         })
         .await
         .unwrap()
@@ -1408,6 +1673,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_cost_usd: None,
             log_path: Some(log_path.clone()),
+            canaries: Vec::new(),
         })
         .await
         .unwrap();
@@ -1456,6 +1722,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_cost_usd: None,
             log_path: None,
+            canaries: Vec::new(),
         })
         .await
         .unwrap();
@@ -1477,6 +1744,173 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let report = broker.shutdown().await;
         assert_eq!(report.usage.input_tokens, 70);
+    }
+
+    #[tokio::test]
+    async fn canary_in_request_quarantines_the_job() {
+        let case = &cases()[0];
+        let (upstream, mock) = mock_upstream(case.response).await;
+        let broker = Broker::start(BrokerConfig {
+            routes: vec![route(case.provider, &upstream, case.model)],
+            listen: Listen::Tcp("127.0.0.1:0".parse().unwrap()),
+            max_request_bytes: 64 * 1024,
+            max_cost_usd: None,
+            log_path: None,
+            canaries: vec![Canary {
+                label: "gh hosts token".into(),
+                value: Credential::new("ghp_canaryvalue0123456789"),
+            }],
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let leaked = format!("the key is {}", key(&broker));
+        let response = client
+            .post(format!("{}{}", base(&broker), case.path))
+            .bearer_auth(key(&broker))
+            .json(&serde_json::json!({ "model": case.model, "messages": [leaked] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        let clean = client
+            .post(format!("{}{}", base(&broker), case.path))
+            .bearer_auth(key(&broker))
+            .json(&case.body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clean.status(), 403);
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 0);
+        let report = broker.shutdown().await;
+        assert_eq!(
+            report.quarantine,
+            Some(Quarantine {
+                provider: Provider::OpenRouter,
+                path: case.path.clone(),
+                canary: "openrouter sandbox key".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn real_credentials_and_planted_canaries_quarantine() {
+        for (leak, label) in [
+            ("real-google-key", "google credential"),
+            ("ghp_canaryvalue0123456789", "gh hosts token"),
+        ] {
+            let case = &cases()[3];
+            let (upstream, mock) = mock_upstream(case.response).await;
+            let broker = Broker::start(BrokerConfig {
+                routes: vec![route(case.provider, &upstream, case.model)],
+                listen: Listen::Tcp("127.0.0.1:0".parse().unwrap()),
+                max_request_bytes: 64 * 1024,
+                max_cost_usd: None,
+                log_path: None,
+                canaries: vec![Canary {
+                    label: "gh hosts token".into(),
+                    value: Credential::new("ghp_canaryvalue0123456789"),
+                }],
+            })
+            .await
+            .unwrap();
+            // Leaks are caught in the query string as well as the body.
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "{}/v1beta/models/{}:generateContent?alt={leak}",
+                    base(&broker),
+                    case.model
+                ))
+                .header("x-goog-api-key", key(&broker))
+                .json(&case.body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 403, "{label}");
+            assert_eq!(mock.hits.load(Ordering::SeqCst), 0);
+            let report = broker.shutdown().await;
+            assert_eq!(report.quarantine.unwrap().canary, label);
+        }
+    }
+
+    async fn unix_broker(dir: &Path, upstream: &str) -> Broker {
+        Broker::start(BrokerConfig {
+            routes: vec![route(Provider::OpenRouter, upstream, "openai/gpt-5")],
+            listen: Listen::Unix(dir.to_owned()),
+            max_request_bytes: 64 * 1024,
+            max_cost_usd: None,
+            log_path: None,
+            canaries: Vec::new(),
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bridge_relays_loopback_requests_to_broker_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let case = &cases()[0];
+        let (upstream, mock) = mock_upstream(case.response).await;
+        let broker = unix_broker(dir.path(), &upstream).await;
+        let manifest = dir.path().join("manifest.json");
+        broker.write_manifest(&manifest).unwrap();
+
+        let bridge = Bridge::start(&manifest).await.unwrap();
+        let env: std::collections::HashMap<_, _> = bridge.env().iter().cloned().collect();
+        assert_eq!(env["OPENROUTER_API_KEY"], key(&broker));
+        let host = &env["OPENROUTER_HOST"];
+        assert!(host.starts_with("http://127.0.0.1:"), "{host}");
+        let response = reqwest::Client::new()
+            .post(format!("{host}{}", case.path))
+            .bearer_auth(&env["OPENROUTER_API_KEY"])
+            .json(&case.body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let _ = response.bytes().await.unwrap();
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(broker.shutdown().await.usage.input_tokens, 1000);
+    }
+
+    #[tokio::test]
+    async fn run_bridge_sets_route_env_and_returns_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = unix_broker(dir.path(), "http://127.0.0.1:9").await;
+        let manifest = dir.path().join("manifest.json");
+        broker.write_manifest(&manifest).unwrap();
+        let script = format!(
+            r#"case "$OPENROUTER_HOST" in http://127.0.0.1:*) ;; *) exit 3;; esac
+            test "$OPENROUTER_API_KEY" = "{}" || exit 4
+            test -z "$OPENAI_HOST" || exit 5
+            exit 7"#,
+            key(&broker)
+        );
+        let status = run_bridge(
+            &manifest,
+            &["sh".into(), "-c".into(), script],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_socket_paths_outside_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for socket in ["../broker.sock", "/run/broker.sock", "..", ""] {
+            let manifest = dir.path().join("manifest.json");
+            std::fs::write(
+                &manifest,
+                serde_json::to_vec(&serde_json::json!({
+                    "routes": [{ "provider": "openrouter", "socket": socket, "sandbox_key": "k" }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(Bridge::start(&manifest).await.is_err(), "{socket}");
+        }
     }
 
     #[test]
