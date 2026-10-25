@@ -499,30 +499,48 @@ async fn sandbox(
                 network.guest_cidr()
             ));
     }
-    // Never forward host GitHub credentials. Regression containers get no provider key.
-    if input.phase != "check" {
-        let provider = if input.phase == "verify" {
-            input
-                .config
-                .verifier_provider
-                .as_deref()
-                .unwrap_or(&input.config.provider)
+    // Never forward host GitHub or provider credentials. Agent phases reach
+    // their model through the host broker; regression checks get no model.
+    let broker = if input.phase == "check" {
+        None
+    } else {
+        let (provider, model) = if input.phase == "verify" {
+            (
+                input
+                    .config
+                    .verifier_provider
+                    .as_deref()
+                    .unwrap_or(&input.config.provider),
+                input
+                    .config
+                    .verifier_model
+                    .as_deref()
+                    .unwrap_or(&input.config.model),
+            )
         } else {
-            &input.config.provider
+            (input.config.provider.as_str(), input.config.model.as_str())
         };
-        let key = match provider {
-            "openrouter" => Some("OPENROUTER_API_KEY"),
-            "openai" => Some("OPENAI_API_KEY"),
-            "anthropic" => Some("ANTHROPIC_API_KEY"),
-            "google" => Some("GOOGLE_API_KEY"),
-            _ => None,
-        };
-        if let Some(key) = key
-            && let Ok(value) = std::env::var(key)
-        {
-            crate::daemon::forward_sandbox_secret(&mut cmd, key, &value);
+        match crate::broker::Provider::supported(provider) {
+            Some(provider) => {
+                let routes = crate::broker::routes_for([(provider, model.to_owned(), None)])?;
+                // Kept beside the retained artifacts, outside every sandbox mount.
+                let mut state_dir = output.path().as_os_str().to_owned();
+                state_dir.push(".broker");
+                let broker = crate::broker::SandboxBroker::start(
+                    Path::new(&state_dir),
+                    routes,
+                    None,
+                    Vec::new(),
+                )
+                .await?;
+                cmd.arg(broker.nspawn_bind_arg());
+                cmd.arg("/bin/fiach");
+                cmd.args(crate::broker::SandboxBroker::bridge_args());
+                Some(broker)
+            }
+            None => None,
         }
-    }
+    };
     cmd.args([
         "/bin/fiach",
         "issue-worker",
@@ -538,7 +556,7 @@ async fn sandbox(
         let _ = child.kill().await;
         return Err(error);
     }
-    let outcome: Result<()> = tokio::select! {
+    let mut outcome: Result<()> = tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(input.config.timeout_secs), child.wait()) => {
             match result {
                 Ok(status) => status.map_err(anyhow::Error::from).and_then(|s| { ensure!(s.success(), "Issue worker failed"); Ok(()) }),
@@ -547,6 +565,12 @@ async fn sandbox(
         }
         _ = cancel.cancelled() => { let _ = child.kill().await; Err(anyhow::anyhow!("Issue worker cancelled")) }
     };
+    // A quarantined phase fails even if the worker succeeded.
+    if let Some(broker) = broker
+        && let Err(error) = broker.finish().await
+    {
+        outcome = Err(error);
+    }
     if let Err(error) = outcome {
         let artifacts = output.keep();
         return Err(error).with_context(|| format!("Worker artifacts: {}", artifacts.display()));

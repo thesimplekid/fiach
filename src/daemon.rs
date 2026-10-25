@@ -1658,18 +1658,6 @@ async fn run_sandboxed_review(
         cmd.arg("--bind-ro=/nix/store");
     }
 
-    // Provider credentials are required by Goose inside the review sandbox.
-    for key in [
-        "OPENROUTER_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GOOGLE_API_KEY",
-        "TYPESAFE_API_KEY",
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            forward_sandbox_secret(&mut cmd, key, &value);
-        }
-    }
     // Never expose the host disclosure token to the model-controlled review
     // process. This token must be separately provisioned with read-only access
     // sufficient for cloning repositories and reading pull-request metadata.
@@ -1680,6 +1668,17 @@ async fn run_sandboxed_review(
     let review_github_token =
         validate_sandbox_review_token(&review_github_token, host_github_token.as_deref())?;
     forward_sandbox_secret(&mut cmd, "GITHUB_TOKEN", review_github_token);
+    // Provider credentials stay on the host. The sandbox reaches providers
+    // through the model broker with per-job keys.
+    let broker = start_review_broker(
+        review_params,
+        &broker_state_dir(&run_dir),
+        review_github_token,
+    )
+    .await?;
+    if let Some(broker) = &broker {
+        cmd.arg(broker.nspawn_bind_arg());
+    }
     if let Ok(val) = std::env::var("RUST_LOG") {
         cmd.arg(format!("--setenv=RUST_LOG={}", val));
     }
@@ -1724,6 +1723,10 @@ async fn run_sandboxed_review(
     // the Nix module) configures the container's network interface for veth
     // mode, then execs `/bin/fiach` with the supplied arguments.
     cmd.arg("/bin/fiach-sandbox-entrypoint");
+    if broker.is_some() {
+        cmd.args(crate::broker::SandboxBroker::bridge_args());
+        cmd.arg("/bin/fiach");
+    }
     cmd.arg("review");
     cmd.arg("--repo").arg(&review_params.repo);
     cmd.arg("--pr").arg(review_params.pr_number.to_string());
@@ -1808,6 +1811,7 @@ async fn run_sandboxed_review(
         veth_subnet = veth_network.as_ref().map(|network| network.index),
         log = %nspawn_log.display(),
         network = network_mode,
+        broker_log = broker.as_ref().map(|broker| broker.log_path().display().to_string()),
         "Launching sandboxed review"
     );
 
@@ -1841,24 +1845,21 @@ async fn run_sandboxed_review(
         review_params.dedupe_existing_comments,
     ));
 
-    tokio::select! {
+    let run: Result<()> = tokio::select! {
         status_res = tokio::time::timeout(timeout_duration, child.wait()) => {
             match status_res {
+                Ok(Ok(status)) if status.success() => Ok(()),
                 Ok(Ok(status)) => {
-                    if !status.success() {
-                        let log_tail = tail_file(&nspawn_log, 40)
-                            .unwrap_or_else(|e| format!("failed to read sandbox log: {e}"));
-                        anyhow::bail!(
-                            "Sandboxed review failed with status: {}; log: {}; recent output:\n{}",
-                            status,
-                            nspawn_log.display(),
-                            log_tail
-                        );
-                    }
+                    let log_tail = tail_file(&nspawn_log, 40)
+                        .unwrap_or_else(|e| format!("failed to read sandbox log: {e}"));
+                    Err(anyhow::anyhow!(
+                        "Sandboxed review failed with status: {}; log: {}; recent output:\n{}",
+                        status,
+                        nspawn_log.display(),
+                        log_tail
+                    ))
                 }
-                Ok(Err(e)) => {
-                    anyhow::bail!("Sandboxed review child wait error: {}", e);
-                }
+                Ok(Err(e)) => Err(anyhow::anyhow!("Sandboxed review child wait error: {}", e)),
                 Err(_) => {
                     tracing::warn!(
                         repo = %review_params.repo,
@@ -1867,16 +1868,22 @@ async fn run_sandboxed_review(
                         "Sandboxed review exceeded hard timeout, killing process"
                     );
                     let _ = child.kill().await;
-                    anyhow::bail!("Sandboxed review timed out");
+                    Err(anyhow::anyhow!("Sandboxed review timed out"))
                 }
             }
         }
         _ = cancel_token.cancelled() => {
             tracing::info!("Cancellation requested, killing sandbox...");
             let _ = child.kill().await;
-            anyhow::bail!("Sandboxed review cancelled");
+            Err(anyhow::anyhow!("Sandboxed review cancelled"))
         }
+    };
+    // A quarantined job fails even if the child succeeded, so none of its
+    // artifacts are disclosed.
+    if let Some(broker) = broker {
+        broker.finish().await?;
     }
+    run?;
 
     let mut completed = read_completed_review(&result_json)?;
     let structured_path = crate::review::structured_artifact_path_for_report(&report_path);
@@ -1895,6 +1902,86 @@ async fn run_sandboxed_review(
             executor: "sandbox".to_string(),
         },
     )
+}
+
+/// Host-only broker state next to the sandbox run directory. The run
+/// directory itself is writable by the sandbox, so the broker's sockets and
+/// request log live outside it.
+fn broker_state_dir(run_dir: &Path) -> PathBuf {
+    let mut dir = run_dir.as_os_str().to_owned();
+    dir.push(".broker");
+    PathBuf::from(dir)
+}
+
+/// Starts the model broker for a sandboxed review with routes for the finder
+/// and verifier models, and Jev when a TypeSafe key is configured. Returns
+/// `None` when no model the review uses has a broker route.
+async fn start_review_broker(
+    review_params: &ReviewParams,
+    state_dir: &Path,
+    review_github_token: &str,
+) -> Result<Option<crate::broker::SandboxBroker>> {
+    use crate::broker::{Canary, Credential, Pricing, Provider, SandboxBroker, routes_for};
+
+    let mut models = vec![(
+        review_params.provider.as_str(),
+        review_params.model.as_str(),
+        review_params.input_price_per_m,
+        review_params.output_price_per_m,
+    )];
+    if review_params.verify_findings {
+        models.push((
+            review_params
+                .verifier_provider
+                .as_deref()
+                .unwrap_or(&review_params.provider),
+            review_params
+                .verifier_model
+                .as_deref()
+                .unwrap_or(&review_params.model),
+            None,
+            None,
+        ));
+    }
+    let mut uses = Vec::new();
+    for (provider_name, model, input, output) in models {
+        let Some(provider) = Provider::supported(provider_name) else {
+            continue;
+        };
+        let (input, output) =
+            crate::review::resolve_price_overrides(provider_name, model, input, output).await;
+        let pricing = input
+            .zip(output)
+            .map(|(input_per_m, output_per_m)| Pricing {
+                input_per_m,
+                output_per_m,
+            });
+        uses.push((provider, model.to_owned(), pricing));
+    }
+    if std::env::var("TYPESAFE_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+        uses.push((
+            Provider::TypeSafe,
+            crate::jev::MODEL.to_owned(),
+            Some(Pricing {
+                input_per_m: crate::jev::INPUT_PRICE_PER_MILLION,
+                output_per_m: 0.0,
+            }),
+        ));
+    }
+    if uses.is_empty() {
+        return Ok(None);
+    }
+    SandboxBroker::start(
+        state_dir,
+        routes_for(uses)?,
+        review_params.max_cost_usd,
+        vec![Canary {
+            label: "review GitHub token".to_owned(),
+            value: Credential::new(review_github_token),
+        }],
+    )
+    .await
+    .map(Some)
 }
 
 struct RuntimeRootfsGuard {
@@ -2674,6 +2761,17 @@ mod tests {
         );
         assert!(validate_sandbox_review_token("", Some("host-write")).is_err());
         assert!(validate_sandbox_review_token("shared-token", Some("shared-token")).is_err());
+    }
+
+    #[test]
+    fn broker_state_stays_outside_the_sandbox_run_directory() {
+        let run_dir = Path::new("/var/lib/fiach/reports/runs/owner_repo.v2_PR7");
+        let state = broker_state_dir(run_dir);
+        assert_eq!(
+            state,
+            Path::new("/var/lib/fiach/reports/runs/owner_repo.v2_PR7.broker")
+        );
+        assert!(!state.starts_with(run_dir));
     }
 
     #[test]

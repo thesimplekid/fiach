@@ -18,6 +18,7 @@ use serde_json::Value;
 // Pin behavior and pricing together: https://docs.typesafe.ai/models (2026-09-18).
 pub(crate) const MODEL: &str = "jev-1.13.0";
 pub(crate) const INPUT_PRICE_PER_MILLION: f64 = 0.042;
+const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 // Resource guard, not an estimate of the model's context window. JSON byte size
 // varies with escaping and content. Jev enforces its own token limits (32k for
 // state + longest question, 64k overall): https://docs.typesafe.ai/models.
@@ -312,8 +313,13 @@ pub(crate) fn client_from_env() -> Result<Option<Client>> {
     else {
         return Ok(None);
     };
-    // Explicit endpoint/model preserve the same behavior in host and sandbox.
-    client(&key, "https://api.typesafe.ai").map(Some)
+    // Sandboxes reach Jev through the host model broker via TYPESAFE_HOST;
+    // the explicit model keeps behavior the same in host and sandbox.
+    let base_url = std::env::var("TYPESAFE_HOST")
+        .ok()
+        .filter(|host| !host.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    client(&key, &base_url).map(Some)
 }
 
 pub(crate) fn client(key: &str, base_url: &str) -> Result<Client> {

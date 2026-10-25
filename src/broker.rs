@@ -102,6 +102,20 @@ impl Provider {
             .with_context(|| format!("Provider {name} is not supported by the model broker"))
     }
 
+    /// The broker route for a Goose provider name, or `None` for providers
+    /// the broker does not cover, such as keyless local models, which then
+    /// run without a broker as before.
+    pub fn supported(name: &str) -> Option<Self> {
+        let provider = Self::from_name(name).ok();
+        if provider.is_none() {
+            tracing::warn!(
+                provider = name,
+                "Provider has no model broker route; the sandbox gets no provider credential"
+            );
+        }
+        provider
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Provider::OpenRouter => "openrouter",
@@ -1085,6 +1099,145 @@ impl UsageScan {
     }
 }
 
+/// Where nspawn sandboxes see the broker's socket directory.
+pub const SANDBOX_MOUNT: &str = "/run/fiach-broker";
+const MANIFEST_NAME: &str = "manifest.json";
+
+/// Groups `(provider, model, pricing)` uses into one route per provider,
+/// reading credentials and upstream overrides from the host environment.
+pub fn routes_for(
+    uses: impl IntoIterator<Item = (Provider, String, Option<Pricing>)>,
+) -> Result<Vec<RouteConfig>> {
+    group_uses(uses)
+        .into_iter()
+        .map(|(provider, models)| RouteConfig::from_env(provider, models))
+        .collect()
+}
+
+type ModelPrices = BTreeMap<String, Option<Pricing>>;
+
+/// Known prices win over unknown ones for a model used twice.
+fn group_uses(
+    uses: impl IntoIterator<Item = (Provider, String, Option<Pricing>)>,
+) -> BTreeMap<Provider, ModelPrices> {
+    let mut grouped: BTreeMap<Provider, ModelPrices> = BTreeMap::new();
+    for (provider, model, pricing) in uses {
+        let entry = grouped
+            .entry(provider)
+            .or_default()
+            .entry(model)
+            .or_insert(pricing);
+        if entry.is_none() {
+            *entry = pricing;
+        }
+    }
+    grouped
+}
+
+/// A broker serving one nspawn sandbox over Unix sockets.
+///
+/// `state_dir` must be host-only: it holds the request log, and only its
+/// `sockets` subdirectory is bound (read-only) into the sandbox.
+pub struct SandboxBroker {
+    broker: Broker,
+    sockets: PathBuf,
+    log: PathBuf,
+}
+
+impl SandboxBroker {
+    pub async fn start(
+        state_dir: &Path,
+        routes: Vec<RouteConfig>,
+        max_cost_usd: Option<f64>,
+        canaries: Vec<Canary>,
+    ) -> Result<Self> {
+        let sockets = state_dir.join("sockets");
+        match std::fs::remove_dir_all(&sockets) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Removing stale broker sockets {}", sockets.display())
+                });
+            }
+        }
+        create_private_dir(state_dir)?;
+        create_private_dir(&sockets)?;
+        let log = state_dir.join("requests.jsonl");
+        let broker = Broker::start(BrokerConfig {
+            routes,
+            listen: Listen::Unix(sockets.clone()),
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            max_cost_usd,
+            log_path: Some(log.clone()),
+            canaries,
+        })
+        .await?;
+        broker.write_manifest(&sockets.join(MANIFEST_NAME))?;
+        Ok(Self {
+            broker,
+            sockets,
+            log,
+        })
+    }
+
+    /// The `systemd-nspawn` argument exposing the sockets to the sandbox.
+    /// Connecting to a Unix socket works on a read-only bind mount.
+    pub fn nspawn_bind_arg(&self) -> String {
+        format!("--bind-ro={}:{SANDBOX_MOUNT}", self.sockets.display())
+    }
+
+    /// Arguments for `fiach` inside the sandbox that run the following
+    /// command under the bridge.
+    pub fn bridge_args() -> [String; 4] {
+        [
+            "broker-bridge".to_owned(),
+            "--manifest".to_owned(),
+            format!("{SANDBOX_MOUNT}/{MANIFEST_NAME}"),
+            "--".to_owned(),
+        ]
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.log
+    }
+
+    /// Stops the broker and removes its sockets. Fails when the job was
+    /// quarantined, so callers never use its results.
+    pub async fn finish(self) -> Result<BrokerReport> {
+        let report = self.broker.shutdown().await;
+        let _ = std::fs::remove_dir_all(&self.sockets);
+        tracing::info!(
+            requests = report.usage.requests,
+            input_tokens = report.usage.input_tokens,
+            output_tokens = report.usage.output_tokens,
+            cost_usd = report.usage.cost_usd,
+            unpriced_requests = report.unpriced_requests,
+            log = %self.log.display(),
+            "Model broker finished"
+        );
+        if let Some(quarantine) = &report.quarantine {
+            bail!(
+                "Sandbox job quarantined: it sent the {} to {} {}; see {}",
+                quarantine.canary,
+                quarantine.provider,
+                quarantine.path,
+                self.log.display()
+            );
+        }
+        Ok(report)
+    }
+}
+
+fn create_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .with_context(|| format!("Creating broker directory {}", path.display()))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct BridgeManifest {
     routes: Vec<BridgeRoute>,
@@ -1911,6 +2064,76 @@ mod tests {
             .unwrap();
             assert!(Bridge::start(&manifest).await.is_err(), "{socket}");
         }
+    }
+
+    #[tokio::test]
+    async fn sandbox_broker_reports_quarantine_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let case = &cases()[0];
+        let (upstream, _mock) = mock_upstream(case.response).await;
+        let state_dir = dir.path().join("run.broker");
+        let broker = SandboxBroker::start(
+            &state_dir,
+            vec![route(case.provider, &upstream, case.model)],
+            None,
+            vec![Canary {
+                label: "review GitHub token".into(),
+                value: Credential::new("github_pat_canary"),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            broker.nspawn_bind_arg(),
+            format!(
+                "--bind-ro={}:/run/fiach-broker",
+                state_dir.join("sockets").display()
+            )
+        );
+        let bridge = Bridge::start(&state_dir.join("sockets/manifest.json"))
+            .await
+            .unwrap();
+        let env: std::collections::HashMap<_, _> = bridge.env().iter().cloned().collect();
+        let response = reqwest::Client::new()
+            .post(format!("{}{}", env["OPENROUTER_HOST"], case.path))
+            .bearer_auth(&env["OPENROUTER_API_KEY"])
+            .json(&serde_json::json!({ "model": case.model, "note": "github_pat_canary" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        let error = broker.finish().await.unwrap_err().to_string();
+        assert!(error.contains("review GitHub token"), "{error}");
+        assert!(!error.contains("github_pat_canary"), "{error}");
+        assert!(!state_dir.join("sockets").exists());
+        assert!(state_dir.join("requests.jsonl").exists());
+    }
+
+    #[test]
+    fn routes_group_models_by_provider() {
+        let price = Some(Pricing {
+            input_per_m: 1.0,
+            output_per_m: 2.0,
+        });
+        let grouped = group_uses([
+            (Provider::OpenRouter, "a".to_owned(), None),
+            (Provider::TypeSafe, "jev".to_owned(), price),
+            (Provider::OpenRouter, "b".to_owned(), price),
+            (Provider::OpenRouter, "a".to_owned(), price),
+        ]);
+        assert_eq!(
+            grouped,
+            BTreeMap::from([
+                (
+                    Provider::OpenRouter,
+                    BTreeMap::from([("a".to_owned(), price), ("b".to_owned(), price)])
+                ),
+                (
+                    Provider::TypeSafe,
+                    BTreeMap::from([("jev".to_owned(), price)])
+                ),
+            ])
+        );
     }
 
     #[test]

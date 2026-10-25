@@ -15,6 +15,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 - `src/workspace.rs`: Uses `gh` to clone repo/PR to a temp dir and records PR lifecycle/base/default-branch context.
 - `src/disclose.rs`: Report modes (`local`, `pr-comment`, `sync-pr`) and centralized GitHub review/sync disclosure.
 - `src/state.rs`: Uses `redb` to track reviewed commit hashes.
+- `src/broker.rs`: Per-job host model broker. Sandboxes get per-job keys and reach providers through it; real provider credentials never enter a sandbox.
 - `flake.nix`: Package, dev shell, and NixOS module. The module can configure finder and verifier provider/model settings.
 - `.agents/skills/`: Domain skills (e.g., `cashu`).
 

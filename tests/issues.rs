@@ -266,6 +266,10 @@ auto_fix = true
 }
 
 async fn run(dir: &Path) -> std::process::Output {
+    run_with_env(dir, &[]).await
+}
+
+async fn run_with_env(dir: &Path, env: &[(&str, &str)]) -> std::process::Output {
     let number = fixture(dir)["items"][0]["number"]
         .as_u64()
         .unwrap()
@@ -291,6 +295,7 @@ async fn run(dir: &Path) -> std::process::Output {
         )
         .env("TYPESAFE_API_KEY", "test-only")
         .env("RUST_LOG", "error")
+        .envs(env.iter().copied())
         .current_dir(dir)
         .output()
         .await
@@ -452,6 +457,15 @@ request = next(a.split('=',1)[1].split(':')[0] for a in args if a.startswith('--
 output = next(a.split('=',1)[1].split(':')[0] for a in args if a.startswith('--bind=') and a.endswith(':/output'))
 i = json.load(open(request)); workspace = root + '/workspace'
 with open(os.environ['FIXTURE'] + '.phases','a') as f: f.write(i['phase'] + '\n')
+command = args[next(n for n, a in enumerate(args) if not a.startswith('-')):]
+brokers = [a.split('=',1)[1].split(':')[0] for a in args if a.startswith('--bind-ro=') and a.endswith(':/run/fiach-broker')]
+manifest = json.load(open(brokers[0] + '/manifest.json')) if brokers else {'routes': []}
+with open(os.environ['FIXTURE'] + '.sandbox','a') as f:
+    f.write(json.dumps({'phase': i['phase'], 'command': command,
+        'routes': [r['provider'] for r in manifest['routes']],
+        'sockets': [os.path.exists(brokers[0] + '/' + r['socket']) for r in manifest['routes']],
+        'real_key_in_manifest': os.environ.get('OPENROUTER_API_KEY', '') in json.dumps(manifest),
+        'setenv': [a for a in args if a.startswith('--setenv=') and 'KEY' in a]}) + '\n')
 report = {'status':'candidate','summary':'Fix persisted amount','test_files':['tests/test_amount.py'],'reproduction':['python3','tests/test_amount.py'],'approved':False}
 if i['phase'] == 'code' and i['fix_kind'] == 'maintenance':
     open(workspace + '/rust-toolchain.toml','w').write('[toolchain]\nchannel = "1.98.1"\n')
@@ -573,6 +587,64 @@ async fn verified_fix_runs_real_regression_on_base_and_patch_then_opens_one_draf
     );
     assert_ok(&run(dir.path()).await);
     assert_eq!(fixture(dir.path())["prs"].as_array().unwrap().len(), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn agent_phases_reach_models_only_through_the_host_broker() {
+    let (dir, server, _) = setup("bug", "different", false, true).await;
+    enable_worker(dir.path(), false).await;
+    let config_path = dir.path().join("fiach.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap().replace(
+        "provider = \"test\"\nmodel = \"test\"",
+        "provider = \"openrouter\"\nmodel = \"openai/gpt-5\"",
+    );
+    std::fs::write(config_path, config).unwrap();
+    // A loopback upstream keeps the broker from resolving the real host.
+    assert_ok(
+        &run_with_env(
+            dir.path(),
+            &[
+                ("OPENROUTER_API_KEY", "sk-or-real-test-key"),
+                ("OPENROUTER_HOST", "http://127.0.0.1:9"),
+            ],
+        )
+        .await,
+    );
+    let records: Vec<serde_json::Value> =
+        std::fs::read_to_string(dir.path().join("fixture.json.sandbox"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let phases: Vec<_> = records.iter().map(|r| r["phase"].clone()).collect();
+    assert_eq!(phases, ["code", "check", "check", "verify"]);
+    for record in &records {
+        assert_eq!(record["setenv"], json!([]), "{record}");
+        assert_eq!(record["real_key_in_manifest"], false, "{record}");
+        let worker = json!([
+            "/bin/fiach",
+            "issue-worker",
+            "--input",
+            "/input/request.json"
+        ]);
+        if record["phase"] == "check" {
+            assert_eq!(record["command"], worker, "{record}");
+            assert_eq!(record["routes"], json!([]), "{record}");
+        } else {
+            let mut bridged = vec![
+                json!("/bin/fiach"),
+                json!("broker-bridge"),
+                json!("--manifest"),
+                json!("/run/fiach-broker/manifest.json"),
+                json!("--"),
+            ];
+            bridged.extend(worker.as_array().unwrap().iter().cloned());
+            assert_eq!(record["command"], json!(bridged), "{record}");
+            assert_eq!(record["routes"], json!(["openrouter"]), "{record}");
+            assert_eq!(record["sockets"], json!([true]), "{record}");
+        }
+    }
     server.abort();
 }
 

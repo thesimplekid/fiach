@@ -269,9 +269,14 @@ fn parse_openrouter_price_per_m(price_per_token: Option<&str>) -> Option<f64> {
 }
 
 async fn fetch_openrouter_prices_per_m(model_id: &str) -> Result<(Option<f64>, Option<f64>)> {
+    // Sandboxes point OPENROUTER_HOST at the host model broker.
+    let host = std::env::var("OPENROUTER_HOST")
+        .ok()
+        .filter(|host| !host.trim().is_empty())
+        .unwrap_or_else(|| "https://openrouter.ai".to_owned());
     let client = reqwest::Client::new();
     let mut request = client
-        .get("https://openrouter.ai/api/v1/models")
+        .get(format!("{}/api/v1/models", host.trim_end_matches('/')))
         .header("User-Agent", "fiach");
 
     if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY")
@@ -302,7 +307,7 @@ async fn fetch_openrouter_prices_per_m(model_id: &str) -> Result<(Option<f64>, O
     ))
 }
 
-async fn resolve_price_overrides(
+pub(crate) async fn resolve_price_overrides(
     provider: &str,
     model: &str,
     input_override: Option<f64>,

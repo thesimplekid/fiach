@@ -57,7 +57,17 @@ workspace, its context repositories, and the host-selected skills directory.
 The verifier retains the developer extension for bounded reproduction commands;
 use sandbox mode for its execution and credential boundary.
 
-The review agent can execute shell commands. In sandbox mode, `fiach` forwards configured provider API keys and maps `FIACH_REVIEW_GITHUB_TOKEN` to `GITHUB_TOKEN` inside the `systemd-nspawn` container so the review can reach the selected LLM provider and read GitHub data. The host `GITHUB_TOKEN` is never forwarded to the model-controlled process.
+The review agent can execute shell commands. In sandbox mode, provider API keys never enter the `systemd-nspawn` container. A per-job model broker on the host listens on Unix sockets bound read-only at `/run/fiach-broker`, and `fiach broker-bridge` inside the container exposes them on loopback ports through `OPENROUTER_HOST`, `OPENAI_HOST`, `ANTHROPIC_HOST`, `GOOGLE_HOST`, and `TYPESAFE_HOST`, with a random per-job key in the matching `*_API_KEY` variable. The broker:
+
+- accepts only the endpoints Goose and Jev use and only the job's finder, verifier, and Jev models;
+- replaces the per-job key with the real credential and forwards to a fixed HTTPS upstream (the host's own `*_HOST` overrides still apply) without following redirects;
+- enforces `maxCostUsd` across all routes from the usage in provider responses;
+- writes request metadata, without bodies, to `<run dir>.broker/requests.jsonl`;
+- quarantines the job when a request contains the per-job key, a real provider credential, or the review GitHub token. A quarantined review fails and is never disclosed.
+
+Issue worker code and verify phases use the same broker with only their phase's model; regression checks get no model access.
+
+`fiach` still maps `FIACH_REVIEW_GITHUB_TOKEN` to `GITHUB_TOKEN` inside the review container so the review can read GitHub data. The host `GITHUB_TOKEN` is never forwarded to the model-controlled process.
 
 Non-sandboxed reviews share the host process environment and do not provide this credential boundary. Use sandbox mode whenever the host token can perform write or disclosure actions.
 
@@ -66,7 +76,7 @@ The sandbox also bootstraps its own runtime environment for service deployments:
 - writable Goose state and log directories
 - packaged domain skills for environments where the review workspace does not contain `.agents/skills`
 
-Treat every credential forwarded into the review sandbox—the read-only review token and provider keys—as readable by the agent. Use least-privilege credentials:
+Treat the read-only review token as readable by the agent, and provider keys as usable (though not readable) by it within the job's model and cost limits. Use least-privilege credentials:
 - Scope the host `GITHUB_TOKEN` only to the repositories and disclosure actions `fiach` needs.
 - Configure `FIACH_REVIEW_GITHUB_TOKEN` as a distinct fine-grained token with read-only repository contents, metadata, and pull-request access. Sandboxed reviews fail closed when it is absent; do not reuse the host disclosure token.
 - Avoid broad write access, org-wide scopes, or access to unrelated private repositories.
@@ -360,7 +370,7 @@ timeout, uses the shared Jev request limits below, and counts against the finder
 budget. `dedupe_existing_comments` controls deduplication independently of lane
 selection.
 
-After the independent verifier finishes, Fiach fetches current PR discussion and uses TypeSafe Jev to compare verified findings with existing comments. Set `TYPESAFE_API_KEY` in the process environment or NixOS service environment file; it is forwarded into review sandboxes. Jev decisions take effect immediately, without shadow mode. The integration uses GDK’s `goose-providers` decision API with the direct TypeSafe provider and pins the model to `jev-1.13.0`. Goose and its provider crate are pinned together to upstream commit `8a460f964ef5b165e35ab231e76ccfa0c133abbd`, which includes decision-provider support. Fiach retains answer validation, caching, cost budgets, and shared provider cooldowns.
+After the independent verifier finishes, Fiach fetches current PR discussion and uses TypeSafe Jev to compare verified findings with existing comments. Set `TYPESAFE_API_KEY` in the process environment or NixOS service environment file; review sandboxes reach Jev through the host model broker. Jev decisions take effect immediately, without shadow mode. The integration uses GDK’s `goose-providers` decision API with the direct TypeSafe provider and pins the model to `jev-1.13.0`. Goose and its provider crate are pinned together to upstream commit `8a460f964ef5b165e35ab231e76ccfa0c133abbd`, which includes decision-provider support. Fiach retains answer validation, caching, cost budgets, and shared provider cooldowns.
 
 Jev compares each finding with batches of up to eight comments using typed choices: same root issue, different issue, or insufficient evidence. Suppression requires a same-issue probability of at least 0.98 and confidence of at least 0.95. A definite non-match requires a different-issue probability of at least 0.95 and confidence of at least 0.90 for every comment. Comment IDs come from the supplied discussion, and the artifact records the matched ID, model, probability, and confidence. These conservative thresholds are policy defaults, not an accuracy guarantee.
 
@@ -593,8 +603,8 @@ In your `flake.nix` or `configuration.nix`:
    a Nix string. For the Beekeeper setup with `fiach-environment.service`, add
    this line to the encrypted `fiach-env.age` source using your normal secret
    editing workflow. The existing assembly script copies it into
-   `/run/fiach/environment`; no script change is needed. Fiach forwards the key
-   into review sandboxes automatically.
+   `/run/fiach/environment`; no script change is needed. Review sandboxes
+   reach Jev through the host model broker automatically.
 
 3. Add an applicability condition for each lane you want Jev to select. For
    the CDK configuration, add this alongside the existing lane prompts:
