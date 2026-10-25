@@ -1563,6 +1563,7 @@ mod tests {
                 final_comment_body: Some("body".to_string()),
                 affected_locations: Vec::new(),
                 command_transcripts: vec![CommandTranscript {
+                    evidence: crate::reporting::TranscriptEvidence::Execution,
                     command: "cargo test".to_string(),
                     branch_or_commit: "head".to_string(),
                     key_output: "failed".to_string(),
@@ -1700,6 +1701,7 @@ mod tests {
             final_comment_body: Some("new body".to_string()),
             affected_locations: Vec::new(),
             command_transcripts: vec![CommandTranscript {
+                evidence: crate::reporting::TranscriptEvidence::Execution,
                 command: "cargo test".to_string(),
                 branch_or_commit: "head".to_string(),
                 key_output: "failed".to_string(),

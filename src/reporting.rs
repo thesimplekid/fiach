@@ -35,6 +35,20 @@ pub struct ReportingArtifact {
     pub budget_exhausted: Option<ReviewPhase>,
     #[serde(default)]
     pub markdown_only_fallback: bool,
+    /// Inspections the host performed for an inspection-only verifier.
+    /// `None` for verifiers with execution tools, whose evidence the host
+    /// cannot observe.
+    #[serde(default)]
+    pub verifier_inspections: Option<Vec<InspectionRecord>>,
+}
+
+/// One successful inspect call, recorded by the host rather than reported
+/// by the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InspectionRecord {
+    pub operation: String,
+    /// Checkout-relative path, or an absolute path in a context root.
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +80,30 @@ impl ReportingArtifact {
 
     pub fn finder_complete_with_summary(&self, require_summary: bool) -> bool {
         self.finder_complete() && (!require_summary || self.pr_summary.is_some())
+    }
+
+    /// Whether an inspection-only verifier read, searched, or diffed a file
+    /// the finding cites. Verifiers with execution tools are not checked.
+    pub fn verifier_inspected(&self, finding: &Finding, verdict: &Verdict) -> bool {
+        let Some(records) = &self.verifier_inspections else {
+            return true;
+        };
+        let cited = finding
+            .affected_locations
+            .iter()
+            .chain(&verdict.affected_locations)
+            .map(|location| normalize_inspected_path(&location.path))
+            .collect::<BTreeSet<_>>();
+        records.iter().any(|record| {
+            record.operation != "files" && cited.contains(normalize_inspected_path(&record.path))
+        })
+    }
+
+    fn verdict_inspected(&self, verdict: &Verdict) -> bool {
+        self.findings
+            .iter()
+            .find(|finding| finding.id == verdict.finding_id)
+            .is_some_and(|finding| self.verifier_inspected(finding, verdict))
     }
 
     pub fn verifier_complete(&self) -> bool {
@@ -133,6 +171,9 @@ impl ReportingArtifact {
                     .verdicts
                     .iter()
                     .find(|verdict| verdict.finding_id == finding.id)?;
+                if !self.verifier_inspected(finding, verdict) {
+                    return None;
+                }
                 AcceptedFinding::from_parts(
                     finding,
                     verdict,
@@ -252,8 +293,31 @@ impl NoFindings {
     }
 }
 
+/// How a transcript's evidence was obtained.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptEvidence {
+    /// Read-only code inspection through the inspect tool.
+    Inspection,
+    /// An executed command. Artifacts from before evidence kinds were
+    /// recorded came from verifiers with a shell, so this is the default.
+    #[default]
+    Execution,
+}
+
+impl TranscriptEvidence {
+    fn label(self) -> &'static str {
+        match self {
+            TranscriptEvidence::Inspection => "inspection",
+            TranscriptEvidence::Execution => "execution",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandTranscript {
+    #[serde(default)]
+    pub evidence: TranscriptEvidence,
     pub command: String,
     pub branch_or_commit: String,
     pub key_output: String,
@@ -690,7 +754,7 @@ pub fn reporting_tools() -> Vec<Tool> {
                         "command_transcripts",
                         array_schema(command_transcript_schema()),
                     ),
-                    ("rationale", string_schema("Classify evidence as reproduced, established by inspection, or unresolved; explain the failure path, counterevidence, and base-versus-PR comparison. Unresolved assumptions require suppression.")),
+                    ("rationale", string_schema("Classify evidence as established by inspection or unresolved; explain the failure path, counterevidence, and base-versus-PR comparison. Unresolved assumptions require suppression.")),
                 ],
                 vec![
                     "finding_id",
@@ -922,8 +986,11 @@ findings_count: {findings_count}
             out.push('\n');
             for transcript in &finding.verdict.command_transcripts {
                 out.push_str(&format!(
-                    "\n- `{}` at `{}`: {}\n",
-                    transcript.command, transcript.branch_or_commit, transcript.interpretation
+                    "\n- {} `{}` at `{}`: {}\n",
+                    transcript.evidence.label(),
+                    transcript.command,
+                    transcript.branch_or_commit,
+                    transcript.interpretation
                 ));
             }
             if !finding.additional_locations.is_empty() {
@@ -984,6 +1051,7 @@ findings_count: {findings_count}
                 || !verdict.introduced_by_pr
                 || !verdict.wants_disclosure()
                 || verdict.command_transcripts.is_empty()
+                || !artifact.verdict_inspected(verdict)
         })
         .collect();
     if !rejected.is_empty() {
@@ -1093,18 +1161,38 @@ fn location_schema() -> JsonObject {
 fn command_transcript_schema() -> JsonObject {
     object_schema(
         vec![
-            ("command", string_schema("Command that was run")),
-            ("branch_or_commit", string_schema("Branch or commit tested")),
+            (
+                "evidence",
+                json_object(json!({
+                    "type": "string",
+                    "enum": ["inspection"],
+                    "description": "inspection: the transcript records an actual inspect call"
+                })),
+            ),
+            (
+                "command",
+                string_schema("The inspect call, for example: inspect diff src/lib.rs"),
+            ),
+            (
+                "branch_or_commit",
+                string_schema("Commit or diff range inspected"),
+            ),
             ("key_output", string_schema("Relevant output excerpt")),
             ("interpretation", string_schema("What this output proves")),
         ],
         vec![
+            "evidence",
             "command",
             "branch_or_commit",
             "key_output",
             "interpretation",
         ],
     )
+}
+
+/// Paths compare without a leading `./`.
+fn normalize_inspected_path(path: &str) -> &str {
+    path.trim_start_matches("./")
 }
 
 fn string_schema(description: &str) -> JsonObject {
@@ -1297,6 +1385,7 @@ mod tests {
                 final_comment_body: None,
                 affected_locations: Vec::new(),
                 command_transcripts: vec![CommandTranscript {
+                    evidence: crate::reporting::TranscriptEvidence::Execution,
                     command: "cargo test".to_string(),
                     branch_or_commit: "head".to_string(),
                     key_output: "failed".to_string(),
@@ -1367,6 +1456,7 @@ mod tests {
             verdict.disclosure_decision = disclose.to_string();
             verdict.rationale = rationale.to_string();
             verdict.command_transcripts = vec![CommandTranscript {
+                evidence: crate::reporting::TranscriptEvidence::Execution,
                 command: "git show base:src/lib.rs; git show head:src/lib.rs".to_string(),
                 branch_or_commit: "base and head".to_string(),
                 key_output: "fixture: caller and callee source at both revisions".to_string(),
@@ -1507,6 +1597,7 @@ mod tests {
                 final_comment_body: None,
                 affected_locations: Vec::new(),
                 command_transcripts: vec![CommandTranscript {
+                    evidence: crate::reporting::TranscriptEvidence::Execution,
                     command: "cargo test".to_string(),
                     branch_or_commit: "head".to_string(),
                     key_output: "failed".to_string(),
@@ -1576,6 +1667,7 @@ mod tests {
                 final_comment_body: None,
                 affected_locations: Vec::new(),
                 command_transcripts: vec![CommandTranscript {
+                    evidence: crate::reporting::TranscriptEvidence::Execution,
                     command: "cargo test".to_string(),
                     branch_or_commit: "head".to_string(),
                     key_output: "failed".to_string(),
@@ -1679,6 +1771,98 @@ mod tests {
 
         assert_eq!(artifact.publishable_findings(&policy()).len(), 1);
         assert!(artifact.already_reported_findings(&policy()).is_empty());
+    }
+
+    fn inspected(operation: &str, path: &str) -> InspectionRecord {
+        InspectionRecord {
+            operation: operation.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn static_verifier_must_inspect_a_cited_file_before_disclosure() {
+        let mut artifact = accepted_artifact(1);
+        artifact.verdicts[0].command_transcripts[0].evidence = TranscriptEvidence::Inspection;
+        // No recorded inspections: a model-reported transcript is not enough.
+        artifact.verifier_inspections = Some(Vec::new());
+        assert!(artifact.publishable_findings(&policy()).is_empty());
+        let markdown = render_markdown("owner/repo", 1, &artifact, Some(&policy()));
+        assert!(markdown.contains("## Suppressed Candidates"));
+
+        for (records, accepted) in [
+            (vec![inspected("files", "src/lib.rs")], false),
+            (vec![inspected("read", "src/other.rs")], false),
+            (vec![inspected("read", "src/lib.rs")], true),
+            (vec![inspected("search", "./src/lib.rs")], true),
+            (vec![inspected("diff", "src/lib.rs")], true),
+        ] {
+            artifact.verifier_inspections = Some(records.clone());
+            assert_eq!(
+                artifact.publishable_findings(&policy()).len(),
+                usize::from(accepted),
+                "{records:?}"
+            );
+        }
+
+        // Locations the verifier adds count as cited.
+        artifact.verdicts[0].affected_locations = vec![AffectedLocation {
+            path: "src/other.rs".to_string(),
+            start_line: Some(3),
+            end_line: None,
+        }];
+        artifact.verifier_inspections = Some(vec![inspected("read", "src/other.rs")]);
+        assert_eq!(artifact.publishable_findings(&policy()).len(), 1);
+    }
+
+    #[test]
+    fn legacy_artifacts_keep_execution_evidence_without_inspection_records() {
+        let mut value = serde_json::to_value(accepted_artifact(1)).unwrap();
+        let transcript = &mut value["verdicts"][0]["command_transcripts"][0];
+        transcript.as_object_mut().unwrap().remove("evidence");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("verifier_inspections");
+        let artifact: ReportingArtifact = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            artifact.verdicts[0].command_transcripts[0].evidence,
+            TranscriptEvidence::Execution
+        );
+        assert!(artifact.verifier_inspections.is_none());
+        assert_eq!(artifact.publishable_findings(&policy()).len(), 1);
+    }
+
+    #[test]
+    fn rendered_evidence_names_its_kind() {
+        let mut artifact = accepted_artifact(1);
+        artifact.verdicts[0].command_transcripts[0].evidence = TranscriptEvidence::Inspection;
+        artifact.verifier_inspections = Some(vec![inspected("diff", "src/lib.rs")]);
+        let markdown = render_markdown("owner/repo", 1, &artifact, Some(&policy()));
+        assert!(
+            markdown.contains("- inspection `cargo test` at `head`"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn verdict_schema_requires_inspection_evidence() {
+        let tools = reporting_tools();
+        let verdict = tools
+            .iter()
+            .find(|tool| tool.name == "submit_verdict")
+            .unwrap();
+        let transcript = &verdict.input_schema["properties"]["command_transcripts"]["items"];
+        assert_eq!(
+            transcript["properties"]["evidence"]["enum"],
+            serde_json::json!(["inspection"])
+        );
+        assert!(
+            transcript["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("evidence"))
+        );
     }
 
     #[test]

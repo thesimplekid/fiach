@@ -1,6 +1,7 @@
 //! Fixed inspection operations shared by the finder and its delegated lanes.
 use std::{
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -19,7 +20,7 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, process::Command};
 use tokio_util::sync::CancellationToken;
 
-use crate::process::output_limited;
+use crate::{process::output_limited, reporting::InspectionRecord};
 
 pub const EXTENSION_NAME: &str = "fiach-inspection";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -32,15 +33,44 @@ pub struct Inspection {
     roots: Vec<PathBuf>,
     base: String,
     head: String,
+    log: Option<InspectionLog>,
 }
 
-#[derive(Deserialize)]
+/// Successful inspections, shared with the host that created the service.
+#[derive(Clone, Default)]
+pub struct InspectionLog(Arc<Mutex<Vec<InspectionRecord>>>);
+
+impl InspectionLog {
+    pub fn records(&self) -> Vec<InspectionRecord> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn push(&self, record: InspectionRecord) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(record);
+    }
+}
+
+#[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
     Read,
     Files,
     Search,
     Diff,
+}
+
+impl Operation {
+    fn name(self) -> &'static str {
+        match self {
+            Operation::Read => "read",
+            Operation::Files => "files",
+            Operation::Search => "search",
+            Operation::Diff => "diff",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -77,7 +107,35 @@ impl Inspection {
             roots: allowed,
             base: base.to_owned(),
             head: head.to_owned(),
+            log: None,
         })
+    }
+
+    /// Records each successful in-process inspection. Calls served through
+    /// the stdio server for delegates are not recorded.
+    pub fn with_log(mut self) -> (Self, InspectionLog) {
+        let log = InspectionLog::default();
+        self.log = Some(log.clone());
+        (self, log)
+    }
+
+    fn record(&self, operation: Operation, path: &Path) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        let path = path
+            .strip_prefix(&self.workspace)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        log.push(InspectionRecord {
+            operation: operation.name().to_owned(),
+            path: if path.is_empty() {
+                ".".to_owned()
+            } else {
+                path
+            },
+        });
     }
 
     pub fn extension_config(&self, executable: &Path) -> ExtensionConfig {
@@ -131,13 +189,14 @@ impl Inspection {
                     bail!("Read requires a regular file");
                 }
                 let mut bytes = Vec::new();
-                tokio::fs::File::open(path)
+                tokio::fs::File::open(&path)
                     .await?
                     .take(MAX_BYTES as u64 + 1)
                     .read_to_end(&mut bytes)
                     .await?;
                 let truncated = bytes.len() > MAX_BYTES;
                 bytes.truncate(MAX_BYTES);
+                self.record(args.operation, &path);
                 (bytes, truncated)
             }
             Operation::Files | Operation::Search => {
@@ -152,7 +211,7 @@ impl Inspection {
                     "!.git",
                 ]);
                 if matches!(args.operation, Operation::Files) {
-                    command.args(["--files", "--"]).arg(path);
+                    command.args(["--files", "--"]).arg(&path);
                 } else {
                     command
                         .args([
@@ -164,7 +223,7 @@ impl Inspection {
                             "--",
                         ])
                         .arg(args.query.context("Search requires a literal query")?)
-                        .arg(path);
+                        .arg(&path);
                 }
                 let output = output_limited(
                     &mut command,
@@ -182,6 +241,7 @@ impl Inspection {
                         String::from_utf8_lossy(&output.stderr)
                     );
                 }
+                self.record(args.operation, &path);
                 (output.stdout, output.stdout_truncated)
             }
             Operation::Diff => {
@@ -222,6 +282,8 @@ impl Inspection {
                         String::from_utf8_lossy(&output.stderr)
                     );
                 }
+                let path = path.strip_prefix(".").unwrap_or(path);
+                self.record(args.operation, path);
                 (output.stdout, output.stdout_truncated)
             }
         };
@@ -387,6 +449,45 @@ mod tests {
             .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn logged_inspections_record_checkout_relative_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let (inspection, log) = fixture(root.path()).with_log();
+        for args in [
+            serde_json::json!({"operation": "read", "path": "src/lib.rs"}),
+            serde_json::json!({"operation": "search", "path": "./src/lib.rs", "query": "main"}),
+            serde_json::json!({"operation": "files"}),
+            serde_json::json!({"operation": "read", "path": "missing.rs"}),
+        ] {
+            let _ = inspection
+                .dispatch(
+                    "inspect",
+                    args.as_object().cloned(),
+                    CancellationToken::new(),
+                )
+                .await;
+        }
+        assert_eq!(
+            log.records(),
+            [
+                InspectionRecord {
+                    operation: "read".into(),
+                    path: "src/lib.rs".into()
+                },
+                InspectionRecord {
+                    operation: "search".into(),
+                    path: "src/lib.rs".into()
+                },
+                InspectionRecord {
+                    operation: "files".into(),
+                    path: ".".into()
+                },
+            ]
+        );
     }
 
     #[tokio::test]

@@ -961,6 +961,7 @@ mod tests {
             final_comment_body: None,
             affected_locations: Vec::new(),
             command_transcripts: vec![CommandTranscript {
+                evidence: crate::reporting::TranscriptEvidence::Execution,
                 command: "git diff".to_string(),
                 branch_or_commit: "HEAD".to_string(),
                 key_output: "output".to_string(),

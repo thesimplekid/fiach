@@ -53,8 +53,13 @@ files, listing paths, literal text searches, and diffs pinned to the reviewed
 commits. They cannot execute shell commands, edit files, run repository scripts,
 or add execution tools to a delegate. Read access is limited to the prepared
 workspace, its context repositories, and the host-selected skills directory.
-The verifier retains the developer extension for bounded reproduction commands;
-use sandbox mode for its execution and credential boundary.
+The verifier uses the same `inspect` tool and has no shell either, so reviews
+are static: no PR code is built or run. The host records each inspect call the
+verifier makes, and a finding is disclosed only when the verifier read,
+searched, or diffed a file the finding cites. Verdict transcripts carry
+`evidence: inspection`; artifacts from before this change default to
+`execution`. Sandbox mode remains the credential boundary for the review
+process itself.
 
 The review agent can execute shell commands. In sandbox mode, provider API keys never enter the `systemd-nspawn` container. A per-job model broker on the host listens on Unix sockets bound read-only at `/run/fiach-broker`, and `fiach broker-bridge` inside the container exposes them on loopback ports through `OPENROUTER_HOST`, `OPENAI_HOST`, `ANTHROPIC_HOST`, `GOOGLE_HOST`, and `TYPESAFE_HOST`, with a random per-job key in the matching `*_API_KEY` variable. The broker:
 
@@ -494,6 +499,7 @@ For `report_mode = "pr-comment"`, Fiach posts a GitHub PR review only when all h
 - the verifier confirmed the finding,
 - the verifier marked it as introduced by the PR,
 - command transcript evidence is present,
+- for inspection-only verifiers, the host recorded an inspection of a file the finding cites,
 - the comment anchor is valid in the PR diff.
 
 This is the same flow for `builtin:security`, `builtin:pr-review`, and `builtin:code-quality`: persona changes what the finder looks for, while the host-side reporting and disclosure policy stays deterministic. Invalid inline anchors are downgraded into the review summary. Merged or closed PRs never receive PR comments. `report_mode = "sync-pr"` can still publish the local rendered report to the configured sync repository.

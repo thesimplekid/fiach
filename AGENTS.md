@@ -36,6 +36,7 @@ High-signal constraints and instructions for AI agents working in this repositor
   - Uses `verifier_provider` / `verifier_model` when set, otherwise falls back to finder `provider` / `model`.
   - Must submit one `submit_verdict` per candidate.
   - Verified disclosure requires command transcript evidence.
+  - The verifier is inspection-only (no developer shell). The host records its inspect calls in `verifier_inspections`, and disclosure requires an inspection of a file the finding cites.
 - PR comments are allowed only for open PRs with confirmed, PR-introduced, verifier-approved findings.
 - Merged or closed PRs must not receive inline or top-level PR comments.
 - Invalid inline anchors are downgraded into the review summary; they must not block other valid comments.
