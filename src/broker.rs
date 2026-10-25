@@ -318,6 +318,16 @@ pub fn sandbox_key() -> String {
     )
 }
 
+/// A random token shaped like a GitHub personal access token, planted in a
+/// sandbox so an agent looking for GitHub credentials finds a canary.
+pub fn github_canary() -> String {
+    format!(
+        "ghp_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        &uuid::Uuid::new_v4().simple().to_string()[..4]
+    )
+}
+
 #[derive(Clone, Debug)]
 pub enum Listen {
     Tcp(SocketAddr),

@@ -112,7 +112,6 @@
             let
               envFile = pkgs.writeText "fiach-env" ''
                 GITHUB_TOKEN=ghp_example
-                FIACH_REVIEW_GITHUB_TOKEN=github_pat_read_only_example
                 OPENROUTER_API_KEY=sk-example
                 FIACH_SERVER_TOKEN=server-example
                 FIACH_BUZZ_PRIVATE_KEY=nsec1example
@@ -433,7 +432,7 @@
 
             environmentFile = lib.mkOption {
               type = lib.types.path;
-              description = "Path to environment file containing GITHUB_TOKEN, FIACH_REVIEW_GITHUB_TOKEN when sandboxing is enabled, the selected provider API key, TYPESAFE_API_KEY for live Jev deduplication, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
+              description = "Path to environment file containing GITHUB_TOKEN, the selected provider API key, TYPESAFE_API_KEY for live Jev deduplication, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
             };
 
             buzz = {

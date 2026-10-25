@@ -288,6 +288,10 @@ enum Commands {
         #[arg(long, hide = true)]
         sandbox_child: bool,
 
+        /// Internal: host-staged workspace and PR inputs for sandbox child reviews
+        #[arg(long, hide = true, requires = "sandbox_child")]
+        staged_review: Option<PathBuf>,
+
         /// Internal: JSON map of review lane prompts for sandbox child reviews
         #[arg(long, hide = true)]
         review_lane_prompts_json: Option<String>,
@@ -595,6 +599,7 @@ async fn main() -> Result<()> {
             input_price,
             output_price,
             sandbox_child,
+            staged_review,
             review_lane_prompts_json,
             review_lane_conditions_json,
             result_json,
@@ -710,6 +715,7 @@ async fn main() -> Result<()> {
                             &persona,
                             use_persona_kind,
                         ),
+                        staged_review: staged_review.clone(),
                     },
                 };
 

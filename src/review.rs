@@ -365,6 +365,9 @@ pub struct ReviewExecution {
     pub skip_state_check: bool,
     pub persist_side_effects: bool,
     pub result_json: Option<PathBuf>,
+    /// Inputs the host staged for a sandbox child; the review then makes no
+    /// GitHub calls of its own.
+    pub staged_review: Option<PathBuf>,
 }
 
 /// Parameters for a single PR review.
@@ -1329,8 +1332,19 @@ pub async fn run_review(
     // 1. Prepare workspace: clone repo and checkout PR branch
     //    The agent starts already inside the checked-out PR branch,
     //    matching the ctf-pr-reviewer pattern.
-    let context_group = params.context_groups.get(&params.repo);
-    let workspace = workspace::prepare(&params.repo, params.pr_number, None, context_group).await?;
+    let staged = params
+        .execution
+        .staged_review
+        .as_deref()
+        .map(workspace::StagedReview::load)
+        .transpose()?;
+    let workspace = match &staged {
+        Some(staged) => workspace::PreparedWorkspace::adopt(staged).await?,
+        None => {
+            let context_group = params.context_groups.get(&params.repo);
+            workspace::prepare(&params.repo, params.pr_number, None, context_group).await?
+        }
+    };
 
     if !params.execution.skip_state_check {
         let decision = state::should_review(
@@ -1456,25 +1470,18 @@ pub async fn run_review(
     if actual_skill.is_none() {
         tracing::debug!("No explicit skill provided. Attempting dynamic skill discovery...");
 
-        let pr_info_output = tokio::process::Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &params.pr_number.to_string(),
-                "--json",
-                "title,body",
-                "--repo",
-                &params.repo,
-            ])
-            .output_bounded("loading pull request details for skill selection")
-            .await;
+        let pr_details = match &staged {
+            Some(staged) => staged
+                .pr_details
+                .clone()
+                .context("The host did not stage pull request details"),
+            None => workspace::fetch_pr_details(&params.repo, params.pr_number).await,
+        };
 
-        match pr_info_output {
-            Ok(output) if output.status.success() => {
-                let pr_json: serde_json::Value =
-                    serde_json::from_slice(&output.stdout).unwrap_or_default();
-                let title = pr_json.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let body = pr_json.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        match pr_details {
+            Ok(details) => {
+                let title = details.title.as_str();
+                let body = details.body.as_str();
 
                 let available_skills = list_available_skills(skills_dir.as_deref());
 
@@ -1552,12 +1559,8 @@ pub async fn run_review(
                     tracing::info!(skills_dir = ?skills_dir, "No skills available in workspace or packaged skills directories");
                 }
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!("Failed to fetch PR info for skill discovery: {}", stderr);
-            }
             Err(e) => {
-                tracing::warn!("Failed to execute gh command for skill discovery: {}", e);
+                tracing::warn!(error = %e, "Failed to load PR details for skill discovery");
             }
         }
     }
@@ -2150,6 +2153,9 @@ pub async fn run_review(
             artifact: &mut artifact,
             policy: &policy,
             review: &params,
+            staged_comments: staged
+                .as_ref()
+                .map(|staged| staged.existing_comments.as_deref()),
             input_price_per_m,
             output_price_per_m,
             max_cost_usd: remaining_cost_budget(params.max_cost_usd, cost_usd),
@@ -2866,7 +2872,7 @@ pub fn disclosure_policy_path_for_report(report_file: &std::path::Path) -> PathB
     disclosure_policy_path(report_file)
 }
 
-async fn fetch_existing_pr_comments(
+pub(crate) async fn fetch_existing_pr_comments(
     repo: &str,
     pr_number: u64,
 ) -> Result<Vec<reporting::ExistingPrComment>> {
@@ -2934,6 +2940,8 @@ struct DuplicateSuppressionParams<'a> {
     artifact: &'a mut ReportingArtifact,
     policy: &'a reporting::DisclosurePolicy,
     review: &'a ReviewParams,
+    /// `Some` for staged reviews: the discussion the host fetched, if any.
+    staged_comments: Option<Option<&'a [reporting::ExistingPrComment]>>,
     input_price_per_m: Option<f64>,
     output_price_per_m: Option<f64>,
     max_cost_usd: Option<f64>,
@@ -2958,10 +2966,15 @@ async fn apply_duplicate_suppression(
     if findings.is_empty() {
         return Ok(crate::dedupe::Outcome::default());
     }
-    // Fetch fresh discussion after verification, in host code rather than via model tools.
-    let comments = match fetch_existing_pr_comments(&params.review.repo, params.review.pr_number)
-        .await
-    {
+    // Fetch fresh discussion after verification, in host code rather than via
+    // model tools. Staged reviews use the discussion the host fetched before
+    // starting the sandbox, which has no GitHub access.
+    let comments = match params.staged_comments {
+        Some(Some(comments)) => Ok(comments.to_vec()),
+        Some(None) => Err(anyhow::anyhow!("The host did not stage PR discussion")),
+        None => fetch_existing_pr_comments(&params.review.repo, params.review.pr_number).await,
+    };
+    let comments = match comments {
         Ok(comments) if comments.is_empty() => return Ok(crate::dedupe::Outcome::default()),
         Ok(comments) => comments,
         Err(error) => {

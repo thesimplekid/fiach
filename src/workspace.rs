@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use tempfile::{Builder, TempDir};
 use tokio::process::Command;
 
@@ -16,13 +16,16 @@ use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT, output_limited};
 
 const PR_CONTEXT_JSON_FIELDS: &str = "baseRefOid,baseRefName,state,mergedAt";
 const MAX_MATERIALIZED_DIFF_BYTES: usize = 16 * 1024 * 1024;
+/// PR discussion can be long; this bounds what a sandbox child will parse.
+const MAX_STAGED_REVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
 /// A prepared workspace with the PR branch checked out, ready for the agent.
 pub struct PreparedWorkspace {
     /// Path to the workspace directory (the agent's working directory).
     pub path: PathBuf,
-    /// Owns this execution's directory, including cleanup on drop.
-    directory: TempDir,
+    /// Owns this execution's directory, including cleanup on drop. Staged
+    /// workspaces belong to the host, which removes them.
+    directory: Option<TempDir>,
     /// The commit hash of the checked-out PR branch.
     pub commit_hash: String,
     /// The base commit hash the PR was branched from.
@@ -61,10 +64,115 @@ struct DefaultBranchRef {
 impl PreparedWorkspace {
     /// Clean up only the temporary directory owned by this execution.
     pub async fn cleanup(self) -> Result<()> {
-        tokio::task::spawn_blocking(move || self.directory.close())
+        let Some(directory) = self.directory else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || directory.close())
             .await
             .context("Workspace cleanup task failed")?
             .context("Failed to remove workspace directory")
+    }
+
+    /// Uses a workspace the host prepared, after checking that its checkout
+    /// is still at the staged commit.
+    pub async fn adopt(staged: &StagedReview) -> Result<Self> {
+        ensure!(
+            staged.workspace.is_absolute() && staged.workspace.join(".git").exists(),
+            "Staged workspace {} is not a git checkout",
+            staged.workspace.display()
+        );
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&staged.workspace)
+            .output_bounded("resolving the staged review commit")
+            .await
+            .context("Failed to run `git rev-parse HEAD`")?;
+        ensure!(head.status.success(), "git rev-parse HEAD failed");
+        ensure!(
+            String::from_utf8_lossy(&head.stdout).trim() == staged.commit_hash,
+            "Staged workspace is not at the staged commit {}",
+            staged.commit_hash
+        );
+        Ok(Self {
+            path: staged.workspace.clone(),
+            directory: None,
+            commit_hash: staged.commit_hash.clone(),
+            base_commit: staged.base_commit.clone(),
+            pr_context: staged.pr_context.clone(),
+        })
+    }
+}
+
+/// Pull request text used to pick a domain skill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrDetails {
+    pub title: String,
+    pub body: String,
+}
+
+pub async fn fetch_pr_details(repo: &str, pr_number: u64) -> Result<PrDetails> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--json",
+            "title,body",
+            "--repo",
+            repo,
+        ])
+        .output_bounded("loading pull request details for skill selection")
+        .await
+        .context("Failed to run `gh pr view`")?;
+    if !output.status.success() {
+        bail!(
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("Failed to parse PR details")?;
+    let text = |field: &str| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Ok(PrDetails {
+        title: text("title"),
+        body: text("body"),
+    })
+}
+
+/// Everything a sandboxed review child would otherwise fetch from GitHub.
+/// The host prepares it so the child needs no GitHub credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedReview {
+    /// The checkout, as a path inside the sandbox.
+    pub workspace: PathBuf,
+    pub commit_hash: String,
+    pub base_commit: String,
+    pub pr_context: crate::reporting::PrContext,
+    /// `None` when an explicit skill makes discovery unnecessary or the
+    /// details could not be fetched.
+    pub pr_details: Option<PrDetails>,
+    /// `None` when deduplication will not run or discussion could not be
+    /// fetched; deduplication is then skipped.
+    pub existing_comments: Option<Vec<crate::reporting::ExistingPrComment>>,
+}
+
+impl StagedReview {
+    pub fn load(path: &Path) -> Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("Reading staged review {}", path.display()))?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= MAX_STAGED_REVIEW_BYTES,
+            "Invalid staged review {}",
+            path.display()
+        );
+        serde_json::from_slice(&std::fs::read(path)?).context("Parsing staged review")
     }
 }
 
@@ -326,7 +434,7 @@ fi
 
     Ok(PreparedWorkspace {
         path: workspace_dir,
-        directory,
+        directory: Some(directory),
         commit_hash: commit_hash.clone(),
         base_commit,
         pr_context: crate::reporting::PrContext {
@@ -347,7 +455,7 @@ mod tests {
     fn prepared(directory: TempDir) -> PreparedWorkspace {
         PreparedWorkspace {
             path: directory.path().join("repo"),
-            directory,
+            directory: Some(directory),
             commit_hash: "head".to_string(),
             base_commit: "base".to_string(),
             pr_context: crate::reporting::PrContext {
@@ -370,11 +478,11 @@ mod tests {
 
         let first =
             prepared(create_workspace_directory("owner/repo", 42, Some(root.path())).unwrap());
-        let first_path = first.directory.path().to_path_buf();
+        let first_path = first.directory.as_ref().unwrap().path().to_path_buf();
         std::fs::write(first_path.join("sentinel"), "first").unwrap();
         let second =
             prepared(create_workspace_directory("owner/repo", 42, Some(root.path())).unwrap());
-        let second_path = second.directory.path().to_path_buf();
+        let second_path = second.directory.as_ref().unwrap().path().to_path_buf();
         std::fs::write(second_path.join("sentinel"), "second").unwrap();
 
         assert_ne!(first_path, second_path);
@@ -407,6 +515,94 @@ mod tests {
         std::fs::write(&file, "preserve").unwrap();
         assert!(create_workspace_directory("owner/repo", 42, Some(&file)).is_err());
         assert_eq!(std::fs::read_to_string(file).unwrap(), "preserve");
+    }
+
+    async fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@localhost",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn staged(workspace: PathBuf, commit_hash: String) -> StagedReview {
+        StagedReview {
+            workspace,
+            commit_hash: commit_hash.clone(),
+            base_commit: "base".to_string(),
+            pr_context: crate::reporting::PrContext {
+                state: "OPEN".to_string(),
+                merged: false,
+                base_ref_name: "main".to_string(),
+                default_branch: "main".to_string(),
+                base_commit: "base".to_string(),
+                head_commit: commit_hash,
+            },
+            pr_details: Some(PrDetails {
+                title: "Fix".to_string(),
+                body: "Body".to_string(),
+            }),
+            existing_comments: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn adopting_a_staged_workspace_checks_its_commit_and_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "--initial-branch=main"]).await;
+        std::fs::write(repo.join("file"), "x").unwrap();
+        git(&repo, &["add", "."]).await;
+        git(&repo, &["commit", "-m", "head"]).await;
+        let head = git(&repo, &["rev-parse", "HEAD"]).await;
+
+        let adopted = PreparedWorkspace::adopt(&staged(repo.clone(), head.clone()))
+            .await
+            .unwrap();
+        assert_eq!(adopted.commit_hash, head);
+        assert_eq!(adopted.pr_context.head_commit, head);
+        adopted.cleanup().await.unwrap();
+        assert!(
+            repo.join("file").exists(),
+            "the host owns staged workspaces"
+        );
+
+        let moved = PreparedWorkspace::adopt(&staged(repo.clone(), "0".repeat(40))).await;
+        assert!(moved.is_err());
+        let relative = PreparedWorkspace::adopt(&staged(PathBuf::from("repo"), head)).await;
+        assert!(relative.is_err());
+    }
+
+    #[test]
+    fn staged_review_round_trips_and_rejects_unknown_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("review.json");
+        let review = staged(PathBuf::from("/review/repo"), "head".to_string());
+        std::fs::write(&path, serde_json::to_vec(&review).unwrap()).unwrap();
+        let loaded = StagedReview::load(&path).unwrap();
+        assert_eq!(loaded.workspace, review.workspace);
+        assert_eq!(loaded.pr_details, review.pr_details);
+
+        let mut value = serde_json::to_value(&review).unwrap();
+        value["github_token"] = serde_json::json!("x");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(StagedReview::load(&path).is_err());
+
+        let link = root.path().join("link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(StagedReview::load(&link).is_err());
     }
 
     #[test]

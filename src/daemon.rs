@@ -1261,6 +1261,7 @@ async fn process_daemon_job(
                     skip_state_check: true,
                     persist_side_effects: false,
                     result_json: None,
+                    staged_review: None,
                 },
             };
             let finalization = FinalizationSpec::from(&review_params);
@@ -1512,20 +1513,6 @@ pub(crate) async fn configure_sandbox_veth_host(
     Ok(())
 }
 
-fn validate_sandbox_review_token<'a>(
-    review_token: &'a str,
-    host_token: Option<&str>,
-) -> Result<&'a str> {
-    if review_token.trim().is_empty() {
-        anyhow::bail!("FIACH_REVIEW_GITHUB_TOKEN must not be empty");
-    }
-    if host_token == Some(review_token) {
-        anyhow::bail!("FIACH_REVIEW_GITHUB_TOKEN must be distinct from the host GITHUB_TOKEN");
-    }
-
-    Ok(review_token)
-}
-
 /// Passes a secret into the container by name only. `systemd-nspawn --setenv=NAME`
 /// copies the value from its own environment, so the secret never appears in the
 /// command line, which any local user can read from `/proc/<pid>/cmdline`.
@@ -1658,24 +1645,16 @@ async fn run_sandboxed_review(
         cmd.arg("--bind-ro=/nix/store");
     }
 
-    // Never expose the host disclosure token to the model-controlled review
-    // process. This token must be separately provisioned with read-only access
-    // sufficient for cloning repositories and reading pull-request metadata.
-    let review_github_token = std::env::var("FIACH_REVIEW_GITHUB_TOKEN").context(
-        "Sandboxed reviews require FIACH_REVIEW_GITHUB_TOKEN; configure a read-only GitHub token distinct from GITHUB_TOKEN",
-    )?;
-    let host_github_token = std::env::var("GITHUB_TOKEN").ok();
-    let review_github_token =
-        validate_sandbox_review_token(&review_github_token, host_github_token.as_deref())?;
-    forward_sandbox_secret(&mut cmd, "GITHUB_TOKEN", review_github_token);
-    // Provider credentials stay on the host. The sandbox reaches providers
-    // through the model broker with per-job keys.
-    let broker = start_review_broker(
-        review_params,
-        &broker_state_dir(&run_dir),
-        review_github_token,
-    )
-    .await?;
+    // The host stages the checkout and PR inputs, so the sandbox needs no
+    // GitHub credentials. It gets a planted token instead: any request that
+    // carries it to the model broker quarantines the review.
+    let staging = stage_sandbox_review(review_params, &runtime_rootfs).await?;
+    let github_canary = crate::broker::github_canary();
+    plant_github_canary(&runtime_rootfs, &github_canary).await?;
+    forward_sandbox_secret(&mut cmd, "GITHUB_TOKEN", &github_canary);
+    cmd.arg(format!("--setenv=GH_CONFIG_DIR={SANDBOX_GH_CONFIG_DIR}"));
+    let broker =
+        start_review_broker(review_params, &broker_state_dir(&run_dir), &github_canary).await?;
     if let Some(broker) = &broker {
         cmd.arg(broker.nspawn_bind_arg());
     }
@@ -1772,6 +1751,7 @@ async fn run_sandboxed_review(
         .arg(review_params.timeout_mins.to_string());
     cmd.arg("--db-path").arg(&review_params.db_path);
     cmd.arg("--sandbox-child");
+    cmd.arg("--staged-review").arg(SANDBOX_STAGED_REVIEW);
     cmd.arg("--result-json").arg("/sandbox-output/result.json");
 
     if review_params.force {
@@ -1886,6 +1866,13 @@ async fn run_sandboxed_review(
     run?;
 
     let mut completed = read_completed_review(&result_json)?;
+    // The child reports what it reviewed; hold it to what the host staged.
+    anyhow::ensure!(
+        completed.metadata.commit_hash == staging.staged.commit_hash,
+        "Sandboxed review reported commit {} but the host staged {}",
+        completed.metadata.commit_hash,
+        staging.staged.commit_hash
+    );
     let structured_path = crate::review::structured_artifact_path_for_report(&report_path);
     let policy_path = crate::review::disclosure_policy_path_for_report(&report_path);
     completed.report_path.clone_from(&report_path);
@@ -1895,13 +1882,115 @@ async fn run_sandboxed_review(
         policy_json: Some(policy_path),
         sandbox_log: Some(nspawn_log.clone()),
     };
-    ReviewOutcome::load(
+    let outcome = ReviewOutcome::load(
         completed,
         crate::execution::ExecutionDiagnostics {
             sandbox_log: Some(nspawn_log),
             executor: "sandbox".to_string(),
         },
+    )?;
+    let staged = &staging.staged.pr_context;
+    let reported = &outcome.policy.pr_context;
+    anyhow::ensure!(
+        reported.head_commit == staged.head_commit && reported.base_commit == staged.base_commit,
+        "Sandboxed review disclosure policy does not match the staged PR commits"
+    );
+    drop(staging);
+    Ok(outcome)
+}
+
+/// Where the staged review inputs appear inside the sandbox.
+const SANDBOX_STAGED_REVIEW: &str = "/fiach-input/review.json";
+const SANDBOX_GH_CONFIG_DIR: &str = "/fiach-input/gh";
+
+/// A workspace the host cloned into the sandbox rootfs, kept alive until the
+/// review finishes.
+struct StagedSandboxReview {
+    _workspace: crate::workspace::PreparedWorkspace,
+    staged: crate::workspace::StagedReview,
+}
+
+/// Clones the PR and fetches everything the child would otherwise read from
+/// GitHub into the runtime rootfs. Staging lives under `/review`, not `/tmp`,
+/// so it is not hidden by a tmpfs the container may mount there.
+async fn stage_sandbox_review(
+    review_params: &ReviewParams,
+    runtime_rootfs: &Path,
+) -> Result<StagedSandboxReview> {
+    let context_group = review_params.context_groups.get(&review_params.repo);
+    let workspace = crate::workspace::prepare(
+        &review_params.repo,
+        review_params.pr_number,
+        Some(&runtime_rootfs.join("review")),
+        context_group,
     )
+    .await?;
+    let pr_details = if review_params.skill.is_none() {
+        crate::workspace::fetch_pr_details(&review_params.repo, review_params.pr_number)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(error = %error, "Could not stage PR details for skill discovery")
+            })
+            .ok()
+    } else {
+        None
+    };
+    let existing_comments = if review_params.dedupe_existing_comments
+        && workspace.pr_context.comments_allowed()
+    {
+        crate::review::fetch_existing_pr_comments(&review_params.repo, review_params.pr_number)
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(error = %error, "Could not stage PR discussion for deduplication")
+                })
+                .ok()
+    } else {
+        None
+    };
+    let relative = workspace
+        .path
+        .strip_prefix(runtime_rootfs)
+        .context("Staged workspace is outside the sandbox rootfs")?;
+    let staged = crate::workspace::StagedReview {
+        workspace: Path::new("/").join(relative),
+        commit_hash: workspace.commit_hash.clone(),
+        base_commit: workspace.base_commit.clone(),
+        pr_context: workspace.pr_context.clone(),
+        pr_details,
+        existing_comments,
+    };
+    let input = sandbox_host_path(runtime_rootfs, SANDBOX_STAGED_REVIEW);
+    if let Some(parent) = input.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&input, serde_json::to_vec(&staged)?)
+        .await
+        .with_context(|| format!("Failed to write staged review {}", input.display()))?;
+    Ok(StagedSandboxReview {
+        _workspace: workspace,
+        staged,
+    })
+}
+
+/// Writes a `gh` config whose token is a canary, so an agent that goes
+/// looking for GitHub credentials finds one the broker recognizes.
+async fn plant_github_canary(runtime_rootfs: &Path, canary: &str) -> Result<()> {
+    let dir = sandbox_host_path(runtime_rootfs, SANDBOX_GH_CONFIG_DIR);
+    tokio::fs::create_dir_all(&dir).await?;
+    let hosts = GH_HOSTS_TEMPLATE.replace("{token}", canary);
+    tokio::fs::write(dir.join("hosts.yml"), hosts)
+        .await
+        .context("Failed to plant sandbox gh config")
+}
+
+const GH_HOSTS_TEMPLATE: &str = r#"github.com:
+    oauth_token: {token}
+    user: fiach-review
+    git_protocol: https
+"#;
+
+fn sandbox_host_path(runtime_rootfs: &Path, sandbox_path: &str) -> PathBuf {
+    runtime_rootfs.join(sandbox_path.trim_start_matches('/'))
 }
 
 /// Host-only broker state next to the sandbox run directory. The run
@@ -1919,7 +2008,7 @@ fn broker_state_dir(run_dir: &Path) -> PathBuf {
 async fn start_review_broker(
     review_params: &ReviewParams,
     state_dir: &Path,
-    review_github_token: &str,
+    github_canary: &str,
 ) -> Result<Option<crate::broker::SandboxBroker>> {
     use crate::broker::{Canary, Credential, Pricing, Provider, SandboxBroker, routes_for};
 
@@ -1976,8 +2065,8 @@ async fn start_review_broker(
         routes_for(uses)?,
         review_params.max_cost_usd,
         vec![Canary {
-            label: "review GitHub token".to_owned(),
-            value: Credential::new(review_github_token),
+            label: "planted GitHub token".to_owned(),
+            value: Credential::new(github_canary),
         }],
     )
     .await
@@ -2754,13 +2843,28 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_review_token_must_be_nonempty_and_distinct() {
+    fn sandbox_paths_map_into_the_runtime_rootfs() {
+        let rootfs = Path::new("/var/lib/fiach/reports/runs/r_PR1/rootfs");
         assert_eq!(
-            validate_sandbox_review_token("review-read-only", Some("host-write")).unwrap(),
-            "review-read-only"
+            sandbox_host_path(rootfs, SANDBOX_STAGED_REVIEW),
+            rootfs.join("fiach-input/review.json")
         );
-        assert!(validate_sandbox_review_token("", Some("host-write")).is_err());
-        assert!(validate_sandbox_review_token("shared-token", Some("shared-token")).is_err());
+        assert_eq!(
+            sandbox_host_path(rootfs, SANDBOX_GH_CONFIG_DIR),
+            rootfs.join("fiach-input/gh")
+        );
+    }
+
+    #[tokio::test]
+    async fn planted_gh_config_carries_only_the_canary() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let canary = crate::broker::github_canary();
+        plant_github_canary(rootfs.path(), &canary).await.unwrap();
+        let hosts =
+            std::fs::read_to_string(rootfs.path().join("fiach-input/gh/hosts.yml")).unwrap();
+        assert!(hosts.contains(&format!("oauth_token: {canary}")));
+        assert!(canary.starts_with("ghp_"));
+        assert_ne!(canary, crate::broker::github_canary());
     }
 
     #[test]

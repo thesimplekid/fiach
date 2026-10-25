@@ -40,6 +40,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 - Merged or closed PRs must not receive inline or top-level PR comments.
 - Invalid inline anchors are downgraded into the review summary; they must not block other valid comments.
 - Sandbox child reviews write artifacts only. Host daemon performs DB persistence and disclosure after validating sandbox output.
+- Sandbox child reviews get no GitHub or provider credentials. The host stages the checkout and PR inputs (`workspace::StagedReview`) and brokers model calls (`src/broker.rs`).
 
 ## Dependencies & Overrides (CRITICAL)
 
