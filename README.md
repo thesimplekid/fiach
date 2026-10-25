@@ -39,6 +39,7 @@ and [example configuration](example.issues.toml). Nothing is merged or closed.
 
 - **Rust:** `1.98.1` (or use the provided Nix flake: `nix develop`)
 - **GitHub CLI (`gh`):** Must be installed and authenticated (`gh auth login`).
+- **Git and ripgrep (`rg`):** Required for the fixed finder inspection operations; provided by the Nix shell and sandbox.
 - **Environment Variables:**
   - `OPENROUTER_API_KEY`: For default OpenRouter LLM access.
   - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`: Required only when using the matching direct provider.
@@ -47,6 +48,14 @@ and [example configuration](example.issues.toml). Nothing is merged or closed.
   - `FIACH_REVIEW_GITHUB_TOKEN`: Separate read-only token used inside review sandboxes for cloning repositories and reading PR metadata.
 
 ### Credential Scope
+
+Finder sessions and their delegated lanes use a fixed `inspect` tool for reading
+files, listing paths, literal text searches, and diffs pinned to the reviewed
+commits. They cannot execute shell commands, edit files, run repository scripts,
+or add execution tools to a delegate. Read access is limited to the prepared
+workspace, its context repositories, and the host-selected skills directory.
+The verifier retains the developer extension for bounded reproduction commands;
+use sandbox mode for its execution and credential boundary.
 
 The review agent can execute shell commands. In sandbox mode, `fiach` forwards configured provider API keys and maps `FIACH_REVIEW_GITHUB_TOKEN` to `GITHUB_TOKEN` inside the `systemd-nspawn` container so the review can reach the selected LLM provider and read GitHub data. The host `GITHUB_TOKEN` is never forwarded to the model-controlled process.
 
