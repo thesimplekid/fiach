@@ -1,3 +1,4 @@
+pub mod broker;
 pub mod buzz;
 pub mod config;
 pub mod daemon;
