@@ -567,8 +567,8 @@ In your `flake.nix` or `configuration.nix`:
               # Network Mode:
               # - "host" (default): Most reliable service-mode option today. Shares the host network stack.
               # - "bridge": Attach each sandbox to an existing br-nspawn bridge.
-              # - "veth": Better namespace isolation. Allows outbound internet but blocks access to
-              #   host-local services. This is namespace isolation, not egress filtering, and it does
+              # - "veth": Better namespace isolation. Allows outbound public IPv4 internet but drops
+              #   traffic to the host, other sandboxes, private/link-local ranges, and IPv6. It does
               #   NOT restrict the sandbox to GitHub/OpenRouter only.
               # - "private": Fully offline.
               networkMode = "veth";
@@ -693,7 +693,8 @@ The following options are available under `services.fiach`:
 | `dataDir` | string | `"/var/lib/fiach"` | Directory to store state database and reports. |
 | `contextGroups` | attrset | `{}` | Context groups mapped by target repo (contains `repos` list). |
 | `sandbox.enable` | boolean | `false` | Enable Sandboxed PR reviews via systemd-nspawn. |
-| `sandbox.networkMode`| enum (`"host"`, `"bridge"`, `"private"`, `"veth"`) | `"veth"` | Network mode for the sandbox. `veth` isolates host-local services while retaining outbound NAT. |
+| `sandbox.networkMode`| enum (`"host"`, `"bridge"`, `"private"`, `"veth"`) | `"veth"` | Network mode for the sandbox. `veth` allows only public IPv4 egress through NAT. |
+| `sandbox.allowedPrivateEgress` | list of `"address:port"` | `[]` | IPv4 TCP endpoints that `veth` sandboxes may reach despite the private-range filter, such as a LAN Nix cache. |
 | `sandbox.extraArgs` | list of string | `[]` | Extra arguments to pass to `systemd-nspawn`. |
 | `sandbox.memoryMax` | systemd size | `"8G"` | Aggregate memory limit for the daemon and all sandbox workers. |
 | `sandbox.cpuQuota` | systemd percent | `"400%"` | Aggregate CPU quota for the daemon and all sandbox workers. |
@@ -736,9 +737,9 @@ When using `bridge`, the host must create and maintain `br-nspawn`, addressing, 
 
 - `sandbox.networkMode = "host"` is an explicit compatibility escape hatch that shares host networking.
 - `sandbox.networkMode = "bridge"` attaches each sandbox to an existing `br-nspawn` bridge.
-- `sandbox.networkMode = "veth"` is the default. It gives each sandbox its own `10.64.<index>.0/30` veth subnet, blocks access to host-local services, and configures NixOS NAT for outbound internet access from the `10.64.0.0/16` sandbox pool.
+- `sandbox.networkMode = "veth"` is the default. It gives each sandbox its own `10.64.<index>.0/30` veth subnet and configures NixOS NAT for outbound internet access from the `10.64.0.0/16` sandbox pool. An `inet fiach_sandbox` nftables table drops all traffic from `ve-fiach-*` to the host, all forwarded IPv6, and forwarded IPv4 to private, shared, loopback, link-local (including `169.254.169.254`), multicast, documentation, and reserved ranges. Other sandboxes are unreachable because `10.64.0.0/16` is inside `10.0.0.0/8`. `sandbox.allowedPrivateEgress` exempts exact TCP endpoints. The table joins `networking.nftables` when that is enabled; otherwise the `fiach-sandbox-egress` unit loads it, and `fiach.service` stops if the filter is unloaded.
 - `sandbox.networkMode = "private"` disables all network access, which also prevents GitHub and OpenRouter access.
-- Restricting outbound traffic to specific destinations requires host-side enforcement such as `nftables`/`iptables` rules on the `ve-*` interfaces, or a proxy-based egress policy.
+- Restricting outbound traffic to specific public destinations requires further host-side rules on the `ve-fiach-*` interfaces, or a proxy-based egress policy.
 - IP allowlists can be managed in NixOS firewall configuration, but they are brittle for CDN-backed services.
 - If you need domain-level guarantees, use a dedicated proxy or egress gateway; `systemd-nspawn` alone is not sufficient.
 

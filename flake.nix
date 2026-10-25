@@ -164,6 +164,7 @@
                       sandbox = {
                         enable = true;
                         networkMode = "veth";
+                        allowedPrivateEgress = [ "192.168.1.20:443" ];
                       };
                     };
                   }
@@ -179,6 +180,14 @@
               fiachNetworkName = fiachNetwork.matchConfig.Name;
               fiachNetworkAddress = fiachNetwork.networkConfig.Address or "";
               fiachServicePath = lib.concatMapStringsSep " " toString testSystem.config.systemd.services.fiach.path;
+              egressStart = testSystem.config.systemd.services.fiach-sandbox-egress.serviceConfig.ExecStart;
+              egressRules =
+                let
+                  match = builtins.match ".* -f ([^ ]+)" egressStart;
+                in
+                if match == null then throw "Could not extract egress rules path from ExecStart" else builtins.head match;
+              trustedInterfaces = lib.concatStringsSep " " testSystem.config.networking.firewall.trustedInterfaces;
+              fiachBindsTo = lib.concatStringsSep " " testSystem.config.systemd.services.fiach.bindsTo;
             in
             pkgs.runCommand "fiach-nixos-module-test" { } ''
               set -eu
@@ -188,11 +197,28 @@
               fiach_network_name=${lib.escapeShellArg fiachNetworkName}
               fiach_network_address=${lib.escapeShellArg fiachNetworkAddress}
               fiach_service_path=${lib.escapeShellArg fiachServicePath}
+              # Keep the ExecStart string context so Nix builds the rules file.
+              egress_start=${lib.escapeShellArg egressStart}
+              egress_rules=${lib.escapeShellArg egressRules}
+              test -n "$egress_start"
+              trusted_interfaces=${lib.escapeShellArg trustedInterfaces}
+              fiach_binds_to=${lib.escapeShellArg fiachBindsTo}
 
               printf '%s' "$exec_start" | grep -F -- '--port 4321' >/dev/null
               printf '%s' "$fiach_network_name" | grep -F 've-fiach-*' >/dev/null
               test -z "$fiach_network_address"
               printf '%s' "$fiach_service_path" | grep -F 'iproute2' >/dev/null
+              if printf '%s' "$trusted_interfaces" | grep -F 've-fiach' >/dev/null; then
+                echo "veth sandboxes must not be trusted firewall interfaces" >&2
+                exit 1
+              fi
+              printf '%s' "$fiach_binds_to" | grep -F 'fiach-sandbox-egress.service' >/dev/null
+              grep -F 'iifname "ve-fiach-*" drop' "$egress_rules" >/dev/null
+              grep -F 'iifname "ve-fiach-*" meta nfproto ipv6 drop' "$egress_rules" >/dev/null
+              grep -F 'iifname "ve-fiach-*" ip daddr @blocked_v4 drop' "$egress_rules" >/dev/null
+              grep -F '169.254.0.0/16' "$egress_rules" >/dev/null
+              grep -F '10.0.0.0/8' "$egress_rules" >/dev/null
+              grep -F 'ip daddr 192.168.1.20 tcp dport 443 accept' "$egress_rules" >/dev/null
               grep -F 'port = 4321' "$config_path" >/dev/null
               grep -F 'max_workers = 2' "$config_path" >/dev/null
               grep -F 'sandbox_network = "veth"' "$config_path" >/dev/null
@@ -659,7 +685,11 @@
                   "veth" gives the container an isolated network
                   namespace and routes outbound traffic via NAT. The module
                   automatically configures the host's systemd-networkd, IP
-                  forwarding, and firewall to make this work.
+                  forwarding, and firewall to make this work. Sandboxes reach
+                  only public IPv4 destinations. Traffic to the host, other
+                  sandboxes, private, link-local, and reserved ranges is
+                  dropped unless listed in allowedPrivateEgress, and all IPv6
+                  traffic is dropped.
 
                   "host" shares the host's network namespace and should be used
                   only as an explicit compatibility escape hatch. The container
@@ -667,6 +697,16 @@
 
                   "private" gives the container only loopback (no internet); only
                   useful for offline use cases.
+                '';
+              };
+              allowedPrivateEgress = lib.mkOption {
+                type = lib.types.listOf (lib.types.strMatching "([0-9]{1,3}\\.){3}[0-9]{1,3}:[0-9]{1,5}");
+                default = [ ];
+                example = [ "192.168.1.20:443" ];
+                description = ''
+                  IPv4 TCP endpoints, as "address:port", that veth sandboxes may
+                  reach despite the private-range egress filter, such as a LAN
+                  Nix cache proxy. Endpoints on the host itself stay blocked.
                 '';
               };
               extraPackages = lib.mkOption {
@@ -1035,8 +1075,99 @@
                 internalIPs = [ "10.64.0.0/16" ];
               };
 
-              networking.firewall.trustedInterfaces = [ "ve-fiach-+" ];
             })
+
+            # Egress filter for veth sandboxes. Sandboxes run untrusted
+            # repository code, so they must not reach host services, other
+            # sandboxes, the LAN, or cloud metadata endpoints. Only forwarded
+            # public IPv4 traffic (plus allowedPrivateEgress) passes.
+            #
+            # A drop verdict in any base chain is final, so this table works
+            # beside either NixOS firewall backend. With networking.nftables
+            # it joins the managed ruleset, which flushes foreign tables on
+            # reload. Otherwise a oneshot unit loads it before fiach starts.
+            (lib.mkIf (cfg.sandbox.enable && cfg.sandbox.networkMode == "veth") (
+              let
+                blockedV4 = [
+                  "0.0.0.0/8"
+                  "10.0.0.0/8"
+                  "100.64.0.0/10"
+                  "127.0.0.0/8"
+                  "169.254.0.0/16"
+                  "172.16.0.0/12"
+                  "192.0.0.0/24"
+                  "192.0.2.0/24"
+                  "192.168.0.0/16"
+                  "198.18.0.0/15"
+                  "198.51.100.0/24"
+                  "203.0.113.0/24"
+                  "224.0.0.0/4"
+                  "240.0.0.0/4"
+                ];
+                allowRules = lib.concatMapStrings
+                  (endpoint:
+                    let
+                      parts = lib.splitString ":" endpoint;
+                    in
+                    ''
+                      iifname "ve-fiach-*" ip daddr ${builtins.elemAt parts 0} tcp dport ${builtins.elemAt parts 1} accept
+                    '')
+                  cfg.sandbox.allowedPrivateEgress;
+                tableBody = ''
+                  set blocked_v4 {
+                    type ipv4_addr
+                    flags interval
+                    elements = { ${lib.concatStringsSep ", " blockedV4} }
+                  }
+
+                  chain input {
+                    type filter hook input priority filter - 10; policy accept;
+                    iifname "ve-fiach-*" drop
+                  }
+
+                  chain forward {
+                    type filter hook forward priority filter - 10; policy accept;
+                    iifname "ve-fiach-*" meta nfproto ipv6 drop
+                    ${allowRules}
+                    iifname "ve-fiach-*" ip daddr @blocked_v4 drop
+                  }
+                '';
+                rulesFile = pkgs.writeText "fiach-sandbox-egress.nft" ''
+                  table inet fiach_sandbox
+                  delete table inet fiach_sandbox
+                  table inet fiach_sandbox {
+                  ${tableBody}
+                  }
+                '';
+              in
+              lib.mkMerge [
+                (lib.mkIf config.networking.nftables.enable {
+                  networking.nftables.tables.fiach_sandbox = {
+                    family = "inet";
+                    content = tableBody;
+                  };
+                  systemd.services.fiach = {
+                    after = [ "nftables.service" ];
+                    requires = [ "nftables.service" ];
+                  };
+                })
+                (lib.mkIf (!config.networking.nftables.enable) {
+                  systemd.services.fiach-sandbox-egress = {
+                    description = "Fiach sandbox egress filter";
+                    before = [ "fiach.service" ];
+                    requiredBy = [ "fiach.service" ];
+                    after = [ "firewall.service" ];
+                    serviceConfig = {
+                      Type = "oneshot";
+                      RemainAfterExit = true;
+                      ExecStart = "${pkgs.nftables}/bin/nft -f ${rulesFile}";
+                      ExecStop = "${pkgs.nftables}/bin/nft delete table inet fiach_sandbox";
+                    };
+                  };
+                  systemd.services.fiach.bindsTo = [ "fiach-sandbox-egress.service" ];
+                })
+              ]
+            ))
           ]);
         };
     };
