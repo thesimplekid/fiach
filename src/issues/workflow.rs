@@ -33,6 +33,8 @@ struct Record {
     fingerprint: String,
     decision: Option<Decision>,
     attempted: Option<String>,
+    #[serde(default)]
+    last_attempted_mention: Option<u64>,
     pr: Option<String>,
     pending: Option<Publication>,
 }
@@ -334,6 +336,10 @@ async fn process(
     cancel: &CancellationToken,
 ) -> Result<bool> {
     let key = format!("{}#{number}", project.repo);
+    let trigger = github.issue_trigger(&project.repo, number, config).await?;
+    if config.trigger_mention.is_some() && trigger.is_none() {
+        return Ok(false);
+    }
     let mut record = store.get(&key)?;
     if config.publish
         && let Some(pending) = &record.pending
@@ -357,6 +363,10 @@ async fn process(
                 "Pending branch is absent or changed; maintainer intervention required"
             );
             let fresh = github.issue(&project.repo, number).await?;
+            ensure!(
+                github.issue_trigger(&project.repo, number, config).await? == trigger,
+                "Issue mention authorization changed; withholding publication"
+            );
             ensure!(
                 fresh.open && content_key(&fresh)? == pending.issue_key,
                 "Issue changed since interrupted publication"
@@ -424,6 +434,9 @@ async fn process(
     }
     let fingerprint = digest(&(
         fingerprint(project, &issue, inventory, config.publish, config.auto_fix)?,
+        trigger,
+        &config.trigger_mention,
+        &config.allowed_mention_users,
         &config.worker,
         &config.coverage,
         config.max_jev_cost_usd,
@@ -491,8 +504,14 @@ async fn process(
         && record.pr.is_none()
         && record.pending.is_none()
     {
-        let attempt_key = digest(&(content_key(&issue)?, super::triage::CACHE_VERSION))?;
-        if record.attempted.as_deref() == Some(&attempt_key) {
+        let attempt_key = match trigger {
+            Some(id) => digest(&("mention", id))?,
+            None => digest(&(content_key(&issue)?, super::triage::CACHE_VERSION))?,
+        };
+        if record.attempted.as_deref() == Some(&attempt_key)
+            || trigger
+                .is_some_and(|id| record.last_attempted_mention.is_some_and(|last| id <= last))
+        {
             reroute(
                 project,
                 &mut decision,
@@ -500,7 +519,12 @@ async fn process(
                 "A fix was already attempted for this issue content. A maintainer must inspect the previous run before another attempt.",
             );
         } else if let Some(worker_config) = &config.worker {
+            ensure!(
+                github.issue_trigger(&project.repo, number, config).await? == trigger,
+                "Issue mention authorization changed; withholding execution"
+            );
             record.attempted = Some(attempt_key);
+            record.last_attempted_mention = trigger.or(record.last_attempted_mention);
             store.put(&key, &record)?;
             let fix_kind = decision.fix_kind;
             match worker::fix(
@@ -526,6 +550,10 @@ async fn process(
                 }
                 Ok(fix) => {
                     let fresh = github.issue(&project.repo, number).await?;
+                    ensure!(
+                        github.issue_trigger(&project.repo, number, config).await? == trigger,
+                        "Issue mention authorization changed; withholding publication"
+                    );
                     ensure!(
                         fresh.open && content_key(&fresh)? == content_key(&issue)?,
                         "Issue changed during fix; withholding publication"
@@ -703,6 +731,10 @@ async fn process(
     let body = render_comment(&decision, record.pr.as_deref(), &linked);
     if config.publish {
         let fresh = github.issue(&project.repo, number).await?;
+        ensure!(
+            github.issue_trigger(&project.repo, number, config).await? == trigger,
+            "Issue mention authorization changed; withholding marking"
+        );
         ensure!(
             fresh.open && content_key(&fresh)? == content_key(&issue)?,
             "Issue changed before marking"

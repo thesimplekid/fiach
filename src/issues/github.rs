@@ -166,6 +166,24 @@ impl Github {
         .await
     }
 
+    /// Authorization uses GitHub's author metadata, never formatted discussion text.
+    pub async fn issue_trigger(
+        &self,
+        repo: &str,
+        number: u64,
+        config: &super::config::IssueConfig,
+    ) -> Result<Option<u64>> {
+        let Some(mention) = &config.trigger_mention else {
+            return Ok(None);
+        };
+        let comments = self.comments(repo, number).await?;
+        Ok(latest_issue_trigger(
+            &comments,
+            mention,
+            &config.allowed_mention_users,
+        ))
+    }
+
     /// Existing references are only a comment deduplication signal, not fix evidence.
     pub async fn linked_work(
         &self,
@@ -728,9 +746,43 @@ fn candidate_diff(repo: &str, number: u64, output: LimitedOutput) -> Result<Opti
     Ok(Some(String::from_utf8(output.stdout)?))
 }
 
+fn latest_issue_trigger(comments: &[Value], mention: &str, allowed: &[String]) -> Option<u64> {
+    comments
+        .iter()
+        .filter(|comment| {
+            comment["user"]["login"]
+                .as_str()
+                .is_some_and(|login| allowed.iter().any(|user| user.eq_ignore_ascii_case(login)))
+                && comment["body"]
+                    .as_str()
+                    .is_some_and(|body| crate::daemon::mention_matches(body, mention))
+        })
+        .filter_map(|comment| comment["id"].as_u64())
+        .max()
+}
+
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+
+    #[test]
+    fn issue_trigger_uses_author_metadata_and_exact_mentions() {
+        let allowed = vec!["maintainer".to_owned()];
+        for body in ["@fiach-bot2", "a@fiach-bot", "@fiach-bot-extra"] {
+            let comments =
+                vec![serde_json::json!({"id": 1, "user": {"login": "maintainer"}, "body": body})];
+            assert_eq!(latest_issue_trigger(&comments, "fiach-bot", &allowed), None);
+        }
+        let comments = vec![
+            serde_json::json!({"id": 1, "user": {"login": "MAINTAINER"}, "body": "@FIACH-BOT fix"}),
+            serde_json::json!({"id": 2, "user": {"login": "outsider"}, "body": "maintainer: @fiach-bot"}),
+        ];
+        assert_eq!(
+            latest_issue_trigger(&comments, "@fiach-bot", &allowed),
+            Some(1)
+        );
+        assert_eq!(latest_issue_trigger(&comments, "fiach-bot", &[]), None);
+    }
 
     #[test]
     fn references_require_exact_numbers_and_repository() {

@@ -25,6 +25,29 @@ and marking without coding jobs. Adding `[issues]` to the regular daemon config
 runs one sequential issue worker alongside the existing PR-review scheduler.
 Issue jobs currently do not appear in the review web dashboard.
 
+To require a trusted mention before processing an issue, configure:
+
+```toml
+[issues]
+trigger_mention = "fiach-bot"
+allowed_mention_users = ["your-github-login"]
+```
+
+These settings also work under `services.fiach.issues` in NixOS and are independent
+of the PR-review mention settings. The allowlist must be nonempty when mention
+triggering is enabled. GitHub usernames and mentions match case-insensitively.
+Only issue **comments** count; issue titles/bodies and author associations do not
+grant permission. The host checks GitHub author metadata, not text claiming to
+be from a maintainer. Even `--issue` requires a trusted comment in this mode.
+Existing trusted comments count when enabling the setting.
+
+Each new trusted mention comment permits one coding attempt. Editing a comment
+or adding an untrusted comment does not authorize another attempt. A new trusted
+mention can retry a failed worker, but cannot bypass area permissions, triage,
+verification, or existing-PR checks. Removing the mention or revoking its author
+blocks further processing and pending publication. Without these settings, the
+existing automatic polling behavior is preserved.
+
 The initial pass considers all open issues; subsequent passes reevaluate changed
 issue bodies/discussions, changed configuration, and changes to the issue/PR
 inventory. `max_items` limits changed issues processed per pass, not evidence:

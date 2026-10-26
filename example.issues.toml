@@ -4,6 +4,9 @@
 [issues]
 publish = false # Set true to apply labels/comments and publish verified draft PRs.
 auto_fix = true
+# Opt in to trusted issue-comment triggers (independent of PR review settings).
+# trigger_mention = "fiach-bot"
+# allowed_mention_users = ["your-github-login"]
 interval_secs = 300
 state_path = "issues.redb"
 scratch_dir = "/data/rust/tmp"

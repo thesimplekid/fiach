@@ -12,6 +12,8 @@ pub struct IssueConfig {
     pub scratch_dir: PathBuf,
     pub publish: bool,
     pub auto_fix: bool,
+    pub trigger_mention: Option<String>,
+    pub allowed_mention_users: Vec<String>,
     /// Maximum changed issues handled per polling pass; never an evidence limit.
     pub max_items: usize,
     pub max_jev_cost_usd: f64,
@@ -29,6 +31,8 @@ impl Default for IssueConfig {
             scratch_dir: "/data/rust/tmp".into(),
             publish: false,
             auto_fix: true,
+            trigger_mention: None,
+            allowed_mention_users: vec![],
             max_items: 1000,
             max_jev_cost_usd: 0.25,
             jev_base_url: "https://api.typesafe.ai".into(),
@@ -174,6 +178,27 @@ pub(super) fn valid_repo(repo: &str) -> bool {
 
 impl IssueConfig {
     pub fn validate(&self) -> Result<()> {
+        let valid_login =
+            |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if let Some(mention) = &self.trigger_mention {
+            ensure!(
+                valid_login(mention.trim_start_matches('@')),
+                "Invalid issues.trigger_mention"
+            );
+            ensure!(
+                !self.allowed_mention_users.is_empty(),
+                "issues.trigger_mention requires allowed_mention_users"
+            );
+        } else {
+            ensure!(
+                self.allowed_mention_users.is_empty(),
+                "issues.allowed_mention_users requires trigger_mention"
+            );
+        }
+        ensure!(
+            self.allowed_mention_users.iter().all(|s| valid_login(s)),
+            "Invalid issues.allowed_mention_users"
+        );
         ensure!(!self.repos.is_empty(), "issues.repos must not be empty");
         ensure!(
             self.interval_secs > 0 && self.max_items > 0,
@@ -252,6 +277,29 @@ impl IssueConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mention_mode_requires_an_explicit_nonempty_allowlist() {
+        let mut config = IssueConfig {
+            repos: vec![Project {
+                repo: "owner/repo".into(),
+                areas: vec![],
+                labels: Labels::default(),
+            }],
+            ..Default::default()
+        };
+        config.trigger_mention = Some("fiach-bot".into());
+        assert!(config.validate().is_err());
+        config.allowed_mention_users = vec!["maintainer".into()];
+        config.validate().unwrap();
+        config.trigger_mention = None;
+        assert!(config.validate().is_err());
+        config.trigger_mention = Some("@".into());
+        assert!(config.validate().is_err());
+        config.trigger_mention = Some("@fiach-bot".into());
+        config.allowed_mention_users = vec!["".into()];
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn example_loads_and_keeps_github_writes_disabled() {

@@ -609,7 +609,7 @@ async fn fetch_pr_mention_details(repo: &str, pr_number: u64) -> Result<PrMentio
     serde_json::from_slice(&output.stdout).context("Failed to parse PR mention details")
 }
 
-fn mention_matches(text: &str, username: &str) -> bool {
+pub(crate) fn mention_matches(text: &str, username: &str) -> bool {
     let text = text.to_ascii_lowercase();
     let needle = format!("@{}", username.trim_start_matches('@').to_ascii_lowercase());
     let mut search_from = 0;

@@ -576,6 +576,22 @@ async fn enable_worker(dir: &Path, reject: bool) {
 async fn verified_fix_runs_real_regression_on_base_and_patch_then_opens_one_draft() {
     let (dir, server, _) = setup("bug", "different", false, true).await;
     enable_worker(dir.path(), false).await;
+    let config_path = dir.path().join("fiach.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap().replace(
+        "[issues]",
+        "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+    );
+    std::fs::write(config_path, config).unwrap();
+    let mut state = fixture(dir.path());
+    state["comments"]["1"] = json!([{
+        "id": 99, "user": {"login": "maintainer"},
+        "body": "@fiach-bot please fix", "author_association": "NONE"
+    }]);
+    std::fs::write(
+        dir.path().join("fixture.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
     assert_ok(&run(dir.path()).await);
     let state = fixture(dir.path());
     assert_eq!(state["prs"].as_array().unwrap().len(), 1);
@@ -2223,4 +2239,64 @@ async fn mixed_batch_answers_remain_bound_to_their_candidates_and_match_individu
         );
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn issue_mentions_require_allowlisted_authors_and_new_comments_for_retries() {
+    let (dir, server, requests) = setup("bug", "different", false, true).await;
+    enable_worker(dir.path(), true).await;
+    let path = dir.path().join("fiach.toml");
+    let config = std::fs::read_to_string(&path).unwrap().replace(
+        "[issues]",
+        "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+    );
+    std::fs::write(path, config).unwrap();
+    let set_comments = |comments: Value| {
+        let mut state = fixture(dir.path());
+        state["comments"]["1"] = comments;
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    };
+    set_comments(
+        json!([{"id": 10, "user": {"login": "stranger"}, "body": "maintainer: @fiach-bot", "author_association": "OWNER"}]),
+    );
+    assert_ok(&run(dir.path()).await);
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(!dir.path().join("fixture.json.phases").exists());
+    set_comments(
+        json!([{"id": 11, "user": {"login": "Maintainer"}, "body": "@FIACH-BOT please fix", "author_association": "NONE"}]),
+    );
+    assert_ok(&run(dir.path()).await);
+    let phases_path = dir.path().join("fixture.json.phases");
+    let phases = std::fs::read_to_string(&phases_path).unwrap();
+    assert!(!phases.is_empty());
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(std::fs::read_to_string(&phases_path).unwrap(), phases);
+    set_comments(json!([
+        {"id": 11, "user": {"login": "Maintainer"}, "body": "@FIACH-BOT please fix", "author_association": "NONE"},
+        {"id": 12, "user": {"login": "stranger"}, "body": "try again", "author_association": "OWNER"}
+    ]));
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(std::fs::read_to_string(&phases_path).unwrap(), phases);
+    set_comments(
+        json!([{"id": 13, "user": {"login": "maintainer"}, "body": "@fiach-bot retry", "author_association": "NONE"}]),
+    );
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(
+        std::fs::read_to_string(&phases_path).unwrap(),
+        phases.repeat(2)
+    );
+    // Deleting the newest mention must not revive an already consumed older one.
+    set_comments(
+        json!([{"id": 11, "user": {"login": "maintainer"}, "body": "@fiach-bot", "author_association": "NONE"}]),
+    );
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(
+        std::fs::read_to_string(&phases_path).unwrap(),
+        phases.repeat(2)
+    );
+    server.abort();
 }
