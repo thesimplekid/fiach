@@ -7,6 +7,7 @@ auto_fix = true
 # Opt in to trusted issue-comment triggers (independent of PR review settings).
 # trigger_mention = "fiach-bot"
 # allowed_mention_users = ["your-github-login"]
+# To enable PR revisions too, see [issues.iterations] at the end of this file.
 interval_secs = 300
 state_path = "issues.redb"
 scratch_dir = "/data/rust/tmp"
@@ -87,3 +88,10 @@ ready = "ready-for-agent"
 # network = "veth" # Uses Fiach's existing subnet/NAT setup; "host" is explicit opt-in.
 # max_turns = 60
 # timeout_secs = 1800
+
+
+# Optional: allow trusted "@fiach-bot fix" comments on recorded Fiach PRs.
+# Requires issues.trigger_mention and issues.allowed_mention_users above.
+# Run alongside the daemon to automatically review each published revision.
+# [issues.iterations]
+# max_attempts = 3 # Includes failed/interrupted attempts; persists across restarts.

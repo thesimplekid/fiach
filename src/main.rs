@@ -991,12 +991,13 @@ async fn main() -> Result<()> {
             if let Some(issues) = config.issues {
                 issues.validate()?;
                 let issue_cancel = cancel_token.clone();
+                let issue_reviews = daemon::GeneratedReviewQueue::new(&params, scheduler.clone());
                 tokio::select! {
                     result = daemon::run_daemon(params, scheduler, cancel_token.clone()) => {
                         cancel_token.cancel();
                         result
                     }
-                    result = fiach::issues::run(issues, true, None, issue_cancel) => {
+                    result = fiach::issues::run_with_reviews(issues, true, None, issue_cancel, Some(issue_reviews)) => {
                         cancel_token.cancel();
                         result
                     }

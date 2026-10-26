@@ -14,6 +14,7 @@ pub struct IssueConfig {
     pub auto_fix: bool,
     pub trigger_mention: Option<String>,
     pub allowed_mention_users: Vec<String>,
+    pub iterations: Option<IterationConfig>,
     /// Maximum changed issues handled per polling pass; never an evidence limit.
     pub max_items: usize,
     pub max_jev_cost_usd: f64,
@@ -33,12 +34,26 @@ impl Default for IssueConfig {
             auto_fix: true,
             trigger_mention: None,
             allowed_mention_users: vec![],
+            iterations: None,
             max_items: 1000,
             max_jev_cost_usd: 0.25,
             jev_base_url: "https://api.typesafe.ai".into(),
             worker: None,
             coverage: CoverageConfig::default(),
         }
+    }
+}
+
+/// Opt-in updates of PRs recorded by this issue worker.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IterationConfig {
+    pub max_attempts: u32,
+}
+
+impl Default for IterationConfig {
+    fn default() -> Self {
+        Self { max_attempts: 3 }
     }
 }
 
@@ -199,6 +214,16 @@ impl IssueConfig {
             self.allowed_mention_users.iter().all(|s| valid_login(s)),
             "Invalid issues.allowed_mention_users"
         );
+        if let Some(iterations) = &self.iterations {
+            ensure!(
+                self.trigger_mention.is_some(),
+                "issues.iterations requires trusted mention configuration"
+            );
+            ensure!(
+                iterations.max_attempts > 0,
+                "issues.iterations.max_attempts must be positive"
+            );
+        }
         ensure!(!self.repos.is_empty(), "issues.repos must not be empty");
         ensure!(
             self.interval_secs > 0 && self.max_items > 0,
@@ -288,10 +313,15 @@ mod tests {
             }],
             ..Default::default()
         };
+        config.iterations = Some(IterationConfig::default());
+        assert!(config.validate().is_err());
         config.trigger_mention = Some("fiach-bot".into());
         assert!(config.validate().is_err());
         config.allowed_mention_users = vec!["maintainer".into()];
         config.validate().unwrap();
+        config.iterations.as_mut().unwrap().max_attempts = 0;
+        assert!(config.validate().is_err());
+        config.iterations.as_mut().unwrap().max_attempts = 3;
         config.trigger_mention = None;
         assert!(config.validate().is_err());
         config.trigger_mention = Some("@".into());

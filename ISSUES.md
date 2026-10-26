@@ -282,6 +282,73 @@ are removed. Successful candidate patches and verification reports are also
 stored beside the database under `issues.artifacts/OWNER_REPO/NUMBER/`. These
 artifacts can contain repository/issue data; apply your own retention policy.
 
+## PR feedback and iteration
+
+Enable the bounded PR workflow alongside trusted issue mentions:
+
+```toml
+[issues]
+trigger_mention = "fiach-bot"
+allowed_mention_users = ["your-github-login"]
+# Existing publish, auto_fix, repositories, and worker settings still apply.
+
+[issues.iterations]
+max_attempts = 3
+```
+
+Run the regular daemon with this configuration for the full cycle:
+
+1. An allowlisted user mentions the bot on an issue.
+2. The issue worker prepares and verifies a fix, then opens a draft PR.
+3. On the next issue polling pass, the host queues that exact commit for the
+   configured PR-review personas.
+4. An allowlisted user comments `@fiach-bot fix` on the PR to request a revision.
+   Optional instructions can follow the command. The comment must start with the
+   mention and the exact word `fix`; quoted commands and incidental mentions do
+   not count. PR review bodies and inline comments supply feedback, but commands
+   must be top-level PR conversation comments.
+5. The worker investigates the conversation plus reviews and inline findings for
+   the current head, verifies an incremental patch, and pushes a new commit to the
+   same branch. The host queues another review on the next polling pass.
+
+Each fresh trusted command authorizes at most one attempt. Failed or interrupted
+attempts count toward `max_attempts`, and both the attempt count and consumed
+comment IDs survive restarts. The bot cannot trigger itself, even if its own
+account is allowlisted. A `@bot fix` command does not simultaneously trigger a
+mention-based review of the old head. Ordinary review mentions still work.
+
+Generated review requests bypass discovery's draft, mention, author-association,
+and automatic backport filters because the host already authorized and verified
+the generated change. Explicit `skip_prs` entries, normal review retry limits,
+personas, verification, and disclosure settings still apply. Configure PR-comment
+disclosure if you want findings posted on the PR. Requests remain in issue state
+until review state records completion for the exact commit; a full queue or
+daemon restart does not lose them. Standalone `fiach issues` can perform fixes,
+but leaves reviews pending until the regular daemon runs with the same issue
+state file.
+
+Only PRs whose creation was journaled with validation evidence by this version
+can be revised. Older PRs are not adopted merely because their branch starts with
+`fiach/issue-`. The host checks repository, author, branch, base branch, and head.
+Closed, merged, forked, retargeted, or externally changed PRs are not updated.
+A concurrent branch change causes the push lease to fail; Fiach never replaces
+someone else's commits. An interrupted push is reconciled against its recorded
+commit. If it did not land, another trusted command is needed to retry; an
+unexpected remote commit requires maintainer intervention.
+
+Existing area and protected-path rules still apply. Bug revisions require a
+new or changed regression test that fails on the previous PR head and passes
+with the patch. Rust-toolchain revisions retain the maintenance policy.
+Previously verified commands are also rerun on the revised tree, and an
+independent verifier must approve. Changed issue content, feedback, authorization,
+or PR head/base during the attempt blocks publication. General feature work and
+unsupported maintenance remain outside the automatic execution policy.
+
+The bot posts a status comment for each handled command. Successful patch and
+report artifacts live under
+`issues.artifacts/OWNER_REPO/ISSUE/iteration-COMMENT_ID/`; worker logs remain in
+the configured scratch directory. Nothing is merged or closed automatically.
+
 ## NixOS
 
 ```nix
@@ -294,6 +361,9 @@ services.fiach = {
   issues = {
     publish = true;
     auto_fix = true;
+    trigger_mention = "fiach-bot";
+    allowed_mention_users = [ "your-github-login" ];
+    iterations.max_attempts = 3;
     scratch_dir = "/data/rust/tmp/fiach-issues";
     repos = [{
       repo = "owner/repo";

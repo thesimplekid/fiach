@@ -34,6 +34,8 @@ static ACTIVE_VETH_SUBNETS: OnceLock<Mutex<HashSet<u8>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub enum DaemonWork {
+    /// Only constructed by the host after a journaled issue PR publication.
+    Generated { repo: String, job: ReviewJob },
     Manual {
         repo: String,
         pr_number: u64,
@@ -44,6 +46,83 @@ pub enum DaemonWork {
         job: ReviewJob,
         honor_mention_trigger: bool,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewOrigin {
+    Poll,
+    Manual,
+    Generated,
+}
+
+/// The issue workflow retains its pending request until review state confirms completion.
+#[derive(Clone)]
+pub struct GeneratedReviewQueue {
+    scheduler: SchedulerHandle<DaemonWork>,
+    db_path: PathBuf,
+    personas: Vec<crate::persona::PersonaSource>,
+    use_persona_kind: bool,
+}
+
+impl GeneratedReviewQueue {
+    pub fn new(params: &DaemonParams, scheduler: SchedulerHandle<DaemonWork>) -> Self {
+        Self {
+            scheduler,
+            db_path: params.db_path.clone(),
+            personas: params.personas.clone(),
+            use_persona_kind: params.personas.len() > 1 || params.buzz_config.is_some(),
+        }
+    }
+
+    pub(crate) async fn submit(&self, repo: &str, pr: &PullRequestSummary) -> Result<bool> {
+        let jobs = review_jobs(
+            &self.personas,
+            std::slice::from_ref(pr),
+            self.use_persona_kind,
+        );
+        anyhow::ensure!(
+            !jobs.is_empty(),
+            "No review personas configured for generated PRs"
+        );
+        let mut complete = true;
+        for job in jobs {
+            let reviewed =
+                crate::state::get_pr_review(&self.db_path, repo, pr.number, &job.review_kind)?;
+            if reviewed.is_some_and(|review| {
+                review.commit_hash == pr.head_ref_oid
+                    && !matches!(
+                        review.status,
+                        crate::state::ReviewStatus::Queued
+                            | crate::state::ReviewStatus::InProgress
+                            | crate::state::ReviewStatus::Failed
+                    )
+            }) {
+                continue;
+            }
+            complete = false;
+            let request = ReviewRequest {
+                target: ReviewTarget {
+                    repository: repo.into(),
+                    pr_number: pr.number,
+                    commit_hash: pr.head_ref_oid.clone(),
+                    review_kind: job.review_kind.clone(),
+                },
+                payload: DaemonWork::Generated {
+                    repo: repo.into(),
+                    job,
+                },
+            };
+            match self.scheduler.submit(request).await {
+                Ok(_) => {}
+                // Leave the durable issue request pending for the next polling pass.
+                Err(SubmitError::Full) => return Ok(false),
+                Err(SubmitError::Closed) => {
+                    anyhow::bail!("Review scheduler closed; generated review remains pending")
+                }
+            }
+        }
+        Ok(complete)
+    }
 }
 
 pub struct DaemonParams {
@@ -211,6 +290,24 @@ pub fn start_review_scheduler(
             let params = std::sync::Arc::clone(&params);
             Box::pin(async move {
                 let status = match work {
+                    DaemonWork::Generated { repo, job } => {
+                        // Re-read lifecycle and head before starting a queued generated review.
+                        let context = GhCli::default().pr_context(&repo, job.pr.number).await?;
+                        if context["state"].as_str() != Some("OPEN")
+                            || context["headRefOid"].as_str() != Some(&job.pr.head_ref_oid)
+                        {
+                            PrProcessStatus::Skipped
+                        } else {
+                            process_daemon_job(
+                                &params,
+                                &repo,
+                                &job,
+                                cancel,
+                                ReviewOrigin::Generated,
+                            )
+                            .await?
+                        }
+                    }
                     DaemonWork::Manual {
                         repo,
                         pr_number,
@@ -224,8 +321,18 @@ pub fn start_review_scheduler(
                         job,
                         honor_mention_trigger,
                     } => {
-                        process_daemon_job(&params, &repo, &job, cancel, honor_mention_trigger)
-                            .await?
+                        process_daemon_job(
+                            &params,
+                            &repo,
+                            &job,
+                            cancel,
+                            if honor_mention_trigger {
+                                ReviewOrigin::Poll
+                            } else {
+                                ReviewOrigin::Manual
+                            },
+                        )
+                        .await?
                     }
                 };
                 Ok(match status {
@@ -690,6 +797,7 @@ fn latest_valid_mention(
             return;
         };
         if mention_matches(body, mention_user)
+            && !crate::issues::is_pr_fix_command(body, mention_user)
             && is_allowed_mentioner(login, association, allowed_users, allowed_associations)
             && latest
                 .as_ref()
@@ -999,7 +1107,7 @@ async fn process_daemon_job(
     repo: &str,
     job: &ReviewJob,
     cancel_token: CancellationToken,
-    honor_mention_trigger: bool,
+    origin: ReviewOrigin,
 ) -> Result<PrProcessStatus> {
     if cancel_token.is_cancelled() {
         return Ok(PrProcessStatus::Skipped);
@@ -1022,7 +1130,7 @@ async fn process_daemon_job(
         return Ok(PrProcessStatus::Skipped);
     }
 
-    let mention_user = if honor_mention_trigger {
+    let mention_user = if origin == ReviewOrigin::Poll {
         params.trigger_mention.as_deref()
     } else {
         None
@@ -1031,7 +1139,8 @@ async fn process_daemon_job(
     // In mention-trigger mode the mentioner carries the trust, so the PR
     // author gate only applies when no mention trigger is in effect. This
     // lets a maintainer summon a review on e.g. a first-time contributor's PR.
-    if mention_user.is_none()
+    if origin != ReviewOrigin::Generated
+        && mention_user.is_none()
         && !is_allowed_author_association(
             &pr.author_association,
             &params.allowed_author_associations,
@@ -1080,7 +1189,7 @@ async fn process_daemon_job(
     } else {
         None
     };
-    if should_skip_backport(pr, mention.as_ref()) {
+    if origin != ReviewOrigin::Generated && should_skip_backport(pr, mention.as_ref()) {
         tracing::info!(
             repo = %repo,
             pr = pr.number,
@@ -1460,7 +1569,14 @@ async fn trigger_manual_review(
 
     // Manual triggers are deliberate, so they bypass the mention gate.
     for job in jobs {
-        process_daemon_job(params, &repo, &job, cancel_token.clone(), false).await?;
+        process_daemon_job(
+            params,
+            &repo,
+            &job,
+            cancel_token.clone(),
+            ReviewOrigin::Manual,
+        )
+        .await?;
     }
 
     Ok(())
@@ -2265,6 +2381,75 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn generated_review_requests_survive_queue_recreation_and_track_each_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviews.redb");
+        let calls = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let done = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let handler = {
+            let calls = calls.clone();
+            let done = done.clone();
+            let db_path = db_path.clone();
+            std::sync::Arc::new(
+                move |work: DaemonWork,
+                      _: CancellationToken|
+                      -> BoxFuture<'static, Result<ExecutionStatus>> {
+                    let (calls, done, db_path) = (calls.clone(), done.clone(), db_path.clone());
+                    Box::pin(async move {
+                        let DaemonWork::Generated { repo, job } = work else {
+                            anyhow::bail!("Expected generated review");
+                        };
+                        calls.lock().await.push(job.pr.head_ref_oid.clone());
+                        let metadata = serde_json::from_value(serde_json::json!({
+                            "repository": repo, "pr_number": job.pr.number, "review_kind": job.review_kind,
+                            "commit_hash": job.pr.head_ref_oid, "model": "test", "timestamp": 1,
+                            "findings_count": 0, "status": "none", "severity": "none", "pr_classification": "bug",
+                            "duration_secs": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0
+                        }))?;
+                        crate::state::mark_reviewed(&db_path, &repo, job.pr.number, &metadata)?;
+                        done.add_permits(1);
+                        Ok(ExecutionStatus::Completed)
+                    })
+                },
+            )
+        };
+        let cancel = CancellationToken::new();
+        let scheduler = crate::scheduler::start(1, cancel.clone(), handler);
+        let queue = GeneratedReviewQueue {
+            scheduler,
+            db_path,
+            personas: vec![crate::persona::PersonaSource::BuiltinSecurity],
+            use_persona_kind: false,
+        };
+        let mut pr = PullRequestSummary {
+            number: 9,
+            head_ref_oid: "first".into(),
+            head_ref_name: "fiach/issue-1".into(),
+            author_association: String::new(),
+            title: "Issue fix".into(),
+        };
+        assert!(!queue.submit("owner/repo", &pr).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), done.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        // Recreating the dispatcher consults durable review state, not an in-memory receipt.
+        let restarted = queue.clone();
+        assert!(restarted.submit("owner/repo", &pr).await.unwrap());
+        pr.head_ref_oid = "second".into();
+        assert!(!restarted.submit("owner/repo", &pr).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), done.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert!(restarted.submit("owner/repo", &pr).await.unwrap());
+        assert_eq!(*calls.lock().await, vec!["first", "second"]);
+        cancel.cancel();
+    }
+
     #[test]
     fn pending_polls_refresh_payloads_and_remove_stale_targets() {
         let mut pending = PendingPollReviews::default();
@@ -2676,6 +2861,21 @@ mod tests {
             created_at: Some(created_at.to_string()),
             submitted_at: None,
         }
+    }
+
+    #[test]
+    fn fix_commands_do_not_start_a_parallel_review_of_the_old_head() {
+        let details: PrMentionDetails = serde_json::from_value(serde_json::json!({
+            "body": "", "comments": [{
+                "id": "IC_1", "author": {"login": "maintainer"}, "authorAssociation": "MEMBER",
+                "body": "@fiach-bot fix", "createdAt": "2026-01-01T00:00:00Z"
+            }], "reviews": []
+        }))
+        .unwrap();
+        assert!(
+            latest_valid_mention(&details, "NONE", "fiach-bot", &["maintainer".into()], &[])
+                .is_none()
+        );
     }
 
     #[test]

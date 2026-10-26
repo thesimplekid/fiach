@@ -18,10 +18,12 @@ use super::{
     config::{IssueConfig, Project},
     coverage::ComparisonRecord,
     github::{self, Github, git},
+    iterations,
     triage::{Triage, route_label},
     worker,
 };
 
+const ITERATIONS: TableDefinition<&str, &str> = TableDefinition::new("issue_pr_iterations_v1");
 const RECORDS: TableDefinition<&str, &str> = TableDefinition::new("issue_workflow_v1");
 const COMPARISONS: TableDefinition<&str, &str> = TableDefinition::new("issue_coverage_v1");
 const ANSWERS: TableDefinition<&str, &str> = TableDefinition::new("issue_jev_answers_v1");
@@ -63,6 +65,10 @@ struct Publication {
     // Old journals lack host-enforced path policy and cannot authorize publication.
     #[serde(default)]
     area_policy: Option<String>,
+    #[serde(default)]
+    fix_kind: super::FixKind,
+    #[serde(default)]
+    validation_command: Option<Vec<String>>,
 }
 pub(super) struct Store(Database);
 impl Store {
@@ -71,12 +77,32 @@ impl Store {
         let tx = db.begin_write()?;
         {
             tx.open_table(RECORDS)?;
+            tx.open_table(ITERATIONS)?;
             tx.open_table(ANSWERS)?;
             tx.open_table(COMPARISONS)?;
         }
         tx.commit()?;
         Ok(Self(db))
     }
+    pub(super) fn iteration(&self, key: &str) -> Result<Option<iterations::State>> {
+        let tx = self.0.begin_read()?;
+        let table = tx.open_table(ITERATIONS)?;
+        table
+            .get(key)?
+            .map(|v| serde_json::from_str(v.value()).map_err(Into::into))
+            .transpose()
+    }
+
+    pub(super) fn save_iteration(&self, key: &str, state: &iterations::State) -> Result<()> {
+        let value = serde_json::to_string(state)?;
+        let tx = self.0.begin_write()?;
+        {
+            tx.open_table(ITERATIONS)?.insert(key, value.as_str())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn get(&self, key: &str) -> Result<Record> {
         let tx = self.0.begin_read()?;
         let table = tx.open_table(RECORDS)?;
@@ -176,6 +202,16 @@ pub async fn run(
     only: Option<u64>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    run_with_reviews(config, watch, only, cancel, None).await
+}
+
+pub async fn run_with_reviews(
+    config: IssueConfig,
+    watch: bool,
+    only: Option<u64>,
+    cancel: CancellationToken,
+    reviews: Option<crate::daemon::GeneratedReviewQueue>,
+) -> Result<()> {
     config.validate()?;
     if only.is_some() {
         ensure!(
@@ -272,9 +308,12 @@ pub async fn run(
                     project,
                     item.number,
                     &inventory,
-                    &github,
-                    &store,
-                    &cancel,
+                    &Runtime {
+                        github: &github,
+                        store: &store,
+                        cancel: &cancel,
+                        reviews: reviews.as_ref(),
+                    },
                 )
                 .await
                 {
@@ -326,19 +365,35 @@ pub async fn run(
     }
 }
 
+struct Runtime<'a> {
+    github: &'a Github,
+    store: &'a Store,
+    cancel: &'a CancellationToken,
+    reviews: Option<&'a crate::daemon::GeneratedReviewQueue>,
+}
+
 async fn process(
     config: &IssueConfig,
     project: &Project,
     number: u64,
     inventory: &[Item],
-    github: &Github,
-    store: &Store,
-    cancel: &CancellationToken,
+    runtime: &Runtime<'_>,
 ) -> Result<bool> {
+    let (github, store, cancel) = (runtime.github, runtime.store, runtime.cancel);
     let key = format!("{}#{number}", project.repo);
+    let iteration_worked = iterations::process(
+        config,
+        project,
+        number,
+        github,
+        store,
+        cancel,
+        runtime.reviews,
+    )
+    .await?;
     let trigger = github.issue_trigger(&project.repo, number, config).await?;
     if config.trigger_mention.is_some() && trigger.is_none() {
-        return Ok(false);
+        return Ok(iteration_worked);
     }
     let mut record = store.get(&key)?;
     if config.publish
@@ -385,7 +440,7 @@ async fn process(
                 .run_until_cancelled(github.inventory(&project.repo))
                 .await
             else {
-                return Ok(false);
+                return Ok(iteration_worked);
             };
             let inventory = inventory?;
             let mut recheck = Triage::new(
@@ -399,7 +454,7 @@ async fn process(
                 .run_until_cancelled(recheck.classify(project, &fresh, &inventory, github))
                 .await
             else {
-                return Ok(false);
+                return Ok(iteration_worked);
             };
             ensure!(
                 decision?.ready_for_execution(),
@@ -417,7 +472,8 @@ async fn process(
                     .await?,
             );
         }
-        if record.pr.is_some() {
+        if let (Some(url), Some(pending)) = (&record.pr, &record.pending) {
+            track_publication(store, &key, project, number, url, pending, &github.login)?;
             record.pending = None;
             store.put(&key, &record)?;
         }
@@ -426,11 +482,11 @@ async fn process(
         .run_until_cancelled(github.issue(&project.repo, number))
         .await
     else {
-        return Ok(false);
+        return Ok(iteration_worked);
     };
     let issue = issue?;
     if !issue.open || issue.is_pr {
-        return Ok(false);
+        return Ok(iteration_worked);
     }
     let fingerprint = digest(&(
         fingerprint(project, &issue, inventory, config.publish, config.auto_fix)?,
@@ -445,7 +501,7 @@ async fn process(
         crate::jev::MODEL,
     ))?;
     if record.fingerprint == fingerprint {
-        return Ok(false);
+        return Ok(iteration_worked);
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -454,7 +510,7 @@ async fn process(
         && retry.blocks(&fingerprint, now)
     {
         tracing::info!(repo = %project.repo, issue = number, retry_at = retry.not_before, permanent = retry.permanent, "Issue retry deferred");
-        return Ok(false);
+        return Ok(iteration_worked);
     }
     tracing::info!(repo = %project.repo, issue = number, "Triaging issue");
     let mut triage = Triage::new(
@@ -470,7 +526,7 @@ async fn process(
         .run_until_cancelled(triage.classify(project, &issue, inventory, github))
         .await
     else {
-        return Ok(false);
+        return Ok(iteration_worked);
     };
     let mut decision = match result {
         Ok(decision) => decision,
@@ -562,7 +618,7 @@ async fn process(
                         .run_until_cancelled(github.inventory(&project.repo))
                         .await
                     else {
-                        return Ok(false);
+                        return Ok(iteration_worked);
                     };
                     let inventory = inventory?;
                     let mut recheck = Triage::new(
@@ -576,7 +632,7 @@ async fn process(
                         .run_until_cancelled(recheck.classify(project, &fresh, &inventory, github))
                         .await
                     else {
-                        return Ok(false);
+                        return Ok(iteration_worked);
                     };
                     decision = result?;
                     if decision.ready_for_execution() {
@@ -630,6 +686,8 @@ async fn process(
                                 issue_key: content_key(&issue)?,
                                 summary: summary.clone(),
                                 area_policy: Some(digest(&project.areas)?),
+                                fix_kind,
+                                validation_command: Some(fix.report.reproduction.clone()),
                             });
                             store.put(&key, &record)?;
                             // Empty expected value makes publication create-only; never overwrite anyone's branch.
@@ -648,6 +706,17 @@ async fn process(
                                     .open_pr(&project.repo, &branch, &fix.branch, number, &summary)
                                     .await?,
                             );
+                            if let (Some(url), Some(pending)) = (&record.pr, &record.pending) {
+                                track_publication(
+                                    store,
+                                    &key,
+                                    project,
+                                    number,
+                                    url,
+                                    pending,
+                                    &github.login,
+                                )?;
+                            }
                             record.pending = None;
                             store.put(&key, &record)?;
                         }
@@ -705,7 +774,9 @@ async fn process(
             } else {
                 Route::NeedsReview
             },
-            if open {
+            if open && config.iterations.is_some() {
+                "A Fiach draft PR already exists for this issue. An allowlisted user can request a verified revision with an @bot fix comment on that PR, using the configured bot username."
+            } else if open {
                 "A Fiach draft PR already exists for this issue. Further changes require maintainer review."
             } else {
                 "The previous Fiach PR is no longer open. A maintainer must decide how to proceed."
@@ -760,6 +831,40 @@ async fn process(
         "Issue triage complete"
     );
     Ok(true)
+}
+
+fn track_publication(
+    store: &Store,
+    key: &str,
+    project: &Project,
+    issue: u64,
+    url: &str,
+    pending: &Publication,
+    author: &str,
+) -> Result<()> {
+    // Old journals lack validation commands; never infer ownership from branch names alone.
+    let Some(command) = &pending.validation_command else {
+        return Ok(());
+    };
+    if store.iteration(key)?.is_none() {
+        let prefix = format!("https://github.com/{}/pull/", project.repo);
+        let number = url
+            .strip_prefix(&prefix)
+            .context("Unexpected generated PR URL")?
+            .parse::<u64>()
+            .context("Invalid generated PR number")?;
+        let state = iterations::State::new(
+            number,
+            issue,
+            &pending.branch,
+            &pending.base_branch,
+            &pending.commit,
+            author,
+            (pending.fix_kind, command.clone()),
+        );
+        store.save_iteration(key, &state)?;
+    }
+    Ok(())
 }
 
 fn reroute(project: &Project, decision: &mut Decision, route: Route, explanation: &str) {
@@ -1018,6 +1123,8 @@ mod tests {
             issue_key: "issue-content".into(),
             summary: "fix".into(),
             area_policy: None,
+            fix_kind: super::super::FixKind::Bug,
+            validation_command: None,
         });
         {
             let store = Store::open(&path).unwrap();

@@ -158,7 +158,7 @@ impl Github {
         ))
     }
 
-    async fn comments(&self, repo: &str, number: u64) -> Result<Vec<Value>> {
+    pub(super) async fn comments(&self, repo: &str, number: u64) -> Result<Vec<Value>> {
         pages(
             &format!("repos/{repo}/issues/{number}/comments?sort=created"),
             2000,
@@ -623,7 +623,7 @@ pub(super) fn mentions_work(text: &str, repo: &str, number: u64) -> bool {
     })
 }
 
-async fn pages(endpoint: &str, max: usize) -> Result<Vec<Value>> {
+pub(super) async fn pages(endpoint: &str, max: usize) -> Result<Vec<Value>> {
     let mut result = vec![];
     let separator = if endpoint.contains('?') { '&' } else { '?' };
     for page in 1.. {

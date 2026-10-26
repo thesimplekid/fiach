@@ -74,13 +74,13 @@ elif path.startswith(root + '/issues/comments/'):
         comment['body'] = body['body']; result = comment
 elif path.startswith(root + '/issues/'):
     tail = path[len(root + '/issues/'):].split('/')
-    n = int(tail[0]); issue = next(i for i in s['items'] if i['number'] == n)
+    n = int(tail[0]); issue = next((i for i in s['items'] if i['number'] == n), {'number':n, 'updated_at':'pr'})
     if len(tail) == 1: result = issue
     elif tail[1] == 'timeline': result = s.get('timeline', {}).get(str(n), [])
     elif tail[1] == 'comments':
         comments = s['comments'].setdefault(str(n), [])
         if method == 'POST':
-            comments.append({'id':1000+n,'user':{'login':'fiach-bot'},'body':body['body']})
+            comments.append({'id':1000+n+len(comments),'user':{'login':'fiach-bot'},'body':body['body']})
             issue['updated_at'] = 'bot-updated'
             result = comments[-1]
         else: result = comments
@@ -115,10 +115,24 @@ elif path == root + '/pulls':
             sys.exit(1)
     else: result = s.get('prs', [])
 elif path.startswith(root + '/pulls/'):
-    n = int(path.split('/')[-1]); result = {'state':'open','head':{'sha':'abc'},'base':{'sha':'base'}}
-    s['pull_reads'] = s.get('pull_reads', 0) + 1
-    if s.get('change_revision') and s['pull_reads'] >= 3:
-        result[s['change_revision']]['sha'] = 'changed'
+    tail = path[len(root + '/pulls/'):].split('/')
+    n = int(tail[0])
+    if len(tail) > 1:
+        assert tail[1] in ['reviews', 'comments']
+        result = s.get('pr_' + tail[1], [])
+    elif n == 9 and s.get('prs'):
+        import subprocess
+        pr = s['prs'][0]
+        sha = lambda ref: subprocess.check_output(['git','rev-parse',ref],cwd=s['remote'],text=True).strip()
+        result = {'number':9, 'title':pr['title'], 'state':pr['state'], 'merged':s.get('iteration_merged',False),
+            'user':{'login':'fiach-bot'},
+            'head':{'sha':sha(pr['head']), 'ref':pr['head'], 'repo':{'full_name':s.get('head_repo','owner/repo')}},
+            'base':{'sha':sha(pr['base']), 'ref':pr['base'], 'repo':{'full_name':'owner/repo'}}}
+    else:
+        result = {'state':'open','head':{'sha':'abc'},'base':{'sha':'base'}}
+        s['pull_reads'] = s.get('pull_reads', 0) + 1
+        if s.get('change_revision') and s['pull_reads'] >= 3:
+            result[s['change_revision']]['sha'] = 'changed'
 else: raise Exception(a)
 json.dump(s,open(p,'w'))
 if '--include' in a: print('HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4000\r\n\r\n', end='')
@@ -476,6 +490,28 @@ if i['phase'] == 'code' and i['fix_kind'] == 'maintenance':
     fixture = json.load(open(os.environ['FIXTURE']))
     if fixture.get('fail_maintenance_check'):
         report['reproduction'] = ['python3','-c','raise RuntimeError("build failed")']
+    subprocess.check_call(['git','add','-N','.'],cwd=workspace)
+    patch = subprocess.check_output(['git','diff','--binary',i['base']],cwd=workspace)
+    open(output + '/patch.diff','wb').write(patch)
+elif i['phase'] == 'code' and i.get('revision'):
+    fixture = json.load(open(os.environ['FIXTURE']))
+    assert i['base'] == i['revision']['head']
+    assert any('Review finding' in f['body'] for f in i['revision']['feedback'])
+    assert i['revision']['previous_checks']
+    if fixture.get('iteration_revoke'):
+        fixture['comments']['9'] = []
+        json.dump(fixture,open(os.environ['FIXTURE'],'w'))
+    if fixture.get('iteration_move_head'):
+        subprocess.check_call(['git','update-ref','refs/heads/fiach/issue-1','main'],cwd=fixture['remote'])
+    if fixture.get('iteration_fail'):
+        raise RuntimeError('iteration coding failed')
+    open(workspace + '/calc.py','a').write('def bonus():\n    return 2\n')
+    if fixture.get('iteration_break_original'):
+        open(workspace + '/calc.py','w').write('def amount():\n    return 0\ndef bonus():\n    return 2\n')
+    test = 'tests/test_bonus.py'
+    open(workspace + '/' + test,'w').write('import runpy\nassert runpy.run_path("calc.py")["bonus"]() == 2\n')
+    report['test_files'] = [test]
+    report['reproduction'] = ['python3',test]
     subprocess.check_call(['git','add','-N','.'],cwd=workspace)
     patch = subprocess.check_output(['git','diff','--binary',i['base']],cwd=workspace)
     open(output + '/patch.diff','wb').write(patch)
@@ -2299,4 +2335,309 @@ async fn issue_mentions_require_allowlisted_authors_and_new_comments_for_retries
         phases.repeat(2)
     );
     server.abort();
+}
+
+async fn enable_iterations(dir: &Path, max_attempts: u32) {
+    let path = dir.join("fiach.toml");
+    let config = std::fs::read_to_string(&path).unwrap().replace(
+        "[issues]",
+        "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+    );
+    std::fs::write(
+        path,
+        format!("{config}\n[issues.iterations]\nmax_attempts = {max_attempts}\n"),
+    )
+    .unwrap();
+    add_comment(
+        dir,
+        "1",
+        10,
+        "maintainer",
+        "@fiach-bot please fix the issue",
+    );
+}
+
+fn add_comment(dir: &Path, number: &str, id: u64, author: &str, body: &str) {
+    let mut state = fixture(dir);
+    if state["comments"].get(number).is_none() {
+        state["comments"][number] = json!([]);
+    }
+    state["comments"][number]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":id, "user":{"login":author}, "body":body, "author_association":"NONE"
+        }));
+    std::fs::write(
+        dir.join("fixture.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+async fn remote_head(dir: &Path, branch: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", branch])
+        .current_dir(dir.join("remote"))
+        .output()
+        .await
+        .unwrap();
+    assert_ok(&output);
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[tokio::test]
+async fn trusted_pr_fix_updates_same_branch_and_reruns_prior_checks_once() {
+    let (dir, server, _) = setup("bug", "different", false, true).await;
+    enable_worker(dir.path(), false).await;
+    enable_iterations(dir.path(), 2).await;
+    assert_ok(&run(dir.path()).await);
+    let initial = remote_head(dir.path(), "fiach/issue-1").await;
+    let mut state = fixture(dir.path());
+    state["pr_reviews"] = json!([{"commit_id":initial,"state":"CHANGES_REQUESTED","user":{"login":"review-bot"},"body":"Review finding: bonus() must return 2."}]);
+    state["pr_comments"] = json!([{"commit_id":initial,"line":1,"path":"calc.py","user":{"login":"review-bot"},"body":"Review finding: missing bonus handling."}]);
+    std::fs::write(
+        dir.path().join("fixture.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    add_comment(dir.path(), "9", 20, "outsider", "@fiach-bot fix");
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(remote_head(dir.path(), "fiach/issue-1").await, initial);
+    add_comment(dir.path(), "9", 21, "maintainer", "@fiach-bot fix");
+    assert_ok(&run(dir.path()).await);
+    let revised = remote_head(dir.path(), "fiach/issue-1").await;
+    assert_ne!(revised, initial);
+    assert_eq!(remote_head(dir.path(), "fiach/issue-1^").await, initial);
+    assert_eq!(fixture(dir.path())["prs"].as_array().unwrap().len(), 1);
+    let phases_path = dir.path().join("fixture.json.phases");
+    let phases = std::fs::read_to_string(&phases_path).unwrap();
+    assert_eq!(
+        phases,
+        "code\ncheck\ncheck\nverify\ncode\ncheck\ncheck\ncheck\nverify\n"
+    );
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(std::fs::read_to_string(phases_path).unwrap(), phases);
+    let comments = fixture(dir.path())["comments"]["9"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        comments
+            .iter()
+            .filter(|c| c["body"]
+                .as_str()
+                .unwrap()
+                .contains("Verified update pushed"))
+            .count(),
+        1
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn pr_iterations_fail_closed_on_revoked_commands_and_regressions() {
+    for flag in [
+        "iteration_revoke",
+        "iteration_break_original",
+        "iteration_move_head",
+    ] {
+        let (dir, server, _) = setup("bug", "different", false, true).await;
+        enable_worker(dir.path(), false).await;
+        enable_iterations(dir.path(), 2).await;
+        assert_ok(&run(dir.path()).await);
+        let initial = remote_head(dir.path(), "fiach/issue-1").await;
+        add_comment(
+            dir.path(),
+            "9",
+            21,
+            "maintainer",
+            "@fiach-bot fix Review finding: bonus",
+        );
+        set_flag(dir.path(), flag);
+        let output = run(dir.path()).await;
+        assert!(!output.status.success(), "{flag}");
+        let expected = if flag == "iteration_move_head" {
+            remote_head(dir.path(), "main").await
+        } else {
+            initial
+        };
+        assert_eq!(
+            remote_head(dir.path(), "fiach/issue-1").await,
+            expected,
+            "{flag}"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn pr_iteration_attempt_limit_survives_restarts_and_new_commands() {
+    let (dir, server, _) = setup("bug", "different", false, true).await;
+    enable_worker(dir.path(), false).await;
+    enable_iterations(dir.path(), 1).await;
+    assert_ok(&run(dir.path()).await);
+    set_flag(dir.path(), "iteration_fail");
+    add_comment(
+        dir.path(),
+        "9",
+        21,
+        "maintainer",
+        "@fiach-bot fix Review finding: bonus",
+    );
+    assert!(!run(dir.path()).await.status.success());
+    let path = dir.path().join("fixture.json.phases");
+    let phases = std::fs::read_to_string(&path).unwrap();
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), phases);
+    add_comment(dir.path(), "9", 22, "maintainer", "@fiach-bot fix retry");
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), phases);
+    assert!(
+        fixture(dir.path())["comments"]["9"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["body"].as_str().unwrap().contains("limit of 1"))
+    );
+    server.abort();
+}
+
+async fn intercept_iteration_push(dir: &Path, flag: &str) {
+    let path = std::env::var_os("PATH").unwrap();
+    let real = std::env::split_paths(&path)
+        .map(|p| p.join("git"))
+        .find(|p| p.is_file())
+        .unwrap();
+    let script = format!(
+        r#"#!{python}
+import json, os, subprocess, sys
+real = {real}
+p = os.environ['FIXTURE']
+s = json.load(open(p))
+a = sys.argv[1:]
+command = a[:]
+while command[:1] == ['-c']:
+    command = command[2:]
+if command[:1] == ['push'] and s.get('iteration_push_mode'):
+    mode = s.pop('iteration_push_mode')
+    json.dump(s,open(p,'w'))
+    if mode == 'race':
+        subprocess.check_call([real,'update-ref','refs/heads/fiach/issue-1','main'],cwd=s['remote'])
+    elif mode == 'fail':
+        sys.exit(1)
+    elif mode == 'lost':
+        subprocess.check_call([real] + a)
+        sys.exit(1)
+sys.exit(subprocess.call([real] + a))
+"#,
+        python = python_executable().await,
+        real = serde_json::to_string(real.to_str().unwrap()).unwrap()
+    );
+    let git = dir.join("bin/git");
+    std::fs::write(&git, script).unwrap();
+    std::fs::set_permissions(git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut state = fixture(dir);
+    state["iteration_push_mode"] = json!(flag);
+    std::fs::write(
+        dir.join("fixture.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pr_iteration_push_journal_recovers_lost_responses_and_honors_concurrent_writes() {
+    for mode in ["lost", "fail", "race"] {
+        let (dir, server, _) = setup("bug", "different", false, true).await;
+        enable_worker(dir.path(), false).await;
+        enable_iterations(dir.path(), 2).await;
+        assert_ok(&run(dir.path()).await);
+        let initial = remote_head(dir.path(), "fiach/issue-1").await;
+        add_comment(
+            dir.path(),
+            "9",
+            21,
+            "maintainer",
+            "@fiach-bot fix Review finding: bonus",
+        );
+        intercept_iteration_push(dir.path(), mode).await;
+        assert!(!run(dir.path()).await.status.success(), "{mode}");
+        let after = remote_head(dir.path(), "fiach/issue-1").await;
+        let path = dir.path().join("fixture.json.phases");
+        let phases = std::fs::read_to_string(&path).unwrap();
+        let recovery = run(dir.path()).await;
+        if mode == "race" {
+            assert!(!recovery.status.success());
+            assert_eq!(after, remote_head(dir.path(), "main").await);
+        } else {
+            assert_ok(&recovery);
+            if mode == "lost" {
+                assert_ne!(after, initial);
+                assert_eq!(remote_head(dir.path(), "fiach/issue-1^").await, initial);
+                assert!(
+                    fixture(dir.path())["comments"]["9"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|c| c["body"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Verified update pushed"))
+                );
+            } else {
+                assert_eq!(after, initial);
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), phases, "{mode}");
+        assert_eq!(remote_head(dir.path(), "fiach/issue-1").await, after);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn pr_iterations_never_update_closed_merged_or_forked_prs() {
+    for mode in ["closed", "merged", "fork"] {
+        let (dir, server, _) = setup("bug", "different", false, true).await;
+        enable_worker(dir.path(), false).await;
+        enable_iterations(dir.path(), 2).await;
+        assert_ok(&run(dir.path()).await);
+        let initial = remote_head(dir.path(), "fiach/issue-1").await;
+        add_comment(
+            dir.path(),
+            "9",
+            21,
+            "maintainer",
+            "@fiach-bot fix Review finding: bonus",
+        );
+        let mut state = fixture(dir.path());
+        match mode {
+            "closed" => state["prs"][0]["state"] = json!("closed"),
+            "merged" => state["iteration_merged"] = json!(true),
+            _ => state["head_repo"] = json!("attacker/fork"),
+        }
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let path = dir.path().join("fixture.json.phases");
+        let phases = std::fs::read_to_string(&path).unwrap();
+        let _ = run(dir.path()).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), phases, "{mode}");
+        assert_eq!(
+            remote_head(dir.path(), "fiach/issue-1").await,
+            initial,
+            "{mode}"
+        );
+        assert_eq!(
+            fixture(dir.path())["comments"]["9"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{mode}"
+        );
+        server.abort();
+    }
 }

@@ -2,12 +2,14 @@
 pub mod config;
 mod coverage;
 mod github;
+mod iterations;
 mod triage;
 mod worker;
 mod workflow;
 
+pub(crate) use iterations::fix_command as is_pr_fix_command;
 pub use worker::run_child;
-pub use workflow::{inspect_coverage, run};
+pub use workflow::{inspect_coverage, run, run_with_reviews};
 
 use serde::{Deserialize, Serialize};
 

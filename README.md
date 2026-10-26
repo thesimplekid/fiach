@@ -12,7 +12,10 @@ It acts as a background daemon that monitors configured GitHub repositories, che
 
 Fiach also supports project-area labeling, duplicate checks across issues and open PRs,
 and independently verified draft bug-fix PRs. See [the issue workflow guide](ISSUES.md)
-and [example configuration](example.issues.toml). Nothing is merged or closed.
+and [example configuration](example.issues.toml). With trusted mentions and
+`issues.iterations` enabled, allowlisted users can comment `@fiach-bot fix` on a
+generated PR to request a verified revision; the daemon reviews each published
+revision. Nothing is merged or closed.
 
 ## 🚀 Features
 
