@@ -81,6 +81,7 @@ fn unauthorized_response() -> axum::response::Response {
 pub async fn start_server(port: u16, state: AppState) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/health/reviews", get(review_processing_health))
         .route("/ready", get(readiness_check))
         .route("/metrics", get(metrics))
         .route("/reviews", get(get_reviews))
@@ -102,11 +103,17 @@ async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
+/// Operational degradation is an alert signal, not a process restart signal.
+async fn review_processing_health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.scheduler.processing_health().await)
+}
+
 #[derive(Serialize)]
 struct ReadinessResponse {
     status: &'static str,
     scheduler: crate::scheduler::SchedulerStats,
     reviews: usize,
+    review_processing: crate::scheduler::ProcessingHealth,
 }
 
 async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
@@ -126,6 +133,7 @@ async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
                 status: "ready",
                 scheduler,
                 reviews: reviews.len(),
+                review_processing: state.scheduler.processing_health().await,
             }),
         )
             .into_response(),
@@ -149,7 +157,11 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 header::CONTENT_TYPE,
                 "text/plain; version=0.0.4; charset=utf-8",
             )],
-            render_metrics(&scheduler, &reviews),
+            format!(
+                "{}{}",
+                render_metrics(&scheduler, &reviews),
+                render_processing_metrics(&state.scheduler.processing_health().await)
+            ),
         )
             .into_response(),
         Err(error) => {
@@ -161,6 +173,36 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 .into_response()
         }
     }
+}
+
+fn render_processing_metrics(health: &crate::scheduler::ProcessingHealth) -> String {
+    let mut output = String::new();
+    for (name, value) in [
+        ("degraded", u64::from(health.degraded)),
+        (
+            "oldest_queued_age_seconds",
+            health.oldest_queued_age_secs.unwrap_or(0),
+        ),
+        ("recent_attempts", health.recent_attempts as u64),
+        ("recent_failures", health.recent_failures as u64),
+        ("consecutive_failures", health.consecutive_failures),
+        (
+            "last_success_timestamp_seconds",
+            health.last_success_at.unwrap_or(0).max(0) as u64,
+        ),
+    ] {
+        let _ = writeln!(
+            output,
+            "# TYPE fiach_review_processing_{name} gauge\nfiach_review_processing_{name} {value}"
+        );
+    }
+    if let Some(rate) = health.recent_failure_rate {
+        let _ = writeln!(
+            output,
+            "# TYPE fiach_review_processing_recent_failure_rate gauge\nfiach_review_processing_recent_failure_rate {rate}"
+        );
+    }
+    output
 }
 
 fn render_metrics(

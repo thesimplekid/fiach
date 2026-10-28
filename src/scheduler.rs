@@ -58,6 +58,8 @@ pub struct JobSnapshot {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub failure: Option<ExecutionFailure>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,10 +74,150 @@ pub struct SchedulerStats {
     pub total: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionStatus {
     Completed,
     Skipped,
+    Failed(ExecutionFailure),
+}
+
+/// Only fixed host categories are exposed; never raw provider/model content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionFailure {
+    pub stage: String,
+    pub reason: String,
+}
+
+impl ExecutionFailure {
+    pub fn classify(stage: &str, error: &anyhow::Error) -> Self {
+        let text = format!("{error:#}").to_ascii_lowercase();
+        let reason = if text.contains("timed out") || text.contains("timeout") {
+            "timeout"
+        } else if text.contains("delegated lane") || text.contains("finder incomplete") {
+            "incomplete_lanes"
+        } else if text.contains("provider") {
+            "provider_failure"
+        } else if text.contains("cancelled") {
+            "cancelled"
+        } else {
+            "unknown"
+        };
+        let stage = if stage == "execution"
+            && (text.contains("review session timed out") || text.contains("finder incomplete"))
+        {
+            "finder"
+        } else {
+            stage
+        };
+        Self {
+            stage: stage.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+const HEALTH_WINDOW_SECS: i64 = 15 * 60;
+const HEALTH_SAMPLE_LIMIT: usize = 1000;
+const QUEUE_AGE_THRESHOLD_SECS: u64 = 10 * 60;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessingHealth {
+    pub scope: &'static str,
+    pub degraded: bool,
+    pub reasons: Vec<&'static str>,
+    pub oldest_queued_age_secs: Option<u64>,
+    pub window_secs: i64,
+    pub sample_limit: usize,
+    pub recent_attempts: usize,
+    pub recent_failures: usize,
+    pub recent_failure_rate: Option<f64>,
+    pub consecutive_failures: u64,
+    pub last_success_at: Option<i64>,
+    pub last_failure_at: Option<i64>,
+    pub last_failure: Option<ExecutionFailure>,
+}
+
+#[derive(Default)]
+struct HealthHistory {
+    outcomes: VecDeque<(i64, bool)>,
+    consecutive_failures: u64,
+    last_success_at: Option<i64>,
+    last_failure_at: Option<i64>,
+    last_failure: Option<ExecutionFailure>,
+}
+
+impl HealthHistory {
+    fn record(&mut self, timestamp: i64, status: JobStatus, failure: Option<ExecutionFailure>) {
+        if !matches!(status, JobStatus::Completed | JobStatus::Failed) {
+            return;
+        }
+        if self
+            .outcomes
+            .back()
+            .is_some_and(|(at, _)| *at < timestamp - HEALTH_WINDOW_SECS)
+        {
+            self.consecutive_failures = 0;
+        }
+        let failed = status == JobStatus::Failed;
+        self.outcomes.push_back((timestamp, failed));
+        while self.outcomes.len() > HEALTH_SAMPLE_LIMIT
+            || self
+                .outcomes
+                .front()
+                .is_some_and(|(at, _)| *at < timestamp - HEALTH_WINDOW_SECS)
+        {
+            self.outcomes.pop_front();
+        }
+        if failed {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.last_failure_at = Some(timestamp);
+            self.last_failure = failure;
+        } else {
+            self.consecutive_failures = 0;
+            self.last_success_at = Some(timestamp);
+        }
+    }
+
+    fn snapshot(&self, timestamp: i64, oldest_queued: Option<i64>) -> ProcessingHealth {
+        let recent: Vec<_> = self
+            .outcomes
+            .iter()
+            .filter(|(at, _)| *at >= timestamp - HEALTH_WINDOW_SECS)
+            .collect();
+        let failures = recent.iter().filter(|(_, failed)| *failed).count();
+        let consecutive_failures = if recent.is_empty() {
+            0
+        } else {
+            self.consecutive_failures
+        };
+        let age = oldest_queued.map(|at| timestamp.saturating_sub(at).max(0) as u64);
+        let mut reasons = Vec::new();
+        if consecutive_failures >= 3 {
+            reasons.push("consecutive_review_failures");
+        }
+        if recent.len() >= 5 && failures * 2 >= recent.len() {
+            reasons.push("high_recent_review_failure_rate");
+        }
+        if age.is_some_and(|age| age >= QUEUE_AGE_THRESHOLD_SECS) {
+            reasons.push("review_queue_age_exceeded");
+        }
+        ProcessingHealth {
+            scope: "reviews",
+            degraded: !reasons.is_empty(),
+            reasons,
+            oldest_queued_age_secs: age,
+            window_secs: HEALTH_WINDOW_SECS,
+            sample_limit: HEALTH_SAMPLE_LIMIT,
+            recent_attempts: recent.len(),
+            recent_failures: failures,
+            recent_failure_rate: (!recent.is_empty())
+                .then(|| failures as f64 / recent.len() as f64),
+            consecutive_failures,
+            last_success_at: self.last_success_at,
+            last_failure_at: self.last_failure_at,
+            last_failure: self.last_failure.clone(),
+        }
+    }
 }
 
 type BoxJobFuture = Pin<Box<dyn Future<Output = Result<ExecutionStatus>> + Send>>;
@@ -106,6 +248,7 @@ pub struct SchedulerHandle<T> {
     sender: mpsc::Sender<Submission<T>>,
     jobs: Arc<Mutex<HashMap<String, JobSnapshot>>>,
     capacity: QueueCapacity,
+    health: Arc<Mutex<HealthHistory>>,
 }
 
 #[derive(Clone)]
@@ -137,6 +280,18 @@ impl<T: Send + 'static> SchedulerHandle<T> {
 
     pub async fn get(&self, job_id: &str) -> Option<JobSnapshot> {
         self.jobs.lock().await.get(job_id).cloned()
+    }
+
+    pub async fn processing_health(&self) -> ProcessingHealth {
+        let oldest_queued = self
+            .jobs
+            .lock()
+            .await
+            .values()
+            .filter(|job| job.status == JobStatus::Queued)
+            .map(|job| job.queued_at)
+            .min();
+        self.health.lock().await.snapshot(now(), oldest_queued)
     }
 
     pub async fn stats(&self) -> SchedulerStats {
@@ -182,11 +337,13 @@ pub fn start<T: Send + 'static>(
         changed: Arc::new(Notify::new()),
     };
     let jobs = Arc::new(Mutex::new(HashMap::new()));
+    let health = Arc::new(Mutex::new(HealthHistory::default()));
     tokio::spawn(run_scheduler(
         worker_limit,
         capacity.clone(),
         receiver,
         Arc::clone(&jobs),
+        health.clone(),
         cancel,
         handler,
     ));
@@ -194,6 +351,7 @@ pub fn start<T: Send + 'static>(
         sender,
         jobs,
         capacity,
+        health,
     }
 }
 
@@ -202,6 +360,7 @@ async fn run_scheduler<T: Send + 'static>(
     capacity: QueueCapacity,
     mut receiver: mpsc::Receiver<Submission<T>>,
     jobs: Arc<Mutex<HashMap<String, JobSnapshot>>>,
+    health: Arc<Mutex<HealthHistory>>,
     cancel: CancellationToken,
     handler: Handler<T>,
 ) {
@@ -249,12 +408,18 @@ async fn run_scheduler<T: Send + 'static>(
                 if let Ok((id, target, result)) = result {
                     active.remove(&id);
                     by_target.remove(&target);
-                    let (status, error) = match result {
-                        Ok(ExecutionStatus::Completed) => (JobStatus::Completed, None),
-                        Ok(ExecutionStatus::Skipped) => (JobStatus::Skipped, None),
-                        Err(error) => (JobStatus::Failed, Some(sanitize_error(&error))),
+                    let (status, error, failure) = match result {
+                        Ok(ExecutionStatus::Completed) => (JobStatus::Completed, None, None),
+                        Ok(ExecutionStatus::Skipped) => (JobStatus::Skipped, None, None),
+                        Ok(ExecutionStatus::Failed(failure)) => (JobStatus::Failed, Some(format!("{}: {}", failure.stage, failure.reason)), Some(failure)),
+                        Err(error) => {
+                            let failure = ExecutionFailure::classify("execution", &error);
+                            (JobStatus::Failed, Some(format!("{}: {}", failure.stage, failure.reason)), Some(failure))
+                        }
                     };
                     update_job(&jobs, &id, status, error).await;
+                    if let Some(job) = jobs.lock().await.get_mut(&id) { job.failure = failure.clone(); }
+                    health.lock().await.record(now(), status, failure);
                     terminal.push_back(id);
                     evict_terminal(&jobs, &mut terminal).await;
                 }
@@ -282,6 +447,7 @@ async fn run_scheduler<T: Send + 'static>(
                     started_at: None,
                     finished_at: None,
                     error: None,
+                    failure: None,
                 };
                 jobs.lock().await.insert(id.clone(), snapshot.clone());
                 by_target.insert(submission.request.target.clone(), id.clone());
@@ -342,11 +508,6 @@ async fn evict_terminal(
     {
         jobs.lock().await.remove(&id);
     }
-}
-
-fn sanitize_error(error: &anyhow::Error) -> String {
-    let text = error.to_string().replace(['\n', '\r'], " ");
-    text.chars().take(240).collect()
 }
 
 #[cfg(test)]
@@ -471,6 +632,95 @@ mod tests {
                 .await
                 .unwrap(),
             Some(2)
+        );
+        cancel.cancel();
+    }
+    #[test]
+    fn processing_health_distinguishes_idle_failure_recovery_and_queue_stalls() {
+        let mut history = HealthHistory::default();
+        let idle = history.snapshot(1000, None);
+        assert!(!idle.degraded);
+        assert_eq!(idle.recent_failure_rate, None);
+        let failure = ExecutionFailure::classify(
+            "execution",
+            &anyhow::anyhow!("Review session timed out secret=private"),
+        );
+        assert_eq!(failure.stage, "finder");
+        assert_eq!(failure.reason, "timeout");
+        for at in 1000..1003 {
+            history.record(at, JobStatus::Failed, Some(failure.clone()));
+        }
+        history.record(1004, JobStatus::Skipped, None);
+        let degraded = history.snapshot(1004, None);
+        assert!(degraded.degraded);
+        assert_eq!(degraded.recent_attempts, 3);
+        assert_eq!(degraded.consecutive_failures, 3);
+        assert_eq!(degraded.last_failure, Some(failure.clone()));
+        history.record(1005, JobStatus::Completed, None);
+        let recovered = history.snapshot(1005, None);
+        assert!(!recovered.degraded);
+        assert_eq!(recovered.last_success_at, Some(1005));
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert!(
+            history
+                .snapshot(1005, Some(400))
+                .reasons
+                .contains(&"review_queue_age_exceeded")
+        );
+        assert!(!history.snapshot(2000, None).degraded);
+        history.record(2000, JobStatus::Failed, Some(failure));
+        assert_eq!(history.snapshot(2000, None).consecutive_failures, 1);
+    }
+
+    #[test]
+    fn recent_failure_rate_uses_attempts_and_clears_after_sustained_recovery() {
+        let mut history = HealthHistory::default();
+        for at in 1000..1005 {
+            history.record(at, JobStatus::Failed, None);
+        }
+        for at in 1005..1010 {
+            history.record(at, JobStatus::Completed, None);
+        }
+        let health = history.snapshot(1010, None);
+        assert_eq!(health.recent_failure_rate, Some(0.5));
+        assert!(health.reasons.contains(&"high_recent_review_failure_rate"));
+        history.record(1010, JobStatus::Completed, None);
+        assert!(!history.snapshot(1011, None).degraded);
+        assert_eq!(history.snapshot(3000, None).recent_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn live_scheduler_exposes_degradation_without_changing_acceptance() {
+        let cancel = CancellationToken::new();
+        let handler = Arc::new(|_: u64, _: CancellationToken| {
+            Box::pin(async {
+                Ok(ExecutionStatus::Failed(ExecutionFailure {
+                    stage: "finder".into(),
+                    reason: "timeout".into(),
+                }))
+            }) as BoxJobFuture
+        });
+        let scheduler = start(1, cancel.clone(), handler);
+        for pr in 1..=3 {
+            scheduler.submit(request(pr)).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while scheduler.stats().await.failed < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(scheduler.stats().await.accepting);
+        assert!(scheduler.processing_health().await.degraded);
+        assert_eq!(
+            scheduler
+                .processing_health()
+                .await
+                .last_failure
+                .unwrap()
+                .stage,
+            "finder"
         );
         cancel.cancel();
     }

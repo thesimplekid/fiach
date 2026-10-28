@@ -21,7 +21,7 @@ use crate::github::{DiscoveryRequest, GhCli, GitHub, PullRequestSummary};
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
 use crate::review::{CompletedReview, ReviewExecution, ReviewParams};
 use crate::scheduler::{
-    ExecutionStatus, ReviewRequest, ReviewTarget, SchedulerHandle, SubmitError,
+    ExecutionFailure, ExecutionStatus, ReviewRequest, ReviewTarget, SchedulerHandle, SubmitError,
 };
 
 const VETH_SUBNET_BASE_OCTETS: (u8, u8) = (10, 64);
@@ -318,10 +318,7 @@ pub fn start_review_scheduler(
                         repo,
                         pr_number,
                         persona,
-                    } => {
-                        trigger_manual_review(&params, repo, pr_number, persona, cancel).await?;
-                        PrProcessStatus::Reviewed
-                    }
+                    } => trigger_manual_review(&params, repo, pr_number, persona, cancel).await?,
                     DaemonWork::Poll {
                         repo,
                         job,
@@ -344,7 +341,7 @@ pub fn start_review_scheduler(
                 Ok(match status {
                     PrProcessStatus::Reviewed => ExecutionStatus::Completed,
                     PrProcessStatus::Skipped => ExecutionStatus::Skipped,
-                    PrProcessStatus::Failed => anyhow::bail!("review execution failed"),
+                    PrProcessStatus::Failed(failure) => ExecutionStatus::Failed(failure),
                 })
             })
         },
@@ -867,11 +864,11 @@ fn apply_mention_trigger(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PrProcessStatus {
     Reviewed,
     Skipped,
-    Failed,
+    Failed(ExecutionFailure),
 }
 
 pub async fn run_daemon(
@@ -1187,7 +1184,10 @@ async fn process_daemon_job(
                     error = %e,
                     "Failed to fetch PR mention details"
                 );
-                return Ok(PrProcessStatus::Failed);
+                return Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
+                    "discovery",
+                    &e,
+                )));
             }
         };
 
@@ -1310,7 +1310,9 @@ async fn process_daemon_job(
                 }
                 Err(e) => {
                     tracing::error!("Failed to lock PR {} in {}: {}", pr.number, repo, e);
-                    return Ok(PrProcessStatus::Failed);
+                    return Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
+                        "state", &e,
+                    )));
                 }
             }
 
@@ -1481,7 +1483,10 @@ async fn process_daemon_job(
                     tracing::error!("Fatal error encountered, stopping daemon");
                     return Err(e);
                 }
-                return Ok(PrProcessStatus::Failed);
+                return Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
+                    "execution",
+                    &e,
+                )));
             } else {
                 execution_result?
             };
@@ -1504,7 +1509,10 @@ async fn process_daemon_job(
                     &failed_finalization,
                 );
                 tracing::error!(repo = %repo, pr = pr.number, error = %error, "Review finalization failed");
-                return Ok(PrProcessStatus::Failed);
+                return Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
+                    "finalization",
+                    &error,
+                )));
             }
 
             Ok(PrProcessStatus::Reviewed)
@@ -1517,7 +1525,9 @@ async fn process_daemon_job(
                 repo,
                 e
             );
-            Ok(PrProcessStatus::Failed)
+            Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
+                "state", &e,
+            )))
         }
     }
 }
@@ -1528,7 +1538,7 @@ async fn trigger_manual_review(
     pr_number: u64,
     persona_filter: Option<String>,
     cancel_token: CancellationToken,
-) -> Result<()> {
+) -> Result<PrProcessStatus> {
     tracing::info!(repo = %repo, pr = pr_number, "Fetching manual PR details");
 
     let output = Command::new("gh")
@@ -1597,8 +1607,9 @@ async fn trigger_manual_review(
     );
 
     // Manual triggers are deliberate, so they bypass the mention gate.
+    let mut outcome = PrProcessStatus::Skipped;
     for job in jobs {
-        process_daemon_job(
+        let status = process_daemon_job(
             params,
             &repo,
             &job,
@@ -1606,9 +1617,12 @@ async fn trigger_manual_review(
             ReviewOrigin::Manual,
         )
         .await?;
+        if !matches!(outcome, PrProcessStatus::Failed(_)) && status != PrProcessStatus::Skipped {
+            outcome = status;
+        }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 async fn wait_for_link(interface: &str) -> Result<()> {

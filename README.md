@@ -829,3 +829,22 @@ work is queued ahead of retries, preserving FIFO within each class.
 On upgrade, legacy failed records receive a fresh retry budget and a persisted,
 staggered delay of 5–65 minutes. Their original attempt timestamp is preserved so
 new mentions can override that delay. Repeated restarts do not move this schedule.
+
+`/health` reports process liveness. `/ready` continues to report whether the daemon
+can accept work and read its state; review failures do not turn readiness into a
+restart trigger. `/health/reviews` (also included as `review_processing` in
+`/ready`) reports review processing separately: oldest queued age, recent failure
+rate, consecutive failures, last success time, and sanitized failure stage/reason.
+It does not describe issue triage, which runs outside the review scheduler.
+
+Processing is degraded after three consecutive failures, a failure rate of at
+least 50% over at least five recent attempts, or a queued job waiting ten minutes.
+The recent window is fifteen minutes, bounded to the last 1,000 completed/failed
+attempts; skipped and cancelled jobs are excluded. Success resets the consecutive
+counter; sustained successes or expiry clear the rolling-rate alert. An idle
+installation without recent attempts or queued work is healthy. Health history
+is in memory and resets on restart; durable retry scheduling is independent.
+The JSON endpoint always returns HTTP 200 with an explicit `degraded` flag.
+Monitor that flag or `fiach_review_processing_*` gauges in `/metrics`, rather than
+using it as a liveness probe. Failure details use fixed categories, never raw
+provider responses or source/model content.
