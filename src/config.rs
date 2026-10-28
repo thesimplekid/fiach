@@ -62,6 +62,7 @@ pub struct DaemonConfig {
     pub timeout_mins: Option<u64>,
     pub db_path: Option<PathBuf>,
     pub max_retries: Option<u32>,
+    pub max_review_retries: Option<u32>,
     pub retry_delay_secs: Option<u64>,
     pub out_dir: Option<PathBuf>,
     pub report_mode: Option<String>,

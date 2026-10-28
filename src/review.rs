@@ -2415,6 +2415,8 @@ pub async fn run_review(
                 disclosure_url: None,
                 buzz_thread: None,
                 failure_stage: None,
+                review_retry_version: 1,
+                retry_not_before: None,
             },
             should_notify,
             report_path: report_file.to_path_buf(),

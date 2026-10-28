@@ -101,6 +101,7 @@ impl GeneratedReviewQueue {
             }
             complete = false;
             let request = ReviewRequest {
+                is_retry: false,
                 target: ReviewTarget {
                     repository: repo.into(),
                     pr_number: pr.number,
@@ -144,6 +145,7 @@ pub struct DaemonParams {
     pub timeout_mins: u64,
     pub db_path: PathBuf,
     pub max_retries: u32,
+    pub max_review_retries: u32,
     pub retry_delay_secs: u64,
     pub out_dir: Option<PathBuf>,
     pub disclose_config: DiscloseConfig,
@@ -202,6 +204,9 @@ impl PendingPollReviews {
             .chain(order)
             .filter_map(|target| latest.remove(&target))
             .collect();
+        self.requests
+            .make_contiguous()
+            .sort_by_key(|request| request.is_retry);
     }
 
     async fn submit(
@@ -264,6 +269,7 @@ pub fn manual_request(
         )
         .unwrap_or_else(|| crate::state::DEFAULT_REVIEW_KIND.to_string());
     ReviewRequest {
+        is_retry: false,
         target: ReviewTarget {
             repository: repo.clone(),
             pr_number,
@@ -848,13 +854,13 @@ fn apply_mention_trigger(
     mention_ts: i64,
     last_review_ts: Option<i64>,
 ) -> crate::state::ReviewDecision {
-    use crate::state::ReviewDecision::{ReReview, Skip};
+    use crate::state::ReviewDecision::{ReReview, RetryFailed, Skip};
 
     let mention_is_fresh = last_review_ts.is_none_or(|last| mention_ts > last);
 
     match decision {
         // Same commit already reviewed, but re-mentioned since: review again.
-        Skip if mention_is_fresh => ReReview,
+        Skip | RetryFailed if mention_is_fresh => ReReview,
         // New commit but nobody has re-mentioned since the last review.
         ReReview if !mention_is_fresh => Skip,
         other => other,
@@ -997,7 +1003,20 @@ pub async fn run_daemon(
                             "Collecting discovered review jobs"
                         );
                         for job in jobs {
+                            let is_retry = crate::state::get_pr_review(
+                                &params.db_path,
+                                repo,
+                                job.pr.number,
+                                &job.review_kind,
+                            )
+                            .ok()
+                            .flatten()
+                            .is_some_and(|record| {
+                                record.commit_hash == job.pr.head_ref_oid
+                                    && record.status == crate::state::ReviewStatus::Failed
+                            });
                             let request = ReviewRequest {
+                                is_retry,
                                 target: ReviewTarget {
                                     repository: repo.clone(),
                                     pr_number: job.pr.number,
@@ -1096,6 +1115,8 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
                 disclosure_url: None,
                 buzz_thread: None,
                 failure_stage: None,
+                review_retry_version: 1,
+                retry_not_before: None,
             };
             let _ = crate::state::mark_reviewed(&params.db_path, repo, job.pr.number, &meta);
         }
@@ -1209,12 +1230,18 @@ async fn process_daemon_job(
         &pr.head_ref_oid,
         &job.review_kind,
         claim_stale_after_secs(params),
-        params.max_retries,
+        params.max_review_retries,
     );
 
     let review_decision = match review_decision {
         Ok(decision) => {
-            if let Some(mention_ts) = mention_ts {
+            if origin == ReviewOrigin::Manual
+                && decision != crate::state::ReviewDecision::FirstReview
+            {
+                // Explicit operator requests reset retries; the atomic claim
+                // below still protects a live in-progress review.
+                Ok(crate::state::ReviewDecision::ReReview)
+            } else if let Some(mention_ts) = mention_ts {
                 let last_review_ts =
                     crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
                         .ok()
@@ -1439,6 +1466,8 @@ async fn process_daemon_job(
                     disclosure_url: None,
                     buzz_thread: None,
                     failure_stage: Some("execution".to_string()),
+                    review_retry_version: 1,
+                    retry_not_before: None,
                 };
                 let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);
 
@@ -2367,6 +2396,7 @@ mod tests {
             review_kind: "security".to_string(),
         };
         ReviewRequest {
+            is_retry: false,
             target: ReviewTarget {
                 repository: repo.clone(),
                 pr_number: pr,
@@ -3010,7 +3040,9 @@ mod tests {
         assert_eq!(apply_mention_trigger(ReReview, 100, Some(200)), Skip);
         // New commit and fresh mention: review.
         assert_eq!(apply_mention_trigger(ReReview, 300, Some(200)), ReReview);
-        // Failed attempts keep retrying without a new mention.
+        // A fresh mention resets the whole-review attempt budget.
+        assert_eq!(apply_mention_trigger(RetryFailed, 300, Some(200)), ReReview);
+        // Failed attempts keep their retry budget without a new mention.
         assert_eq!(
             apply_mention_trigger(RetryFailed, 100, Some(200)),
             RetryFailed

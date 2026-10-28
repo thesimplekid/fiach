@@ -132,6 +132,7 @@
                       drafts = true;
                       timeoutMins = 45;
                       maxRetries = 7;
+                      maxReviewRetries = 4;
                       retryDelaySecs = 20;
                       maxCostUsd = 12.5;
                       inputPricePerM = 1.25;
@@ -242,6 +243,7 @@
               grep -F 'drafts = true' "$config_path" >/dev/null
               grep -F 'timeout_mins = 45' "$config_path" >/dev/null
               grep -F 'max_retries = 7' "$config_path" >/dev/null
+              grep -F 'max_review_retries = 4' "$config_path" >/dev/null
               grep -F 'retry_delay_secs = 20' "$config_path" >/dev/null
               grep -F 'max_cost_usd = 12.5' "$config_path" >/dev/null
               grep -F 'input_price_per_m = 1.25' "$config_path" >/dev/null
@@ -574,7 +576,13 @@
             maxRetries = lib.mkOption {
               type = lib.types.int;
               default = 3;
-              description = "Maximum number of retries for LLM provider failures and failed review attempts.";
+              description = "Maximum number of retries for LLM provider/session failures.";
+            };
+
+            maxReviewRetries = lib.mkOption {
+              type = lib.types.ints.unsigned;
+              default = 5;
+              description = "Maximum whole-review retries per commit; a fresh trusted mention resets the limit.";
             };
 
             retryDelaySecs = lib.mkOption {
@@ -960,6 +968,7 @@
                         max_turns = cfg.maxTurns;
                         timeout_mins = cfg.timeoutMins;
                         max_retries = cfg.maxRetries;
+                        max_review_retries = cfg.maxReviewRetries;
                         retry_delay_secs = cfg.retryDelaySecs;
                       } // personaConfig // buzzConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
                         verifier_provider = cfg.verifierProvider;

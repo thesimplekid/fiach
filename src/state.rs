@@ -179,6 +179,11 @@ pub struct ReviewRecord {
     pub buzz_thread: Option<BuzzThreadState>,
     #[serde(default)]
     pub failure_stage: Option<String>,
+    #[serde(default)]
+    pub review_retry_version: u8,
+    /// Migration-only scheduling anchor; ordinary retries derive from timestamp.
+    #[serde(default)]
+    pub retry_not_before: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -412,6 +417,56 @@ pub fn should_review(
 }
 
 /// Checks if a PR needs review, bounding same-commit failed-review retries.
+/// Whole-review attempts are separate from model/session retries. Delay starts
+/// at five minutes, doubles after each failure, and caps at six hours.
+pub fn review_retry_delay_secs(retries: u32) -> u64 {
+    300_u64
+        .saturating_mul(1_u64 << retries.min(16))
+        .min(6 * 60 * 60)
+}
+
+fn retry_jitter(key: &str, window: u64) -> u64 {
+    // Stable across processes and Rust versions, unlike RandomState.
+    key.bytes().fold(0_u64, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+    }) % window
+}
+
+fn migrate_review_retry(db_path: &Path, repo: &str, pr: u64, review_kind: &str) -> Result<()> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    with_retries(|| {
+        let db = open_database(db_path)?;
+        let write = db.begin_write()?;
+        {
+            let mut table = write.open_table(PR_STATE)?;
+            let key = pr_state_key(repo, pr, review_kind);
+            let previous = table
+                .get(key.as_str())?
+                .and_then(|value| serde_json::from_str::<ReviewMetadata>(value.value()).ok());
+            if let Some(mut record) = previous
+                && record.status == ReviewStatus::Failed
+                && record.review_retry_version == 0
+            {
+                record.review_retry_version = 1;
+                record.retry_count = 0;
+                record.retry_not_before = Some(
+                    time::OffsetDateTime::now_utc()
+                        .unix_timestamp()
+                        .saturating_add(300 + retry_jitter(&key, 3600) as i64),
+                );
+                // Preserve the attempt timestamp so fresh trusted mentions still
+                // bypass this staggered migration delay.
+                let json = serde_json::to_string(&record)?;
+                table.insert(key.as_str(), json.as_str())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    })
+}
+
 pub fn should_review_with_retry_limit(
     db_path: &Path,
     repo: &str,
@@ -421,6 +476,7 @@ pub fn should_review_with_retry_limit(
     stale_after_secs: u64,
     max_failed_retries: u32,
 ) -> Result<ReviewDecision> {
+    migrate_review_retry(db_path, repo, pr, review_kind)?;
     should_review_inner(ShouldReviewInput {
         db_path,
         repo,
@@ -487,6 +543,11 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                                 "Found stale in_progress lock, proceeding with review"
                             );
                             if metadata.commit_hash == current_hash {
+                                if max_failed_retries
+                                    .is_some_and(|limit| metadata.retry_count >= limit)
+                                {
+                                    return Ok(ReviewDecision::Skip);
+                                }
                                 return Ok(ReviewDecision::RetryFailed);
                             }
                             // Fall through to commit hash check for newer commits.
@@ -497,38 +558,25 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                     }
                     if metadata.commit_hash == current_hash {
                         if metadata.status == "failed" {
-                            if let Some(max_failed_retries) = max_failed_retries
-                                && metadata.retry_count >= max_failed_retries
-                            {
+                            if let Some(limit) = max_failed_retries {
                                 let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                                let age_secs = now.saturating_sub(metadata.timestamp);
-                                let retry_cooldown_secs = stale_after_secs;
-
-                                if age_secs as u64 <= retry_cooldown_secs {
-                                    tracing::warn!(
-                                        repo = %repo,
-                                        pr = pr,
-                                        commit = %current_hash,
-                                        review_kind = %review_kind,
+                                let next_retry = metadata.retry_not_before.unwrap_or_else(|| {
+                                    metadata.timestamp.saturating_add(
+                                        review_retry_delay_secs(metadata.retry_count) as i64
+                                            + retry_jitter(&key, 60) as i64,
+                                    )
+                                });
+                                if metadata.retry_count >= limit || now < next_retry {
+                                    tracing::debug!(
+                                        repo,
+                                        pr,
                                         retries = metadata.retry_count,
-                                        max_retries = max_failed_retries,
-                                        retry_cooldown_secs = retry_cooldown_secs,
-                                        "Skipping previously failed review during retry cooldown"
+                                        limit,
+                                        next_retry,
+                                        "Whole-review retry deferred or exhausted"
                                     );
                                     return Ok(ReviewDecision::Skip);
                                 }
-
-                                tracing::warn!(
-                                    repo = %repo,
-                                    pr = pr,
-                                    commit = %current_hash,
-                                    review_kind = %review_kind,
-                                    retries = metadata.retry_count,
-                                    max_retries = max_failed_retries,
-                                    age_secs = age_secs,
-                                    retry_cooldown_secs = retry_cooldown_secs,
-                                    "Retrying previously failed review after retry cooldown"
-                                );
                             }
                             tracing::info!(
                                 repo = %repo,
@@ -675,6 +723,8 @@ pub fn lock_for_review(
                 disclosure_url: None,
                 buzz_thread: None,
                 failure_stage: None,
+                review_retry_version: 1,
+                retry_not_before: None,
             };
 
             if let Some(value) = pr_table.get(key.as_str())? {
@@ -1245,7 +1295,102 @@ mod tests {
             disclosure_url: None,
             buzz_thread: None,
             failure_stage: None,
+            review_retry_version: 1,
+            retry_not_before: None,
         }
+    }
+
+    #[test]
+    fn whole_review_backoff_is_increasing_capped_and_durable() {
+        assert_eq!(review_retry_delay_secs(0), 300);
+        assert_eq!(review_retry_delay_secs(1), 600);
+        assert_eq!(review_retry_delay_secs(2), 1200);
+        assert_eq!(review_retry_delay_secs(u32::MAX), 21600);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry.redb");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let check = |hash: &str| {
+            should_review_with_retry_limit(
+                &path,
+                "owner/repo",
+                42,
+                hash,
+                "security",
+                STALE_AFTER_SECS,
+                5,
+            )
+            .unwrap()
+        };
+        mark_reviewed(
+            &path,
+            "owner/repo",
+            42,
+            &metadata_with_timestamp("head", "failed", 0, now),
+        )
+        .unwrap();
+        assert_eq!(check("head"), ReviewDecision::Skip);
+        assert_eq!(check("new-head"), ReviewDecision::ReReview);
+        // Each API call reopens the database; scheduling survives that restart.
+        assert_eq!(check("head"), ReviewDecision::Skip);
+        mark_reviewed(
+            &path,
+            "owner/repo",
+            42,
+            &metadata_with_timestamp("head", "failed", 0, now - 360),
+        )
+        .unwrap();
+        assert_eq!(check("head"), ReviewDecision::RetryFailed);
+        mark_reviewed(
+            &path,
+            "owner/repo",
+            42,
+            &metadata_with_timestamp("head", "failed", 1, now - 360),
+        )
+        .unwrap();
+        assert_eq!(check("head"), ReviewDecision::Skip);
+    }
+
+    #[test]
+    fn legacy_failed_reviews_get_one_durable_staggered_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.redb");
+        let mut old = metadata_with_timestamp("head", "failed", 100, 100);
+        old.review_retry_version = 0;
+        mark_reviewed(&path, "owner/repo", 42, &old).unwrap();
+        let check = || {
+            should_review_with_retry_limit(
+                &path,
+                "owner/repo",
+                42,
+                "head",
+                "security",
+                STALE_AFTER_SECS,
+                5,
+            )
+            .unwrap()
+        };
+        assert_eq!(check(), ReviewDecision::Skip);
+        let migrated = get_pr_review(&path, "owner/repo", 42, "security")
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.timestamp, 100);
+        assert_eq!(migrated.retry_count, 0);
+        assert_eq!(migrated.review_retry_version, 1);
+        assert!(
+            migrated.retry_not_before.unwrap() > time::OffsetDateTime::now_utc().unix_timestamp()
+        );
+        assert_eq!(check(), ReviewDecision::Skip);
+        assert_eq!(
+            get_pr_review(&path, "owner/repo", 42, "security")
+                .unwrap()
+                .unwrap()
+                .retry_not_before,
+            migrated.retry_not_before
+        );
+        assert_ne!(
+            retry_jitter("owner/repo|1", 3600),
+            retry_jitter("owner/repo|2", 3600)
+        );
     }
 
     #[test]
@@ -1301,7 +1446,13 @@ mod tests {
         let commit = "abcdef";
         let review_kind = "security";
 
-        mark_reviewed(&db_path, repo, pr, &metadata(commit, "failed", 2)).unwrap();
+        mark_reviewed(
+            &db_path,
+            repo,
+            pr,
+            &metadata_with_timestamp(commit, "failed", 2, 0),
+        )
+        .unwrap();
 
         assert_eq!(
             should_review_with_retry_limit(
@@ -1332,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_review_retries_after_retry_limit_cooldown() {
+    fn exhausted_review_requires_a_new_commit_or_explicit_trigger() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("state.redb");
         let repo = "owner/repo";
@@ -1359,7 +1510,7 @@ mod tests {
                 3
             )
             .unwrap(),
-            ReviewDecision::RetryFailed
+            ReviewDecision::Skip
         );
     }
 

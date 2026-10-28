@@ -814,3 +814,18 @@ session ID, submitted candidates/summary, and lane states. Bounded raw lane note
 are stored separately from structured findings. These artifacts are explicitly
 incomplete: no completed-review result is emitted and neither GitHub nor Buzz
 finding disclosure runs. Cleanup of outstanding lanes is bounded and concurrent.
+
+Whole-review retry policy is independent of model/session retries:
+`--max-retries` controls model recovery, while daemon `--max-review-retries`
+(`daemon.max_review_retries` in TOML; NixOS `maxReviewRetries`) defaults to five
+retries after the initial attempt. Failed reviews wait 5, 10, 20, 40, ... minutes,
+capped at six hours plus up to 59 seconds of stable jitter. The persisted attempt
+count and timestamp determine eligibility across restarts. Exhausted reviews wait
+for a fresh trusted mention, a new commit, or an explicit operator-triggered
+review; a fresh mention resets the attempt budget. New commits reset retry history
+but still obey the existing mention gate when that gate applies. Eligible fresh
+work is queued ahead of retries, preserving FIFO within each class.
+
+On upgrade, legacy failed records receive a fresh retry budget and a persisted,
+staggered delay of 5–65 minutes. Their original attempt timestamp is preserved so
+new mentions can override that delay. Repeated restarts do not move this schedule.

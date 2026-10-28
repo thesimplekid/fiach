@@ -240,7 +240,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Maximum number of retries for LLM provider failures and failed review attempts
+        /// Maximum number of retries for LLM provider/session failures
         #[arg(long)]
         max_retries: Option<u32>,
 
@@ -366,9 +366,13 @@ enum Commands {
         #[arg(long)]
         db_path: Option<PathBuf>,
 
-        /// Maximum number of retries for LLM provider failures and failed review attempts
+        /// Maximum number of retries for LLM provider/session failures
         #[arg(long)]
         max_retries: Option<u32>,
+
+        /// Maximum whole-review retries per commit; a fresh trusted mention resets the limit
+        #[arg(long)]
+        max_review_retries: Option<u32>,
 
         /// Initial delay in seconds before retrying an LLM failure
         #[arg(long)]
@@ -755,6 +759,7 @@ async fn main() -> Result<()> {
             timeout_mins,
             db_path,
             max_retries,
+            max_review_retries,
             retry_delay_secs,
             out_dir,
             report_mode,
@@ -909,6 +914,9 @@ async fn main() -> Result<()> {
                     .or(daemon_cfg.db_path)
                     .unwrap_or_else(|| PathBuf::from("fiach.redb")),
                 max_retries: max_retries.or(daemon_cfg.max_retries).unwrap_or(3),
+                max_review_retries: max_review_retries
+                    .or(daemon_cfg.max_review_retries)
+                    .unwrap_or(5),
                 retry_delay_secs: retry_delay_secs
                     .or(daemon_cfg.retry_delay_secs)
                     .unwrap_or(10),

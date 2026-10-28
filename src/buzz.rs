@@ -752,6 +752,8 @@ mod tests {
             disclosure_url: None,
             buzz_thread: None,
             failure_stage: None,
+            review_retry_version: 1,
+            retry_not_before: None,
         }
     }
 

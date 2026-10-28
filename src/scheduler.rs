@@ -23,6 +23,8 @@ pub struct ReviewTarget {
 
 #[derive(Debug, Clone)]
 pub struct ReviewRequest<T> {
+    /// Eligible fresh work is queued ahead of failed whole-review retries.
+    pub is_retry: bool,
     pub target: ReviewTarget,
     pub payload: T,
 }
@@ -283,7 +285,13 @@ async fn run_scheduler<T: Send + 'static>(
                 };
                 jobs.lock().await.insert(id.clone(), snapshot.clone());
                 by_target.insert(submission.request.target.clone(), id.clone());
-                queue.push_back(Queued { id, request: submission.request });
+                let queued = Queued { id, request: submission.request };
+                if queued.request.is_retry {
+                    queue.push_back(queued);
+                } else {
+                    let position = queue.iter().position(|job| job.request.is_retry).unwrap_or(queue.len());
+                    queue.insert(position, queued);
+                }
                 let _ = submission.response.send(Ok(snapshot));
             }
             else => {
@@ -347,6 +355,7 @@ mod tests {
 
     fn request(pr: u64) -> ReviewRequest<u64> {
         ReviewRequest {
+            is_retry: false,
             target: ReviewTarget {
                 repository: "owner/repo".to_string(),
                 pr_number: pr,
@@ -418,5 +427,51 @@ mod tests {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(*order.lock().await, vec![1, 2, 3]);
+    }
+    #[tokio::test]
+    async fn fresh_work_runs_before_queued_retries() {
+        let cancel = CancellationToken::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let handler = Arc::new(move |pr: u64, _: CancellationToken| {
+            let sender = sender.clone();
+            Box::pin(async move {
+                sender.send(pr).unwrap();
+                Ok(ExecutionStatus::Completed)
+            }) as BoxJobFuture
+        });
+        // Keep a separate gate reference for releasing the first worker.
+        let first_gate = Arc::new(tokio::sync::Notify::new());
+        let release = first_gate.clone();
+        let handler = Arc::new(move |pr: u64, token: CancellationToken| {
+            let handler = handler.clone();
+            let first_gate = first_gate.clone();
+            Box::pin(async move {
+                if pr == 1 {
+                    first_gate.notified().await;
+                    return Ok(ExecutionStatus::Completed);
+                }
+                handler(pr, token).await
+            }) as BoxJobFuture
+        });
+        let scheduler = start(1, cancel.clone(), handler);
+        scheduler.submit(request(1)).await.unwrap();
+        let mut retry = request(2);
+        retry.is_retry = true;
+        scheduler.submit(retry).await.unwrap();
+        scheduler.submit(request(3)).await.unwrap();
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        cancel.cancel();
     }
 }
