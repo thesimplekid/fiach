@@ -1822,6 +1822,7 @@ pub async fn run_review(
         "Allocated review cost budget"
     );
     let mut budget_exceeded = false;
+    let finder_started = Instant::now();
     let review_future = async {
         if cost_budget_reached(direct_call_cost_usd, finder_budget) {
             budget_exceeded = true;
@@ -2086,25 +2087,42 @@ pub async fn run_review(
     };
     let review_result = timeout(Duration::from_secs(params.timeout_mins * 60), review_future).await;
     phase_cancel_token.cancel();
+    let stop_reason = match &review_result {
+        Err(_) => Some(reporting::FinderStopReason::Timeout),
+        Ok(Err(_)) => Some(reporting::FinderStopReason::SessionFailure),
+        Ok(Ok(())) if !delegation.recovery.complete().await => {
+            Some(reporting::FinderStopReason::IncompleteLanes)
+        }
+        _ => None,
+    };
     delegation
         .recovery
         .cleanup(&delegation.inner, &delegation_context)
         .await;
+    if let Some(reason) = stop_reason {
+        let artifact = reporting_artifact.lock().await.clone();
+        persist_incomplete_finder(
+            std::path::Path::new(&report_path),
+            &params.repo,
+            params.pr_number,
+            artifact,
+            reporting::FinderFailure {
+                reason,
+                elapsed_secs: finder_started.elapsed().as_secs(),
+                session_id: session_config.id.clone(),
+                lanes: delegation.recovery.snapshots().await,
+            },
+        )?;
+        tracing::warn!(reason = ?reason, path = %report_path, "Preserved incomplete finder artifacts");
+    }
     match review_result {
         Ok(result) => result?,
-        Err(_) => {
-            tracing::warn!(
-                timeout_mins = params.timeout_mins,
-                "Review session timed out"
-            );
-            bail!(
-                "Review session timed out after {} minutes",
-                params.timeout_mins
-            );
-        }
-    };
-
-    if !delegation.recovery.complete().await {
+        Err(_) => bail!(
+            "Review session timed out after {} minutes",
+            params.timeout_mins
+        ),
+    }
+    if stop_reason.is_some() {
         bail!("Finder incomplete: not all delegated lanes completed");
     }
 
@@ -2911,6 +2929,32 @@ fn parse_tool_arguments<T: serde::de::DeserializeOwned>(
         .map(serde_json::Value::Object)
         .context("missing tool arguments")?;
     serde_json::from_value(value).context("invalid tool arguments")
+}
+
+fn persist_incomplete_finder(
+    report_file: &std::path::Path,
+    repo: &str,
+    pr_number: u64,
+    mut artifact: ReportingArtifact,
+    failure: reporting::FinderFailure,
+) -> Result<()> {
+    artifact.finder_failure = Some(failure);
+    if let Some(parent) = report_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Persist authoritative submissions independently of raw lane notes. No
+    // completed-review result is written, so the host cannot finalize/disclose.
+    fs::write(
+        structured_artifact_path(report_file),
+        serde_json::to_vec_pretty(&artifact)?,
+    )
+    .context("Failed to preserve incomplete finder JSON")?;
+    fs::write(
+        report_file,
+        reporting::render_markdown(repo, pr_number, &artifact, None),
+    )
+    .context("Failed to preserve incomplete finder Markdown")?;
+    Ok(())
 }
 
 fn structured_artifact_path(report_file: &std::path::Path) -> PathBuf {
@@ -3840,6 +3884,60 @@ mod tests {
         assert!(!logs.contains("private-secret"));
         assert!(!logs.contains("Authorization"));
         assert!(!logs.contains("password"));
+    }
+
+    #[test]
+    fn incomplete_finder_artifacts_preserve_partial_work_without_disclosure() {
+        for partial in [false, true] {
+            for completed_lane in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("report.md");
+                let artifact = if partial {
+                    duplicate_fixture().0
+                } else {
+                    ReportingArtifact::default()
+                };
+                let expected_count = artifact.findings.len();
+                persist_incomplete_finder(
+                    &path,
+                    "owner/repo",
+                    1,
+                    artifact,
+                    reporting::FinderFailure {
+                        reason: reporting::FinderStopReason::Timeout,
+                        elapsed_secs: 60,
+                        session_id: "test-session".into(),
+                        lanes: vec![reporting::LaneSnapshot {
+                            lane: "persona".into(),
+                            task_id: Some("task".into()),
+                            status: if completed_lane {
+                                reporting::LaneStatus::Completed
+                            } else {
+                                reporting::LaneStatus::Running
+                            },
+                            recovery_attempt: 0,
+                            reason: None,
+                            raw_notes: completed_lane.then(|| "untrusted lane note".into()),
+                        }],
+                    },
+                )
+                .unwrap();
+                let saved: ReportingArtifact =
+                    serde_json::from_slice(&fs::read(structured_artifact_path(&path)).unwrap())
+                        .unwrap();
+                assert!(saved.is_incomplete());
+                assert!(!saved.finder_complete());
+                assert_eq!(saved.findings.len(), expected_count);
+                let failure = saved.finder_failure.as_ref().unwrap();
+                assert_eq!(failure.reason, reporting::FinderStopReason::Timeout);
+                assert_eq!(failure.lanes[0].raw_notes.is_some(), completed_lane);
+                let md = fs::read_to_string(&path).unwrap();
+                assert!(md.contains("notify: false"));
+                assert!(md.contains("Incomplete finder"));
+                assert!(!md.contains("untrusted lane note"));
+                assert!(!dir.path().join("result.json").exists());
+            }
+        }
     }
 
     #[test]

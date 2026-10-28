@@ -9,7 +9,6 @@ use rmcp::{
     ServiceError,
     model::{CallToolResult, ContentBlock as Content, JsonObject},
 };
-use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -18,25 +17,7 @@ use super::{
     summon_error_category, summon_task_status,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum LaneStatus {
-    Pending,
-    Running,
-    Completed,
-    Incomplete,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(super) struct LaneSnapshot {
-    pub lane: String,
-    pub task_id: Option<String>,
-    pub status: LaneStatus,
-    pub recovery_attempt: u32,
-    pub reason: Option<String>,
-    /// Untrusted lane output, never authoritative structured findings.
-    pub raw_notes: Option<String>,
-}
+use crate::reporting::{LaneSnapshot, LaneStatus};
 
 struct Lane {
     snapshot: LaneSnapshot,
@@ -143,14 +124,18 @@ impl Recovery {
         }
     }
 
-    async fn cancel_task(inner: &dyn McpClientTrait, ctx: &ToolCallContext, task: &str) {
+    async fn cancel_task(
+        inner: &dyn McpClientTrait,
+        ctx: &ToolCallContext,
+        task: &str,
+    ) -> CallToolResult {
         // Goose cancels its token, allows five seconds, then aborts the task.
         // Bound the entire call too, including session bookkeeping afterwards.
         let args = serde_json::json!({"source": task, "cancel": true})
             .as_object()
             .cloned()
             .unwrap_or_default();
-        let _ = Self::invoke(
+        Self::invoke(
             inner,
             ctx,
             "load",
@@ -158,7 +143,7 @@ impl Recovery {
             Duration::from_secs(7),
             CancellationToken::new(),
         )
-        .await;
+        .await
     }
 
     pub async fn cleanup(&self, inner: &dyn McpClientTrait, ctx: &ToolCallContext) {
@@ -172,9 +157,42 @@ impl Recovery {
             .collect();
         let mut pending: FuturesUnordered<_> = tasks
             .iter()
-            .map(|task| Self::cancel_task(inner, ctx, task))
+            .map(|task| async move { (task, Self::cancel_task(inner, ctx, task).await) })
             .collect();
-        while pending.next().await.is_some() {}
+        while let Some((task, result)) = pending.next().await {
+            if summon_task_status(&result) == Some("completed")
+                && !call_tool_result_failed(&result)
+                && let Some(lane) = self.tasks.lock().await.get(task).cloned()
+            {
+                self.record_completed(&lane, &result).await;
+            }
+        }
+        for lane in self.lanes.lock().await.values_mut() {
+            if lane.snapshot.status == LaneStatus::Running {
+                lane.snapshot.status = LaneStatus::Incomplete;
+                lane.snapshot.reason = Some("phase_stopped".into());
+            }
+        }
+    }
+
+    async fn record_completed(&self, lane: &str, result: &CallToolResult) {
+        if let Some(record) = self.lanes.lock().await.get_mut(lane) {
+            record.snapshot.status = LaneStatus::Completed;
+            record.snapshot.reason = None;
+            record.snapshot.raw_notes = Some(
+                result
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .flat_map(str::chars)
+                    .take(16_384)
+                    .collect(),
+            );
+            record.result = Some(result.clone());
+        }
     }
 
     async fn start(
@@ -319,7 +337,7 @@ impl Recovery {
             };
             arguments.insert("source".into(), task.clone().into());
             if arguments.get("cancel").and_then(|v| v.as_bool()) == Some(true) {
-                Self::cancel_task(inner, ctx, &task).await;
+                let _ = Self::cancel_task(inner, ctx, &task).await;
                 self.incomplete(&lane, "cancelled").await;
                 return Ok(failure());
             }
@@ -334,24 +352,7 @@ impl Recovery {
             .await;
             let status = summon_task_status(&result);
             if status == Some("completed") && !call_tool_result_failed(&result) {
-                if let Some(record) = self.lanes.lock().await.get_mut(&lane) {
-                    record.snapshot.status = LaneStatus::Completed;
-                    record.snapshot.raw_notes = Some(
-                        result
-                            .content
-                            .iter()
-                            .filter_map(|c| match c {
-                                Content::Text(text) => Some(text.text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                            .chars()
-                            .take(16_384)
-                            .collect(),
-                    );
-                    record.result = Some(result.clone());
-                }
+                self.record_completed(&lane, &result).await;
                 return Ok(result);
             }
             if status == Some("running") {
@@ -364,7 +365,7 @@ impl Recovery {
             if !terminal && waits < 2 {
                 continue;
             }
-            Self::cancel_task(inner, ctx, &task).await;
+            let _ = Self::cancel_task(inner, ctx, &task).await;
             if !self.replace(&lane).await {
                 return Ok(failure());
             }
@@ -592,5 +593,58 @@ mod tests {
             recovery.snapshots().await[0].reason.as_deref(),
             Some("lane_deadline")
         );
+    }
+    #[tokio::test]
+    async fn cleanup_does_not_hang_on_unresponsive_tasks() {
+        struct Hung;
+        #[async_trait::async_trait]
+        impl McpClientTrait for Hung {
+            async fn list_tools(
+                &self,
+                _: &str,
+                _: Option<String>,
+                _: CancellationToken,
+            ) -> Result<ListToolsResult, ServiceError> {
+                Ok(ListToolsResult::default())
+            }
+            async fn call_tool(
+                &self,
+                _: &ToolCallContext,
+                _: &str,
+                _: Option<JsonObject>,
+                _: CancellationToken,
+            ) -> Result<CallToolResult, ServiceError> {
+                std::future::pending().await
+            }
+            fn get_info(&self) -> Option<&InitializeResult> {
+                None
+            }
+        }
+        let (recovery, inner, ctx) =
+            setup(vec![result("one", "running"), result("two", "running")]);
+        delegate(&recovery, &inner, &ctx, "persona").await;
+        delegate(&recovery, &inner, &ctx, "security").await;
+        tokio::time::timeout(Duration::from_secs(9), recovery.cleanup(&Hung, &ctx))
+            .await
+            .unwrap();
+        assert!(
+            recovery
+                .snapshots()
+                .await
+                .iter()
+                .all(|lane| lane.status == LaneStatus::Incomplete)
+        );
+    }
+    #[tokio::test]
+    async fn cleanup_preserves_completed_but_uncollected_lane_notes() {
+        let (recovery, inner, ctx) =
+            setup(vec![result("one", "running"), result("one", "completed")]);
+        delegate(&recovery, &inner, &ctx, "persona").await;
+        recovery.cleanup(&inner, &ctx).await;
+        let snapshots = recovery.snapshots().await;
+        assert_eq!(snapshots[0].status, LaneStatus::Completed);
+        assert_eq!(snapshots[0].raw_notes.as_deref(), Some("lane notes"));
+        assert_eq!(snapshots[1].status, LaneStatus::Pending);
+        assert!(!recovery.complete().await);
     }
 }

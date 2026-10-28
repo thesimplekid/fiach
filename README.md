@@ -806,3 +806,11 @@ uncollected work after four such intervals. Goose cancellation allows five secon
 before abort, with a seven-second host bound including bookkeeping. Completed
 lanes remain available when another lane fails. A missing, cancelled, or exhausted
 lane makes the review incomplete and prevents disclosure.
+
+Finder timeouts and other incomplete finder exits preserve `report.md` and its
+structured JSON sibling in the normal report location (the per-run artifact
+directory for sandbox reviews). The JSON records the stop reason, elapsed time,
+session ID, submitted candidates/summary, and lane states. Bounded raw lane notes
+are stored separately from structured findings. These artifacts are explicitly
+incomplete: no completed-review result is emitted and neither GitHub nor Buzz
+finding disclosure runs. Cleanup of outstanding lanes is bounded and concurrent.

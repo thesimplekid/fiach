@@ -15,6 +15,9 @@ pub enum ReviewPhase {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReportingArtifact {
+    /// Host-recorded finder stop; never supplied by reporting tools.
+    #[serde(default)]
+    pub finder_failure: Option<FinderFailure>,
     /// Host routing decisions, never findings or evidence that a lane completed.
     #[serde(default)]
     pub lane_selection: Vec<LaneSelectionDecision>,
@@ -40,6 +43,42 @@ pub struct ReportingArtifact {
     /// cannot observe.
     #[serde(default)]
     pub verifier_inspections: Option<Vec<InspectionRecord>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneStatus {
+    Pending,
+    Running,
+    Completed,
+    Incomplete,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneSnapshot {
+    pub lane: String,
+    pub task_id: Option<String>,
+    pub status: LaneStatus,
+    pub recovery_attempt: u32,
+    pub reason: Option<String>,
+    /// Untrusted lane output, never authoritative structured findings.
+    pub raw_notes: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinderStopReason {
+    Timeout,
+    SessionFailure,
+    IncompleteLanes,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FinderFailure {
+    pub reason: FinderStopReason,
+    pub elapsed_secs: u64,
+    pub session_id: String,
+    pub lanes: Vec<LaneSnapshot>,
 }
 
 /// One successful inspect call, recorded by the host rather than reported
@@ -71,11 +110,11 @@ pub struct LaneSelectionDecision {
 
 impl ReportingArtifact {
     pub fn is_incomplete(&self) -> bool {
-        self.verifier_failed || self.budget_exhausted.is_some()
+        self.finder_failure.is_some() || self.verifier_failed || self.budget_exhausted.is_some()
     }
 
     pub fn finder_complete(&self) -> bool {
-        self.no_findings.is_some() || !self.findings.is_empty()
+        self.finder_failure.is_none() && (self.no_findings.is_some() || !self.findings.is_empty())
     }
 
     pub fn finder_complete_with_summary(&self, require_summary: bool) -> bool {
@@ -907,6 +946,15 @@ findings_count: {findings_count}
             .collect::<Vec<_>>()
             .join(", "),
     );
+    if let Some(failure) = &artifact.finder_failure {
+        out.push_str(&format!("\n## Incomplete finder execution\n\nReason: `{:?}`. Elapsed: {} seconds. Session: `{}`.\nCandidates and lane notes in the JSON artifact are unverified.\n", failure.reason, failure.elapsed_secs, failure.session_id));
+        for lane in &failure.lanes {
+            out.push_str(&format!(
+                "- {}: {:?} (replacement attempts: {})\n",
+                lane.lane, lane.status, lane.recovery_attempt
+            ));
+        }
+    }
 
     if let Some(summary) = &artifact.pr_summary {
         out.push_str("## Pull Request Summary\n\n");
@@ -1268,6 +1316,9 @@ fn markdown_title(
     accepted: &[AcceptedFinding],
     already_reported: &[AcceptedFinding],
 ) -> String {
+    if artifact.finder_failure.is_some() {
+        return "Incomplete finder review".to_string();
+    }
     if artifact.budget_exhausted.is_some() {
         return "Incomplete review: cost budget exhausted".to_string();
     }
