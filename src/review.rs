@@ -787,6 +787,7 @@ struct SummonLaneLogState {
     delegate_calls: HashMap<String, PendingSummonCall>,
     load_calls: HashMap<String, PendingSummonCall>,
     task_lanes: HashMap<String, String>,
+    lane_attempts: HashMap<String, u32>,
 }
 
 struct SummonLogContext<'a> {
@@ -819,8 +820,41 @@ fn extract_subagent_task_id(result: &CallToolResult) -> Option<String> {
     })
 }
 
+/// Only fixed diagnostic labels leave this boundary. Raw provider/model text may
+/// contain credentials, checkout content, or attacker-controlled instructions.
+fn summon_error_category(result: &CallToolResult) -> &'static str {
+    match summon_task_status(result) {
+        Some("failed" | "panicked") => return "task_failure",
+        Some("cancelled") => return "cancelled",
+        _ => {}
+    }
+    for content in result.content.iter().take(8) {
+        let Content::Text(text) = content else { continue };
+        let prefix: String = text.text.chars().take(2048).collect();
+        let prefix = prefix.to_ascii_lowercase();
+        if prefix.contains("still running after waiting") {
+            return "waiting_timeout";
+        }
+        if prefix.contains("unknown tool") || prefix.contains("invalid tool") {
+            return "invalid_tool_call";
+        }
+        if prefix.contains("provider") || prefix.contains("rate limit") {
+            return "provider_failure";
+        }
+        if prefix.contains("cancelled") || prefix.contains("canceled") {
+            return "cancelled";
+        }
+    }
+    "unknown"
+}
+
+fn summon_task_status(result: &CallToolResult) -> Option<&str> {
+    result.meta.as_ref()?.0.get("task_status")?.as_str()
+}
+
 fn call_tool_result_failed(result: &CallToolResult) -> bool {
     result.is_error.unwrap_or(false)
+        || matches!(summon_task_status(result), Some("failed" | "panicked" | "cancelled"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1044,8 +1078,10 @@ fn log_summon_tool_activity(
                         "Summon delegate started"
                     );
                 }
-                Ok(_) => {
+                Ok(result) => {
                     tracing::warn!(
+                        error_category = summon_error_category(result),
+                        recovery_attempt = pending.lane.as_ref().and_then(|lane| state.lane_attempts.get(lane)).copied().unwrap_or(1).saturating_sub(1),
                         repo = %context.repo,
                         pr = context.pr_number,
                         review_kind = %context.review_kind,
@@ -1057,8 +1093,10 @@ fn log_summon_tool_activity(
                         "Summon delegate returned an error"
                     );
                 }
-                Err(error) => {
+                Err(_error) => {
                     tracing::warn!(
+                        error_category = "transport_error",
+                        recovery_attempt = pending.lane.as_ref().and_then(|lane| state.lane_attempts.get(lane)).copied().unwrap_or(1).saturating_sub(1),
                         repo = %context.repo,
                         pr = context.pr_number,
                         review_kind = %context.review_kind,
@@ -1067,7 +1105,6 @@ fn log_summon_tool_activity(
                         tool_call_id = %response.id,
                         lane = ?pending.lane,
                         source = ?pending.source,
-                        error = %error,
                         "Summon delegate failed"
                     );
                 }
@@ -1146,8 +1183,10 @@ fn log_summon_tool_activity(
                         }
                     }
                 }
-                Ok(_) => {
+                Ok(result) => {
                     tracing::warn!(
+                        error_category = summon_error_category(result),
+                        recovery_attempt = pending.lane.as_ref().and_then(|lane| state.lane_attempts.get(lane)).copied().unwrap_or(1).saturating_sub(1),
                         repo = %context.repo,
                         pr = context.pr_number,
                         review_kind = %context.review_kind,
@@ -1161,8 +1200,10 @@ fn log_summon_tool_activity(
                         "Summon load returned an error"
                     );
                 }
-                Err(error) => {
+                Err(_error) => {
                     tracing::warn!(
+                        error_category = "transport_error",
+                        recovery_attempt = pending.lane.as_ref().and_then(|lane| state.lane_attempts.get(lane)).copied().unwrap_or(1).saturating_sub(1),
                         repo = %context.repo,
                         pr = context.pr_number,
                         review_kind = %context.review_kind,
@@ -1173,7 +1214,6 @@ fn log_summon_tool_activity(
                         source = ?pending.source,
                         peek = pending.peek,
                         cancel = pending.cancel,
-                        error = %error,
                         "Summon load failed"
                     );
                 }
@@ -1195,10 +1235,12 @@ fn log_summon_tool_request(
     match kind {
         "delegate" => {
             let lane = infer_review_lane(args, context.review_lanes);
-            let source = arg_str(args, "source");
+            if let Some(lane) = &lane {
+                *state.lane_attempts.entry(lane.clone()).or_default() += 1;
+            }
+            let source: Option<String> = None;
             let async_requested = arg_bool(args, "async").unwrap_or(false);
             let max_turns = arg_u64(args, "max_turns");
-            let working_dir = arg_str(args, "working_dir");
             let has_instructions = arg_str(args, "instructions").is_some();
             state.delegate_calls.insert(
                 tool_call_id.to_string(),
@@ -1221,13 +1263,14 @@ fn log_summon_tool_request(
                 source = ?source,
                 async_requested = async_requested,
                 max_turns = ?max_turns,
-                working_dir = ?working_dir,
                 has_instructions = has_instructions,
                 "Summon delegate requested"
             );
         }
         "load" => {
-            let source = arg_str(args, "source");
+            let source = arg_str(args, "source").filter(|source| {
+                state.task_lanes.contains_key(source) || context.review_lanes.contains(source)
+            });
             let peek = arg_bool(args, "peek").unwrap_or(false);
             let cancel = arg_bool(args, "cancel").unwrap_or(false);
             let lane = source.as_deref().and_then(|source| {
@@ -3717,6 +3760,93 @@ impl<'a> ReplyRetry<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn summon_logs_distinguish_marked_and_transport_errors_without_raw_payloads() {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut state = SummonLaneLogState::default();
+            state.task_lanes.insert("task".into(), "persona".into());
+            state.lane_attempts.insert("persona".into(), 2);
+            for result in [
+                Ok(CallToolResult::error(vec![Content::text(
+                    "Provider failure Authorization: Bearer private-secret",
+                )])),
+                Err(rmcp::model::ErrorData::internal_error(
+                    "transport password=private-secret",
+                    None,
+                )),
+            ] {
+                state.load_calls.insert(
+                    "load-call".into(),
+                    PendingSummonCall {
+                        source: Some("task".into()),
+                        lane: Some("persona".into()),
+                        peek: false,
+                        cancel: false,
+                    },
+                );
+                log_summon_tool_activity(
+                    &Message::user().with_tool_response("load-call", result),
+                    &mut state,
+                    SummonLogContext {
+                        repo: "owner/repo",
+                        pr_number: 1,
+                        review_kind: "default",
+                        phase: "finder",
+                        session_id: "session",
+                        review_lanes: &["persona".into()],
+                    },
+                );
+            }
+        });
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("provider_failure"));
+        assert!(logs.contains("transport_error"));
+        assert!(logs.contains("recovery_attempt=1"));
+        assert!(logs.contains("persona"));
+        assert!(!logs.contains("private-secret"));
+        assert!(!logs.contains("Authorization"));
+        assert!(!logs.contains("password"));
+    }
+
+    #[test]
+    fn summon_diagnostics_are_bounded_and_do_not_echo_secrets() {
+        for (text, expected) in [
+            ("Task 'x' is still running after waiting 5 min", "waiting_timeout"),
+            ("Unknown tool read_text secret=sk-live-private", "invalid_tool_call"),
+            ("Provider error Authorization: Bearer private", "provider_failure"),
+            ("cancelled password=private", "cancelled"),
+            ("{malformed secret=private", "unknown"),
+        ] {
+            let result = CallToolResult::error(vec![Content::text(text)]);
+            assert!(call_tool_result_failed(&result));
+            assert_eq!(summon_error_category(&result), expected);
+        }
+        let long = format!("{}provider secret", "é".repeat(2048));
+        assert_eq!(summon_error_category(&CallToolResult::error(vec![Content::text(long)])), "unknown");
+        let mut result = CallToolResult::success(vec![]);
+        result.meta = Some(serde_json::from_value(serde_json::json!({"task_status": "failed"})).unwrap());
+        assert!(call_tool_result_failed(&result));
+        assert_eq!(summon_error_category(&result), "task_failure");
+    }
+
     use super::*;
 
     #[test]
