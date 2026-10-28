@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +33,8 @@ use crate::process::CommandExt as _;
 use crate::reporting::{self, ReportingArtifact, ReviewPhase};
 use crate::state;
 use crate::workspace;
+
+mod delegation;
 
 const SANDBOX_SKILLS_DIR: &str = "/etc/fiach/skills";
 const MAX_BUZZ_REVIEW_EVIDENCE_BYTES: usize = 256 * 1024;
@@ -711,12 +713,12 @@ fn review_lane_prompt(
     const LANES: &str = r#"REVIEW LANES:
 {lane_list}
 
-Use `delegate` with `async: true`, then `load(source: task_id)` to collect each result. Run at most {max_review_lanes} delegates concurrently, batching until all lanes finish. For each delegate, set `extensions` to `["fiach-inspection"]`, use the prepared checkout, and begin its instructions with `Review lane: <lane>`. Pass its focus and these execution rules explicitly; delegates do not inherit your prompt.
+Use `delegate` with `async: true`, then `load(source: task_id)` to collect each result. Run at most {max_review_lanes} delegates concurrently, batching until all lanes finish. For each delegate, set `extensions` to `["fiach-inspection"]`, use the prepared checkout, and begin its instructions with `Review lane: <lane>` on its own line. Pass its focus and these execution rules explicitly; delegates do not inherit your prompt.
 Delegates read domain skills through `inspect(operation: "read", path: <skill path>)`. They cannot delegate further, call reporting tools, modify files, run tests/builds/compilers/interpreters, or disclose. Read `.pr_diff.txt` with inspect; use its files/search operations to explore and diff operation for the pinned incremental scope starting at {diff_base}. No shell or repository scripts are available.
 {summary_instructions}
 Non-summary lanes return JSON: {"status":"candidates","candidates":[...]} or {"status":"no_findings","candidates":[],"summary":"...","skills_used":[...]}.
 Candidate fields: title, severity, confidence, affected_locations, evidence, skills_used, body_markdown. Include the changed code that introduces a failure or materially worsens its reachability or impact, a concrete base-versus-PR comparison, and a concrete fix.
-After all results are loaded, you are the only agent that synthesizes and submits. Wait until every lane candidate has either been retained or discarded with a reason. Merge same-root-cause candidates across {candidate_lane_names}, preserving evidence and contributing skills. Require an affected PR diff location, discard unsupported claims, and add `lane:<name>` provenance. Submit candidates with submit_finding or a combined submit_no_findings result. Preserve every contributing domain skill and lane even for no-findings results. A failed or missing lane is incomplete work, never a no-findings result; retry it or report the execution failure."#;
+After all results are loaded, you are the only agent that synthesizes and submits. Wait until every lane candidate has either been retained or discarded with a reason. Merge same-root-cause candidates across {candidate_lane_names}, preserving evidence and contributing skills. Require an affected PR diff location, discard unsupported claims, and add `lane:<name>` provenance. Submit candidates with submit_finding or a combined submit_no_findings result. Preserve every contributing domain skill and lane even for no-findings results. A failed or missing lane is incomplete work, never a no-findings result; load its existing task to allow host recovery, or report the execution failure. The host permits one replacement per lane; do not start replacement delegates yourself."#;
     LANES
         .replace("{lane_list}", &lane_list)
         .replace("{max_review_lanes}", &max_review_lanes.to_string())
@@ -829,10 +831,15 @@ fn summon_error_category(result: &CallToolResult) -> &'static str {
         _ => {}
     }
     for content in result.content.iter().take(8) {
-        let Content::Text(text) = content else { continue };
+        let Content::Text(text) = content else {
+            continue;
+        };
         let prefix: String = text.text.chars().take(2048).collect();
         let prefix = prefix.to_ascii_lowercase();
-        if prefix.contains("still running after waiting") {
+        if prefix == "transport_error" {
+            return "transport_error";
+        }
+        if prefix == "host_wait_timeout" || prefix.contains("still running after waiting") {
             return "waiting_timeout";
         }
         if prefix.contains("unknown tool") || prefix.contains("invalid tool") {
@@ -854,7 +861,10 @@ fn summon_task_status(result: &CallToolResult) -> Option<&str> {
 
 fn call_tool_result_failed(result: &CallToolResult) -> bool {
     result.is_error.unwrap_or(false)
-        || matches!(summon_task_status(result), Some("failed" | "panicked" | "cancelled"))
+        || matches!(
+            summon_task_status(result),
+            Some("failed" | "panicked" | "cancelled")
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1719,7 +1729,6 @@ pub async fn run_review(
         &diff_base,
         &workspace.commit_hash,
     )?;
-    add_finder_extensions(&agent, &session.id, inspection).await?;
 
     let selection = crate::lane_selection::select(
         &workspace.path,
@@ -1741,6 +1750,19 @@ pub async fn run_review(
     }
     reporting_artifact.lock().await.lane_selection = selection.decisions;
     let normalized_review_lanes = selection.lanes;
+    // Four bounded waits plus cancellation fit well inside the finder deadline.
+    let lane_attempt_timeout =
+        Duration::from_secs((params.timeout_mins.saturating_mul(60) / 8).clamp(1, 150));
+    let delegation = add_finder_extensions(
+        &agent,
+        &session.id,
+        inspection,
+        &effective_review_lanes(&normalized_review_lanes),
+        lane_attempt_timeout,
+    )
+    .await?;
+    let delegation_context =
+        ToolCallContext::new(session.id.clone(), Some(workspace.path.clone()), None);
 
     // 7. Construct the user message — agent is already in the checked-out PR workspace
     let lane_prompt = review_lane_prompt(
@@ -1824,8 +1846,14 @@ pub async fn run_review(
         let mut stream = retry.start(user_message.clone()).await?;
 
         let mut budget_poll = tokio::time::interval(Duration::from_secs(1));
+        let mut recovery_poll = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
+                _ = recovery_poll.tick() => {
+                    if delegation.recovery.exhausted().await {
+                        bail!("Finder incomplete: delegated lane recovery exhausted");
+                    }
+                }
                 _ = budget_poll.tick(), if finder_budget.is_some() => {
                     if let Ok(totals) = agent.config.session_manager
                         .get_session_usage_totals(&session_config.id).await
@@ -2058,6 +2086,10 @@ pub async fn run_review(
     };
     let review_result = timeout(Duration::from_secs(params.timeout_mins * 60), review_future).await;
     phase_cancel_token.cancel();
+    delegation
+        .recovery
+        .cleanup(&delegation.inner, &delegation_context)
+        .await;
     match review_result {
         Ok(result) => result?,
         Err(_) => {
@@ -2071,6 +2103,10 @@ pub async fn run_review(
             );
         }
     };
+
+    if !delegation.recovery.complete().await {
+        bail!("Finder incomplete: not all delegated lanes completed");
+    }
 
     let mut finder_usage = SessionUsageSnapshot::default();
     // Collect finder metrics before verification and coordinator continuation.
@@ -2548,7 +2584,7 @@ impl McpClientTrait for ReportingClient {
 
 struct FinderDelegationClient {
     inner: goose::agents::platform_extensions::summon::SummonClient,
-    tasks: Mutex<HashSet<String>>,
+    recovery: delegation::Recovery,
 }
 
 fn finder_delegate_arguments(mut arguments: JsonObject) -> Result<JsonObject> {
@@ -2628,45 +2664,23 @@ impl McpClientTrait for FinderDelegationClient {
     ) -> std::result::Result<CallToolResult, ServiceError> {
         let arguments = match name {
             "delegate" => match finder_delegate_arguments(arguments.unwrap_or_default()) {
-                Ok(arguments) => Some(arguments),
+                Ok(arguments) => arguments,
                 Err(error) => {
                     return Ok(CallToolResult::error(vec![Content::text(
                         error.to_string(),
                     )]));
                 }
             },
-            "load" => {
-                let source = arguments
-                    .as_ref()
-                    .and_then(|args| args.get("source"))
-                    .and_then(|value| value.as_str());
-                if !match source {
-                    Some(source) => self.tasks.lock().await.contains(source),
-                    None => false,
-                } {
-                    return Ok(CallToolResult::error(vec![Content::text(
-                        "Load requires a task ID created by this review; read skills with inspect",
-                    )]));
-                }
-                arguments
-            }
+            "load" => arguments.unwrap_or_default(),
             _ => {
                 return Ok(CallToolResult::error(vec![Content::text(
                     "Unknown finder delegation tool",
                 )]));
             }
         };
-        let result = self.inner.call_tool(ctx, name, arguments, cancel).await?;
-        if name == "delegate"
-            && let Some(task) = result
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.0.get("subagent_session_id"))
-                .and_then(|value| value.as_str())
-        {
-            self.tasks.lock().await.insert(task.to_owned());
-        }
-        Ok(result)
+        self.recovery
+            .call(&self.inner, ctx, name, arguments, cancel)
+            .await
     }
     fn get_info(&self) -> Option<&InitializeResult> {
         None
@@ -2680,7 +2694,9 @@ async fn add_finder_extensions(
     agent: &Agent,
     session_id: &str,
     inspection: crate::inspection::Inspection,
-) -> Result<()> {
+    lanes: &[String],
+    attempt_timeout: Duration,
+) -> Result<Arc<FinderDelegationClient>> {
     let config = inspection
         .extension_config(&std::env::current_exe().context("Cannot locate Fiach executable")?);
     agent
@@ -2694,10 +2710,10 @@ async fn add_finder_extensions(
         .await;
     let mut context = agent.extension_manager.get_context().clone();
     context.extension_manager = Some(Arc::downgrade(&agent.extension_manager));
-    let delegation = FinderDelegationClient {
+    let delegation = Arc::new(FinderDelegationClient {
         inner: goose::agents::platform_extensions::summon::SummonClient::new(context)?,
-        tasks: Mutex::new(HashSet::new()),
-    };
+        recovery: delegation::Recovery::new(lanes, attempt_timeout),
+    });
     agent
         .extension_manager
         .add_client(
@@ -2709,14 +2725,14 @@ async fn add_finder_extensions(
                 bundled: Some(true),
                 available_tools: vec!["delegate".into(), "load".into()],
             },
-            Arc::new(delegation),
+            delegation.clone(),
             None,
         )
         .await;
     // Summon constructs lane clients from this persisted configuration. The
     // inspection entry is executable stdio configuration, not an unknown platform.
     agent.persist_extension_state(session_id).await?;
-    Ok(())
+    Ok(delegation)
 }
 
 async fn add_reporting_extension(
@@ -3829,9 +3845,18 @@ mod tests {
     #[test]
     fn summon_diagnostics_are_bounded_and_do_not_echo_secrets() {
         for (text, expected) in [
-            ("Task 'x' is still running after waiting 5 min", "waiting_timeout"),
-            ("Unknown tool read_text secret=sk-live-private", "invalid_tool_call"),
-            ("Provider error Authorization: Bearer private", "provider_failure"),
+            (
+                "Task 'x' is still running after waiting 5 min",
+                "waiting_timeout",
+            ),
+            (
+                "Unknown tool read_text secret=sk-live-private",
+                "invalid_tool_call",
+            ),
+            (
+                "Provider error Authorization: Bearer private",
+                "provider_failure",
+            ),
             ("cancelled password=private", "cancelled"),
             ("{malformed secret=private", "unknown"),
         ] {
@@ -3840,9 +3865,13 @@ mod tests {
             assert_eq!(summon_error_category(&result), expected);
         }
         let long = format!("{}provider secret", "é".repeat(2048));
-        assert_eq!(summon_error_category(&CallToolResult::error(vec![Content::text(long)])), "unknown");
+        assert_eq!(
+            summon_error_category(&CallToolResult::error(vec![Content::text(long)])),
+            "unknown"
+        );
         let mut result = CallToolResult::success(vec![]);
-        result.meta = Some(serde_json::from_value(serde_json::json!({"task_status": "failed"})).unwrap());
+        result.meta =
+            Some(serde_json::from_value(serde_json::json!({"task_status": "failed"})).unwrap());
         assert!(call_tool_result_failed(&result));
         assert_eq!(summon_error_category(&result), "task_failure");
     }
@@ -4476,9 +4505,15 @@ Reviewed the PR and found no vulnerabilities.
             Arc::new(Mutex::new(ReportingArtifact::default())),
         )
         .await;
-        add_finder_extensions(&finder, &session, inspection)
-            .await
-            .unwrap();
+        add_finder_extensions(
+            &finder,
+            &session,
+            inspection,
+            &["persona".into()],
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         let names: Vec<_> = finder
             .list_tools(&session, None)
             .await

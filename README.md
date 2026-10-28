@@ -797,3 +797,12 @@ This lets NixOS/systemd deployments keep using bundled skills such as `rust-secu
 - `src/workspace.rs`: Manages cloning the repo and checking out the PR into a temporary directory.
 - `src/disclose.rs`: Handles the `ReportMode` logic (commenting or creating Sync PRs).
 - `src/state.rs`: Typed, versioned, async redb state adapter.
+
+Delegated review lanes have host-enforced recovery. Each selected lane may start
+once and receive at most one replacement. Two unsuccessful waits (or one terminal
+task failure) trigger cancellation before replacement. Each wait is bounded by
+one eighth of the finder deadline, capped at 150 seconds; a lane watchdog stops
+uncollected work after four such intervals. Goose cancellation allows five seconds
+before abort, with a seven-second host bound including bookkeeping. Completed
+lanes remain available when another lane fails. A missing, cancelled, or exhausted
+lane makes the review incomplete and prevents disclosure.
