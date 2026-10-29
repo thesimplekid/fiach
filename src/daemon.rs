@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::disclose::DiscloseConfig;
 use crate::execution::{ReviewExecutor, ReviewOutcome};
 use crate::finalizer::{FinalizationSpec, ReviewFinalizer};
-use crate::github::{DiscoveryRequest, GhCli, GitHub, PullRequestSummary};
+use crate::forge::{DiscoveryRequest, PullRequestSummary};
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
 use crate::review::{CompletedReview, ReviewExecution, ReviewParams};
 use crate::scheduler::{
@@ -298,7 +298,10 @@ pub fn start_review_scheduler(
                 let status = match work {
                     DaemonWork::Generated { repo, job } => {
                         // Re-read lifecycle and head before starting a queued generated review.
-                        let context = GhCli::default().pr_context(&repo, job.pr.number).await?;
+                        let context = crate::forge::client(&repo)?
+                            .adapter()
+                            .pr_context(&repo, job.pr.number)
+                            .await?;
                         if context["state"].as_str() != Some("OPEN")
                             || context["headRefOid"].as_str() != Some(&job.pr.head_ref_oid)
                         {
@@ -375,81 +378,10 @@ fn is_allowed_author_association(association: &str, allowed: &[String]) -> bool 
         .any(|allowed| allowed.eq_ignore_ascii_case(association))
 }
 
-fn split_repo_name(repo: &str) -> Result<(&str, &str)> {
-    match repo.split_once('/') {
-        Some((owner, name)) if !owner.is_empty() && !name.is_empty() => Ok((owner, name)),
-        _ => anyhow::bail!("Repository must be in owner/name form: {repo}"),
-    }
-}
-
-fn build_author_associations_query(numbers: &[u64]) -> String {
-    let mut query = String::from(
-        "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {",
-    );
-
-    for number in numbers {
-        query.push_str(&format!(
-            " pr{number}: pullRequest(number: {number}) {{ authorAssociation }}"
-        ));
-    }
-
-    query.push_str(" } }");
-    query
-}
-
-#[derive(Deserialize)]
-struct AuthorAssociationsResponse {
-    data: AuthorAssociationsData,
-}
-
-#[derive(Deserialize)]
-struct AuthorAssociationsData {
-    repository: HashMap<String, Option<AuthorAssociationPullRequest>>,
-}
-
-#[derive(Deserialize)]
-struct AuthorAssociationPullRequest {
-    #[serde(rename = "authorAssociation")]
-    author_association: String,
-}
-
 async fn fetch_author_associations(repo: &str, numbers: &[u64]) -> Result<HashMap<u64, String>> {
-    let (owner, name) = split_repo_name(repo)?;
-    let mut associations = HashMap::new();
-
-    for chunk in numbers.chunks(50) {
-        let query = build_author_associations_query(chunk);
-        let output = Command::new("gh")
-            .args(["api", "graphql", "-f", &format!("owner={owner}")])
-            .args(["-f", &format!("name={name}")])
-            .args(["-f", &format!("query={query}")])
-            .output_bounded("loading pull request author associations")
-            .await
-            .context("Failed to run gh api graphql")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh api graphql failed for {repo}: {stderr}");
-        }
-
-        let response: AuthorAssociationsResponse = serde_json::from_slice(&output.stdout)
-            .context("Failed to parse author association GraphQL response")?;
-
-        for (alias, pr) in response.data.repository {
-            let Some(number) = alias
-                .strip_prefix("pr")
-                .and_then(|number| number.parse::<u64>().ok())
-            else {
-                continue;
-            };
-
-            if let Some(pr) = pr {
-                associations.insert(number, pr.author_association);
-            }
-        }
-    }
-
-    Ok(associations)
+    crate::forge::client(repo)?
+        .author_associations(repo, numbers)
+        .await
 }
 
 async fn populate_author_associations(repo: &str, prs: &mut [PullRequest]) -> Result<()> {
@@ -661,8 +593,6 @@ fn pr_list_state_arg(state: &str) -> String {
     }
 }
 
-const MENTION_PR_VIEW_JSON_FIELDS: &str = "author,body,createdAt,comments,reviews";
-
 #[derive(Debug, Deserialize)]
 struct MentionAuthor {
     login: String,
@@ -697,26 +627,11 @@ struct PrMentionDetails {
 }
 
 async fn fetch_pr_mention_details(repo: &str, pr_number: u64) -> Result<PrMentionDetails> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_number.to_string(),
-            "--repo",
-            repo,
-            "--json",
-            MENTION_PR_VIEW_JSON_FIELDS,
-        ])
-        .output_bounded("loading pull request mention details")
-        .await
-        .context("Failed to run gh pr view for mention details")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("gh pr view failed for {repo}#{pr_number}: {stderr}");
-    }
-
-    serde_json::from_slice(&output.stdout).context("Failed to parse PR mention details")
+    let value = crate::forge::client(repo)?
+        .adapter()
+        .discussion(repo, pr_number)
+        .await?;
+    serde_json::from_value(value).context("Failed to parse PR mention details")
 }
 
 pub(crate) fn mention_matches(text: &str, username: &str) -> bool {
@@ -887,6 +802,9 @@ pub async fn run_daemon(
         anyhow::bail!("No repositories specified to monitor");
     }
 
+    for repo in &repo_list {
+        crate::forge::client(repo)?;
+    }
     validate_sandbox_network_capacity(&params)?;
 
     let question_listener = params
@@ -914,18 +832,23 @@ pub async fn run_daemon(
             })
         });
 
-    // Ensure gh is authenticated
-    let gh_auth = Command::new("gh")
-        .arg("auth")
-        .arg("setup-git")
-        .output_bounded("configuring Git authentication")
-        .await;
-    if let Err(e) = gh_auth {
-        tracing::warn!("Failed to run gh auth setup-git: {}", e);
+    if repo_list
+        .iter()
+        .chain(params.disclose_config.sync_repo.iter())
+        .any(|repo| !repo.starts_with("https://"))
+    {
+        // Ensure gh is authenticated
+        let gh_auth = Command::new("gh")
+            .arg("auth")
+            .arg("setup-git")
+            .output_bounded("configuring Git authentication")
+            .await;
+        if let Err(e) = gh_auth {
+            tracing::warn!("Failed to run gh auth setup-git: {}", e);
+        }
     }
 
     let sleep_duration = Duration::from_secs(params.interval);
-    let github = GhCli::default();
     let (discovery_sender, discoveries) = tokio::sync::watch::channel(Vec::new());
     let submitter_cancel = cancel_token.child_token();
     let _submitter_guard = submitter_cancel.clone().drop_guard();
@@ -951,6 +874,7 @@ pub async fn run_daemon(
 
             tracing::debug!(repo = %repo, "Checking for open PRs");
 
+            let forge = crate::forge::client(repo)?;
             for state in &params.pr_states {
                 if cancel_token.is_cancelled() {
                     break;
@@ -965,7 +889,8 @@ pub async fn run_daemon(
                 );
 
                 let list_state = pr_list_state_arg(state);
-                match github
+                match forge
+                    .adapter()
                     .discover(DiscoveryRequest {
                         repository: repo,
                         state: &list_state,
@@ -1541,23 +1466,10 @@ async fn trigger_manual_review(
 ) -> Result<PrProcessStatus> {
     tracing::info!(repo = %repo, pr = pr_number, "Fetching manual PR details");
 
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_number.to_string(),
-            "--repo",
-            &repo,
-            "--json",
-            "headRefOid,headRefName,title",
-        ])
-        .output_bounded("loading a manually requested pull request")
+    let context = crate::forge::client(&repo)?
+        .adapter()
+        .pr_context(&repo, pr_number)
         .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to fetch PR details: {}", stderr);
-    }
 
     #[derive(Deserialize)]
     struct PrDetails {
@@ -1569,7 +1481,7 @@ async fn trigger_manual_review(
     }
 
     let pr_details: PrDetails =
-        serde_json::from_slice(&output.stdout).context("Failed to parse PR details")?;
+        serde_json::from_value(context).context("Failed to parse PR details")?;
     let mut associations = fetch_author_associations(&repo, &[pr_number]).await?;
     let author_association = associations
         .remove(&pr_number)
@@ -2752,23 +2664,6 @@ mod tests {
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].review_kind, "security");
-    }
-
-    #[test]
-    fn split_repo_name_requires_owner_and_name() {
-        assert_eq!(split_repo_name("owner/repo").unwrap(), ("owner", "repo"));
-        assert!(split_repo_name("owner").is_err());
-        assert!(split_repo_name("/repo").is_err());
-        assert!(split_repo_name("owner/").is_err());
-    }
-
-    #[test]
-    fn author_associations_query_uses_pr_aliases() {
-        let query = build_author_associations_query(&[1, 42]);
-
-        assert!(query.contains("repository(owner: $owner, name: $name)"));
-        assert!(query.contains("pr1: pullRequest(number: 1) { authorAssociation }"));
-        assert!(query.contains("pr42: pullRequest(number: 42) { authorAssociation }"));
     }
 
     #[test]

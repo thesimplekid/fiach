@@ -175,7 +175,7 @@ enum Commands {
     },
     /// Run a review for a single PR
     Review {
-        /// GitHub repository to review (e.g., "org/repo")
+        /// Repository: owner/name for GitHub or https://host/owner/name for Forgejo
         #[arg(long)]
         repo: String,
 
@@ -310,7 +310,7 @@ enum Commands {
     },
     /// Run as a daemon that polls for open PRs
     Daemon {
-        /// Comma-separated list of GitHub repositories to monitor (e.g., "org/repo1,org/repo2")
+        /// Comma-separated GitHub owner/name or Forgejo HTTPS repository URLs
         #[arg(long)]
         repos: Option<String>,
 
@@ -446,17 +446,17 @@ enum Commands {
         #[arg(long)]
         filter_by_updated: Option<bool>,
 
-        /// GitHub username whose @-mention triggers a review (e.g. "fiach-bot").
+        /// Username whose @-mention triggers a review (e.g. "fiach-bot").
         /// When set, the daemon only picks up PRs where this user is mentioned.
         #[arg(long)]
         trigger_mention: Option<String>,
 
-        /// Comma-separated GitHub usernames allowed to trigger reviews by mentioning
+        /// Comma-separated usernames allowed to trigger reviews by mentioning
         /// the trigger account. Defaults to commenters matching --allowed-author-associations.
         #[arg(long)]
         allowed_mention_users: Option<String>,
 
-        /// Maximum number of PRs to fetch from GitHub
+        /// Maximum number of matching PRs to discover per repository and state
         #[arg(long)]
         pr_limit: Option<u32>,
 
@@ -482,7 +482,7 @@ enum Commands {
         #[arg(long)]
         db_path: Option<PathBuf>,
 
-        /// Filter by GitHub repository (e.g., "org/repo")
+        /// Filter by repository (GitHub owner/name or Forgejo HTTPS URL)
         #[arg(long)]
         repo: Option<String>,
 

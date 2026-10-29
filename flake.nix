@@ -323,7 +323,14 @@
 
             repos = lib.mkOption {
               type = lib.types.listOf lib.types.str;
-              description = "List of repositories to monitor (e.g., ['org/repo'])";
+              description = "Repositories to monitor: owner/name for GitHub, or https://host/owner/name for Forgejo.";
+            };
+
+            forgejoHost = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "git.cashu.dev";
+              description = "Forgejo host (optionally host:port) authorized to receive FORGEJO_TOKEN from environmentFile. Do not put the token in Nix configuration.";
             };
 
             issues = lib.mkOption {
@@ -353,7 +360,7 @@
             filterByUpdated = lib.mkOption {
               type = lib.types.bool;
               default = true;
-              description = "Whether to include the updated:>= GitHub search filter when discovering PRs.";
+              description = "Whether to filter discovered PRs by their last update time.";
             };
 
             prStates = lib.mkOption {
@@ -365,7 +372,7 @@
             prLimit = lib.mkOption {
               type = lib.types.int;
               default = 1000;
-              description = "Maximum number of PRs to fetch from GitHub per polling cycle";
+              description = "Maximum number of matching PRs to discover per repository and state in a polling cycle.";
             };
 
             allowedAuthorAssociations = lib.mkOption {
@@ -434,7 +441,7 @@
 
             environmentFile = lib.mkOption {
               type = lib.types.path;
-              description = "Path to environment file containing GITHUB_TOKEN, the selected provider API key, TYPESAFE_API_KEY for live Jev deduplication, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
+              description = "Path to environment file containing GITHUB_TOKEN and/or FORGEJO_TOKEN for the configured forges, the selected provider API key, TYPESAFE_API_KEY for live Jev deduplication, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
             };
 
             buzz = {
@@ -1030,7 +1037,7 @@
                       "HOME=${cfg.dataDir}"
                       "GH_CONFIG_DIR=${cfg.dataDir}/.config/gh"
                       "RUST_LOG=${cfg.logFilter}"
-                    ];
+                    ] ++ lib.optional (cfg.forgejoHost != null) "FORGEJO_HOST=${cfg.forgejoHost}";
                     Restart = "always";
                     RestartSec = "10s";
                     UMask = "0077";

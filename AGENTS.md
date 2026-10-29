@@ -4,16 +4,17 @@ High-signal constraints and instructions for AI agents working in this repositor
 
 ## Architecture & Layout
 
-- **Pre-stage then delegate**: The app isolates work in a temp dir using `gh` CLI *before* giving control to the `goose` agent. This prevents wasting agent turns on git operations.
+- **Pre-stage then delegate**: The app isolates work in a temp dir using host-side forge adapters *before* giving control to the `goose` agent. This prevents wasting agent turns on git operations.
 - **Structured reporting first**: Finder agents submit candidates through the in-process `fiach-reporting` MCP client (`submit_finding` / `submit_no_findings`). Markdown is rendered by the host from structured data.
 - **Separate verifier session**: Candidate findings are adjudicated in a second Goose session. The verifier submits one `submit_verdict` per finding; structured verdicts are authoritative for metadata and disclosure.
-- **Host-only disclosure**: Models never post to GitHub. `src/disclose.rs` applies deterministic policy checks before any GitHub side effect.
+- **Host-only disclosure**: Models never post to a forge. `src/disclose.rs` applies deterministic policy checks before any forge side effect.
 - `src/main.rs`: Entrypoint, clap CLI parsing, tracing init.
-- `src/daemon.rs`: Polling loop, PR discovery via GitHub CLI (`updated:>=`), deduplication.
+- `src/daemon.rs`: Polling loop, PR discovery via GitHub CLI or Forgejo REST, deduplication.
 - `src/review.rs`: Sets up finder/verifier Goose sessions, reporting tools, artifact rendering, retries, and token/cost accounting.
 - `src/reporting.rs`: Structured finding/verdict schemas, validation, Markdown rendering, diff-anchor parsing, and disclosure policy helpers.
-- `src/workspace.rs`: Uses `gh` to clone repo/PR to a temp dir and records PR lifecycle/base/default-branch context.
-- `src/disclose.rs`: Report modes (`local`, `pr-comment`, `sync-pr`) and centralized GitHub review/sync disclosure.
+- `src/forge.rs`, `src/github.rs`, `src/forgejo.rs`: Forge selection and host adapters. Bare `owner/name` means GitHub; an HTTPS repository URL means Forgejo.
+- `src/workspace.rs`: Uses forge adapters to clone repo/PR to a temp dir and records PR lifecycle/base/default-branch context.
+- `src/disclose.rs`: Report modes (`local`, `pr-comment`, `sync-pr`) and centralized forge review/sync disclosure.
 - `src/state.rs`: Uses `redb` to track reviewed commit hashes.
 - `src/broker.rs`: Per-job host model broker. Sandboxes get per-job keys and reach providers through it; real provider credentials never enter a sandbox.
 - `flake.nix`: Package, dev shell, and NixOS module. The module can configure finder and verifier provider/model settings.
@@ -41,7 +42,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 - Merged or closed PRs must not receive inline or top-level PR comments.
 - Invalid inline anchors are downgraded into the review summary; they must not block other valid comments.
 - Sandbox child reviews write artifacts only. Host daemon performs DB persistence and disclosure after validating sandbox output.
-- Sandbox child reviews get no GitHub or provider credentials. The host stages the checkout and PR inputs (`workspace::StagedReview`) and brokers model calls (`src/broker.rs`).
+- Sandbox child reviews get no forge or provider credentials. The host stages the checkout and PR inputs (`workspace::StagedReview`) and brokers model calls (`src/broker.rs`).
 
 ## Dependencies & Overrides (CRITICAL)
 

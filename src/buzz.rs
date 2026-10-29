@@ -532,10 +532,9 @@ fn render_pr_summary(metadata: &ReviewRecord, summary: &PullRequestSummary) -> S
         content.push_str(testing.trim());
     }
     content.push_str(&format!(
-        "\n\n[`{commit}`](https://github.com/{repo}/pull/{pr}) · [View pull request](https://github.com/{repo}/pull/{pr})",
+        "\n\n[`{commit}`]({url}) · [View pull request]({url})",
         commit = abbreviated_commit(&metadata.commit_hash),
-        repo = metadata.repository,
-        pr = metadata.pr_number,
+        url = crate::forge::pr_url(&metadata.repository, metadata.pr_number),
     ));
     truncate_message(content)
 }
@@ -570,9 +569,8 @@ fn render_finding(metadata: &ReviewRecord, finding: &AcceptedFinding) -> String 
     }
 
     content.push_str(&format!(
-        "\n\n[View pull request](https://github.com/{repo}/pull/{pr})",
-        repo = metadata.repository,
-        pr = metadata.pr_number,
+        "\n\n[View pull request]({url})",
+        url = crate::forge::pr_url(&metadata.repository, metadata.pr_number),
     ));
     truncate_message(content)
 }

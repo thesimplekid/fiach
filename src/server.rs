@@ -25,7 +25,12 @@ pub struct AppState {
 
 #[derive(Deserialize)]
 pub struct ReviewQuery {
+    /// Complete GitHub owner/name or Forgejo HTTPS target. Legacy owner/repo
+    /// fields remain accepted when repository is omitted.
+    pub repository: Option<String>,
+    #[serde(default)]
     pub owner: String,
+    #[serde(default)]
     pub repo: String,
     pub pr: u64,
     pub persona: Option<String>,
@@ -33,10 +38,30 @@ pub struct ReviewQuery {
 
 #[derive(Deserialize)]
 pub struct TriggerReviewRequest {
+    /// Complete GitHub owner/name or Forgejo HTTPS target. Legacy owner/repo
+    /// fields remain accepted when repository is omitted.
+    pub repository: Option<String>,
+    #[serde(default)]
     pub owner: String,
+    #[serde(default)]
     pub repo: String,
     pub pr: u64,
     pub persona: Option<String>,
+}
+
+fn repository_target(repository: Option<&str>, owner: &str, repo: &str) -> Result<String> {
+    let target = match repository {
+        Some(target) => {
+            anyhow::ensure!(
+                owner.is_empty() && repo.is_empty(),
+                "Use repository or owner/repo, not both"
+            );
+            target.to_owned()
+        }
+        None => format!("{owner}/{repo}"),
+    };
+    crate::forge::Repository::parse(&target)?;
+    Ok(target)
 }
 
 fn review_kind_from_query(persona: Option<&str>) -> String {
@@ -295,7 +320,11 @@ async fn get_review(
         return unauthorized_response();
     }
 
-    let repo_full = format!("{}/{}", query.owner, query.repo);
+    let repo_full = match repository_target(query.repository.as_deref(), &query.owner, &query.repo)
+    {
+        Ok(repo) => repo,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
     let review_kind = review_kind_from_query(query.persona.as_deref());
     match state
         .state_store
@@ -324,7 +353,11 @@ async fn get_review_content(
         return unauthorized_response();
     }
 
-    let repo_full = format!("{}/{}", query.owner, query.repo);
+    let repo_full = match repository_target(query.repository.as_deref(), &query.owner, &query.repo)
+    {
+        Ok(repo) => repo,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
     let review_kind = review_kind_from_query(query.persona.as_deref());
     let metadata = match state
         .state_store
@@ -374,7 +407,11 @@ async fn trigger_review(
         return unauthorized_response();
     }
 
-    let repo_full = format!("{}/{}", payload.owner, payload.repo);
+    let repo_full =
+        match repository_target(payload.repository.as_deref(), &payload.owner, &payload.repo) {
+            Ok(repo) => repo,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
     let request =
         crate::daemon::manual_request(repo_full.clone(), payload.pr, payload.persona.clone());
 
@@ -430,6 +467,22 @@ async fn get_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_targets_accept_legacy_and_forgejo_requests() {
+        assert_eq!(
+            repository_target(None, "owner", "repo").unwrap(),
+            "owner/repo"
+        );
+        let target = "https://git.cashu.dev/owner/repo";
+        assert_eq!(repository_target(Some(target), "", "").unwrap(), target);
+        assert!(repository_target(Some(target), "other", "repo").is_err());
+        assert!(repository_target(Some("https://user:secret@host/owner/repo"), "", "").is_err());
+        let request: TriggerReviewRequest =
+            serde_json::from_value(serde_json::json!({"repository": target, "pr": 42})).unwrap();
+        assert_eq!(request.repository.as_deref(), Some(target));
+        assert!(request.owner.is_empty());
+    }
 
     #[test]
     fn review_kind_query_accepts_raw_kind_and_builtin_persona() {

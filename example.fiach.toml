@@ -1,5 +1,8 @@
 [daemon]
+# GitHub: owner/name. Forgejo: full HTTPS URL without .git or a trailing slash.
+# For authenticated Forgejo access, set FORGEJO_HOST and FORGEJO_TOKEN in the host environment.
 repos = ["owner/repo"]
+# repos = ["https://git.cashu.dev/thesimplekid/fiach"]
 interval = 100
 provider = "openrouter" # Options: openrouter, anthropic, openai, google
 model = "google/gemini-3.1-pro-preview"
@@ -9,7 +12,7 @@ model = "google/gemini-3.1-pro-preview"
 pr_state = ["open", "merged"] # Options: "open", "merged", "closed", "all" (can also be a comma-separated string)
 # filter_by_updated = false # Omit the updated:>= filter; default is true
 # updated_within_days = 120 # Used only when filter_by_updated = true
-# trigger_mention = "fiach-bot" # Only review PRs after this GitHub user is @-mentioned; each mention triggers one review, re-mention to re-review
+# trigger_mention = "fiach-bot" # Only review PRs after this user is @-mentioned; each mention triggers one review, re-mention to re-review
 # allowed_mention_users = ["lead-maintainer"] # Usernames whose mentions count; defaults to commenters matching allowed_author_associations
 skip_prs = ["1870"] # Skip specific PR numbers globally or per repo
 allowed_author_associations = ["COLLABORATOR", "CONTRIBUTOR", "MEMBER", "OWNER"]
@@ -17,10 +20,10 @@ max_workers = 1 # Shared polling/manual worker limit; queue capacity is max(2 * 
 drafts = false # Set to true to also review draft PRs
 out_dir = "reports" # Local directory to store reports
 report_mode = "sync-pr" # Options: local, pr-comment, sync-pr
-sync_repo = "thesimplekid/cdk-reviews" # GitHub repo to sync to if report_mode = "sync-pr"
+sync_repo = "thesimplekid/cdk-reviews" # GitHub owner/name or Forgejo HTTPS URL to sync to if report_mode = "sync-pr"
 notify_on_empty = false
-# review_start_reaction = "eyes" # Default GitHub PR reaction when review starts
-# no_findings_reaction = "+1" # Default GitHub PR reaction when review completes with no findings
+# review_start_reaction = "eyes" # Default PR reaction when review starts
+# no_findings_reaction = "+1" # Default PR reaction when review completes with no findings
 verify_findings = true # Run a verifier pass before disclosure when findings are present
 max_turns = 300
 # persona = "builtin:pr-review" # Single persona; default is builtin:security

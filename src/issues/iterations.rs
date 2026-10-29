@@ -267,7 +267,7 @@ pub(super) async fn process(
         && reviews
             .submit(
                 &project.repo,
-                &crate::github::PullRequestSummary {
+                &crate::forge::PullRequestSummary {
                     number: pr.number,
                     title: pr.title.clone(),
                     head_ref_oid: pr.head.sha.clone(),

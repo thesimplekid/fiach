@@ -6,6 +6,8 @@ mod dedupe;
 pub mod disclose;
 pub mod execution;
 pub mod finalizer;
+pub mod forge;
+pub mod forgejo;
 pub mod github;
 pub mod inspection;
 pub mod issues;

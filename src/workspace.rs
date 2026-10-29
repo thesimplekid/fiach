@@ -1,9 +1,8 @@
 //! Workspace preparation: clone the repo and checkout the PR branch
 //! before the agent starts, so it doesn't waste LLM turns on setup.
 //!
-//! This mirrors the pattern from `ctf-pr-reviewer/review.sh` where the shell
-//! script clones the repo, copies it to a per-PR workspace, and runs
-//! `gh pr checkout` before launching the AI agent.
+//! Forge-specific operations run on the host; sandbox children adopt the
+//! prepared checkout and structured inputs without forge credentials.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +13,6 @@ use tokio::process::Command;
 
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT, output_limited};
 
-const PR_CONTEXT_JSON_FIELDS: &str = "baseRefOid,baseRefName,state,mergedAt";
 const MAX_MATERIALIZED_DIFF_BYTES: usize = 16 * 1024 * 1024;
 /// PR discussion can be long; this bounds what a sandbox child will parse.
 const MAX_STAGED_REVIEW_BYTES: u64 = 32 * 1024 * 1024;
@@ -35,6 +33,8 @@ pub struct PreparedWorkspace {
 
 #[derive(Debug, Clone, Deserialize)]
 struct PullRequestContext {
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
     #[serde(rename = "baseRefOid")]
     base_ref_oid: String,
     #[serde(rename = "baseRefName")]
@@ -46,7 +46,7 @@ struct PullRequestContext {
 
 impl PullRequestContext {
     fn is_merged(&self) -> bool {
-        self.merged_at.is_some()
+        self.state == "MERGED" || self.merged_at.is_some()
     }
 }
 
@@ -111,27 +111,10 @@ pub struct PrDetails {
 }
 
 pub async fn fetch_pr_details(repo: &str, pr_number: u64) -> Result<PrDetails> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_number.to_string(),
-            "--json",
-            "title,body",
-            "--repo",
-            repo,
-        ])
-        .output_bounded("loading pull request details for skill selection")
-        .await
-        .context("Failed to run `gh pr view`")?;
-    if !output.status.success() {
-        bail!(
-            "gh pr view failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("Failed to parse PR details")?;
+    let value = crate::forge::client(repo)?
+        .adapter()
+        .pr_context(repo, pr_number)
+        .await?;
     let text = |field: &str| {
         value
             .get(field)
@@ -145,8 +128,8 @@ pub async fn fetch_pr_details(repo: &str, pr_number: u64) -> Result<PrDetails> {
     })
 }
 
-/// Everything a sandboxed review child would otherwise fetch from GitHub.
-/// The host prepares it so the child needs no GitHub credentials.
+/// Everything a sandboxed review child would otherwise fetch from its forge.
+/// The host prepares it so the child needs no forge credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StagedReview {
@@ -199,8 +182,8 @@ fn create_workspace_directory(
 ///
 /// Steps:
 /// 1. Create a temporary workspace directory
-/// 2. `gh repo clone {repo} {workspace_dir}`
-/// 3. `gh pr checkout {pr_number}` inside the workspace
+/// 2. Clone through the selected forge adapter.
+/// 3. Check out the pull request head, including fork PRs.
 ///
 /// The agent will start with its working directory set to the prepared workspace,
 /// already on the PR branch — no clone/checkout tool calls needed.
@@ -217,99 +200,44 @@ pub async fn prepare(
     let repo_name = repo.split('/').next_back().unwrap_or(repo);
     let workspace_dir = parent_dir.join(repo_name);
 
-    // 1. Clone the main repo
-    tracing::debug!(repo = %repo, path = %workspace_dir.display(), "Cloning target repository");
-    let clone_output = Command::new("gh")
-        .args(["repo", "clone", repo])
-        .arg(&workspace_dir)
-        .output_with_timeout("cloning the review repository", LONG_COMMAND_TIMEOUT)
-        .await
-        .context("Failed to run `gh repo clone` — is `gh` installed?")?;
+    let forge = crate::forge::client(repo)?;
+    forge
+        .adapter()
+        .clone_workspace(repo, pr_number, &workspace_dir)
+        .await?;
 
-    if !clone_output.status.success() {
-        let stderr = String::from_utf8_lossy(&clone_output.stderr);
-        bail!("gh repo clone failed: {stderr}");
-    }
-
-    // Clone context groups
-    if let Some(ctx_group) = context_groups {
-        for ctx_repo in &ctx_group.repos {
-            let ctx_repo_name = ctx_repo.split('/').next_back().unwrap_or(ctx_repo);
-            let ctx_dir = parent_dir.join(ctx_repo_name);
-            tracing::debug!(repo = %ctx_repo, path = %ctx_dir.display(), "Cloning context repository");
-            let ctx_clone_output = Command::new("gh")
-                .args(["repo", "clone", ctx_repo])
-                .arg(&ctx_dir)
-                .output_with_timeout("cloning a context repository", LONG_COMMAND_TIMEOUT)
+    if let Some(group) = context_groups {
+        for context_repo in &group.repos {
+            let target = crate::forge::Repository::parse(context_repo)?;
+            let name = target
+                .slug
+                .split('/')
+                .next_back()
+                .context("Missing context repository name")?;
+            let destination = parent_dir.join(name);
+            if let Err(error) = crate::forge::client(context_repo)?
+                .clone_repository(context_repo, &destination)
                 .await
-                .context("Failed to clone context repository")?;
-
-            if !ctx_clone_output.status.success() {
-                let stderr = String::from_utf8_lossy(&ctx_clone_output.stderr);
-                tracing::warn!("Failed to clone context repo {}: {}", ctx_repo, stderr);
+            {
+                tracing::warn!(repo = %context_repo, error = %error, "Failed to clone context repository");
             }
         }
     }
 
-    // 2. Checkout the PR branch
-    tracing::debug!(pr = pr_number, "Checking out PR branch");
-    let checkout_output = Command::new("gh")
-        .args(["pr", "checkout", &pr_number.to_string()])
-        .current_dir(&workspace_dir)
-        .output_bounded("checking out the pull request")
-        .await
-        .context("Failed to run `gh pr checkout`")?;
-
-    if !checkout_output.status.success() {
-        let stderr = String::from_utf8_lossy(&checkout_output.stderr);
-        bail!("gh pr checkout failed: {stderr}");
-    }
-
-    // 3. Get PR lifecycle and base context used by host disclosure policy.
-    tracing::debug!(pr = pr_number, "Getting PR context");
-    let pr_context_output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_number.to_string(),
-            "--json",
-            PR_CONTEXT_JSON_FIELDS,
-        ])
-        .current_dir(&workspace_dir)
-        .output_bounded("loading pull request context")
-        .await
-        .context("Failed to run `gh pr view`")?;
-
-    if !pr_context_output.status.success() {
-        let stderr = String::from_utf8_lossy(&pr_context_output.stderr);
-        bail!("gh pr view failed: {stderr}");
-    }
-
     let pr_context: PullRequestContext =
-        serde_json::from_slice(&pr_context_output.stdout).context("Failed to parse PR context")?;
+        serde_json::from_value(forge.adapter().pr_context(repo, pr_number).await?)
+            .context("Failed to parse PR context")?;
     let base_commit = pr_context.base_ref_oid.clone();
     let merged = pr_context.is_merged();
-
-    let repo_context_output = Command::new("gh")
-        .args(["repo", "view", repo, "--json", "defaultBranchRef"])
-        .current_dir(&workspace_dir)
-        .output_bounded("loading repository context")
-        .await
-        .context("Failed to run `gh repo view`")?;
-
-    let default_branch = if repo_context_output.status.success() {
-        serde_json::from_slice::<RepositoryContext>(&repo_context_output.stdout)
-            .ok()
-            .and_then(|ctx| ctx.default_branch_ref.map(|branch| branch.name))
-            .unwrap_or_else(|| pr_context.base_ref_name.clone())
-    } else {
-        let stderr = String::from_utf8_lossy(&repo_context_output.stderr);
-        tracing::warn!(
-            repo = %repo,
-            error = %stderr,
-            "Failed to fetch repository default branch; using PR base branch"
-        );
-        pr_context.base_ref_name.clone()
+    let default_branch = match forge.repository_context(repo).await {
+        Ok(value) => serde_json::from_value::<RepositoryContext>(value)?
+            .default_branch_ref
+            .map(|branch| branch.name)
+            .unwrap_or_else(|| pr_context.base_ref_name.clone()),
+        Err(error) => {
+            tracing::warn!(repo, error = %error, "Could not fetch default branch; using PR base branch");
+            pr_context.base_ref_name.clone()
+        }
     };
 
     // 4. Materialize the complete PR diff for prompts that need a single
@@ -430,6 +358,10 @@ fi
         .trim()
         .to_string();
 
+    ensure!(
+        commit_hash == pr_context.head_ref_oid,
+        "PR head changed during workspace preparation; retry the review"
+    );
     tracing::debug!(path = %workspace_dir.display(), commit = %commit_hash, "Workspace ready");
 
     Ok(PreparedWorkspace {
@@ -606,22 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn pr_context_fields_use_gh_supported_merged_timestamp() {
-        assert!(
-            PR_CONTEXT_JSON_FIELDS
-                .split(',')
-                .any(|field| field == "mergedAt")
-        );
-        assert!(
-            !PR_CONTEXT_JSON_FIELDS
-                .split(',')
-                .any(|field| field == "merged")
-        );
-    }
-
-    #[test]
     fn pull_request_context_derives_merged_from_merged_at() {
         let unmerged = PullRequestContext {
+            head_ref_oid: "head".to_owned(),
             base_ref_oid: "base".to_string(),
             base_ref_name: "main".to_string(),
             state: "CLOSED".to_string(),

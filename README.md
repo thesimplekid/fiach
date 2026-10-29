@@ -41,13 +41,57 @@ revision. Nothing is merged or closed.
 ## 🛠 Prerequisites
 
 - **Rust:** `1.98.1` (or use the provided Nix flake: `nix develop`)
-- **GitHub CLI (`gh`):** Must be installed and authenticated (`gh auth login`).
+- **GitHub CLI (`gh`):** Required for GitHub repositories and issue automation. Forgejo PR reviews use the REST API and Git directly.
 - **Git and ripgrep (`rg`):** Required for the fixed finder inspection operations; provided by the Nix shell and sandbox.
 - **Environment Variables:**
   - `OPENROUTER_API_KEY`: For default OpenRouter LLM access.
   - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`: Required only when using the matching direct provider.
   - `TYPESAFE_API_KEY`: Enables optional Jev lane selection and live deduplication. Without it, all configured lanes run and deduplication uses the coordinator fallback.
-  - `GITHUB_TOKEN`: Host-only token for PR discovery and permitted disclosure actions.
+  - `GITHUB_TOKEN`: Host-only token for GitHub PR discovery and permitted disclosure actions.
+  - `FORGEJO_HOST` and `FORGEJO_TOKEN`: For authenticated Forgejo access. The host must match the repository URL (for example, `git.cashu.dev`); the token stays on the host.
+
+### Forgejo PR reviews
+
+Use `owner/name` for GitHub and a full HTTPS repository URL, without a trailing
+slash or `.git`, for Forgejo. These targets work in `review --repo`, daemon
+`repos`, `context_groups`, and `sync_repo`. A daemon can monitor both forges;
+state and report paths distinguish repositories by host.
+
+```sh
+fiach review --repo https://git.cashu.dev/thesimplekid/fiach --pr 24
+```
+
+Configure `FORGEJO_HOST=git.cashu.dev` and `FORGEJO_TOKEN` in the existing
+service environment file or `.env`. Public reads can run without a token;
+comments, reviews, reactions, and sync PR creation require one. A configured
+token is accepted only for its matching host. Git authentication is supplied
+per command and is not stored in the staged checkout. Git does not read
+`FORGEJO_TOKEN` itself, so a fixed, ephemeral credential helper reads it from
+the command environment. Tokens are not forwarded
+to sandbox children.
+
+```nix
+services.fiach = {
+  enable = true;
+  repos = [ "https://git.cashu.dev/thesimplekid/fiach" ];
+  forgejoHost = "git.cashu.dev";
+  environmentFile = "/run/secrets/fiach.env";
+};
+```
+
+Forgejo supports PR polling, manual reviews, mention triggers, discussion
+deduplication, reactions, inline reviews, and sync/hybrid disclosure. The same
+verifier and open-PR publication checks apply. Forgejo permission checks map
+repository owners to `OWNER` and users with write/admin permission to
+`COLLABORATOR`; read-only users map to `NONE`. Historical contributor and
+organization-member associations are not inferred. Failed permission lookups
+map to `UNKNOWN` and do not satisfy the default author allowlist. For mention
+triggers, `allowed_mention_users` can explicitly allow named users.
+
+The HTTP review endpoints also accept `repository` instead of the legacy
+`owner` and `repo` fields, for example
+`{"repository":"https://git.cashu.dev/thesimplekid/fiach","pr":24}`.
+The separate `fiach issues` triage/automatic-fix workflow remains GitHub-only.
 
 ### Credential Scope
 
@@ -691,7 +735,8 @@ The following options are available under `services.fiach`:
 | `model` | string | `"google/gemini-3.1-pro-preview"` | Model to use with the selected provider. |
 | `verifierProvider` | string or null | `null` | Provider to use for the verifier pass. Defaults to `provider` when unset. |
 | `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
-| `environmentFile` | path | *none* | Path to an environment file containing host-only `GITHUB_TOKEN`, the selected provider API key, and optionally `FIACH_SERVER_TOKEN`. |
+| `environmentFile` | path | *none* | Environment file containing host-only forge tokens (`GITHUB_TOKEN` / `FORGEJO_TOKEN`), the selected provider API key, and optionally `FIACH_SERVER_TOKEN`. |
+| `forgejoHost` | string or null | `null` | Host authorized to receive `FORGEJO_TOKEN`, e.g. `git.cashu.dev`. |
 | `logFilter` | string | `"fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
 | `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |
@@ -790,7 +835,9 @@ This lets NixOS/systemd deployments keep using bundled skills such as `rust-secu
 - `src/scheduler.rs`: Bounded FIFO scheduling and process-local job lifecycle.
 - `src/execution.rs`: Common local/sandbox executor outcome contract.
 - `src/finalizer.rs`: Host-only rendering, disclosure, reactions, and persistence.
-- `src/github.rs`: Object-safe GitHub boundary and the production `gh` adapter.
+- `src/forge.rs`: Forge boundary, repository identities, and adapter selection.
+- `src/github.rs`: GitHub `gh` adapter.
+- `src/forgejo.rs`: Forgejo REST adapter and ephemeral Git authentication.
 - `src/daemon.rs`: Polling and sandbox/nspawn orchestration.
 - `src/review.rs`: Finder, verifier, and duplicate-adjudication agent passes.
 - `src/server.rs`: Axum-based interactive web server for daemon management and reporting.

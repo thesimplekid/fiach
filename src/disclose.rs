@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use crate::github::{GhCli, GitHub};
+use crate::forge::{Forge, SyncPullRequest};
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
 use crate::reporting::{DisclosurePolicy, InlineComment, ReportingArtifact};
 
@@ -76,14 +76,6 @@ impl Default for ReactionConfig {
             no_findings: Some("+1".to_string()),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-struct ExistingSyncPr {
-    number: u64,
-    url: String,
-    #[serde(rename = "baseRefName")]
-    base_ref_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,7 +164,7 @@ pub async fn handle_disclosure_idempotent(
             }
             let marker = disclosure_marker(target, config);
             post_pr_comment(
-                &GhCli::default(),
+                crate::forge::client(target.repo)?.adapter(),
                 report_path,
                 target.repo,
                 target.pr_number,
@@ -212,7 +204,7 @@ pub async fn handle_disclosure_idempotent(
             if policy_comments_allowed(target.review_kind) {
                 let marker = disclosure_marker(target, config);
                 post_pr_comment(
-                    &GhCli::default(),
+                    crate::forge::client(target.repo)?.adapter(),
                     report_path,
                     target.repo,
                     target.pr_number,
@@ -264,7 +256,7 @@ pub async fn handle_structured_disclosure_idempotent(
                 crate::reporting::review_summary_body(&accepted)
             );
             post_pr_review(
-                &GhCli::default(),
+                crate::forge::client(target.repo)?.adapter(),
                 target,
                 &body,
                 comments,
@@ -414,7 +406,7 @@ struct LivePrLifecycle {
     merged_at: Option<String>,
 }
 
-async fn live_comments_allowed(github: &dyn GitHub, repo: &str, pr_number: u64) -> Result<bool> {
+async fn live_comments_allowed(github: &dyn Forge, repo: &str, pr_number: u64) -> Result<bool> {
     let lifecycle: LivePrLifecycle = serde_json::from_value(
         github
             .pr_context(repo, pr_number)
@@ -430,7 +422,7 @@ async fn live_comments_allowed(github: &dyn GitHub, repo: &str, pr_number: u64) 
 }
 
 async fn find_existing_disclosure(
-    github: &dyn GitHub,
+    github: &dyn Forge,
     repo: &str,
     pr_number: u64,
     marker: &str,
@@ -448,7 +440,7 @@ async fn find_existing_disclosure(
             .map(|entry| {
                 entry
                     .url
-                    .unwrap_or_else(|| format!("https://github.com/{repo}/pull/{pr_number}"))
+                    .unwrap_or_else(|| crate::forge::pr_url(repo, pr_number))
             }))
     }
     .await;
@@ -508,7 +500,7 @@ fn review_payload(
 }
 
 async fn post_pr_review(
-    github: &dyn GitHub,
+    github: &dyn Forge,
     target: DisclosureTarget<'_>,
     body: &str,
     comments: Vec<InlineComment>,
@@ -556,32 +548,14 @@ pub async fn post_pr_reaction(repo: &str, pr_number: u64, reaction: &str) -> Res
         "Posting PR reaction"
     );
 
-    let endpoint = format!("repos/{repo}/issues/{pr_number}/reactions");
-    let mut cmd = Command::new("gh");
-    cmd.kill_on_drop(true)
-        .args([
-            "api",
-            &endpoint,
-            "--method",
-            "POST",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-f",
-        ])
-        .arg(format!("content={content}"));
-
-    let output = tokio::time::timeout(
+    tokio::time::timeout(
         std::time::Duration::from_secs(PR_REACTION_TIMEOUT_SECS),
-        cmd.output(),
+        crate::forge::client(repo)?
+            .adapter()
+            .react(repo, pr_number, content),
     )
     .await
-    .context("Timed out posting PR reaction")?
-    .context("Failed to run `gh api` for PR reaction")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh api PR reaction failed: {stderr}");
-    }
+    .context("Timed out posting PR reaction")??;
 
     tracing::info!(
         repo = %repo,
@@ -652,6 +626,19 @@ async fn mutate_mention_reaction(
     reaction: &str,
     mutation: &str,
 ) -> Result<()> {
+    if let Some(subject) = crate::forgejo::MentionSubject::decode(subject_node_id)? {
+        let crate::forge::Client::Forgejo(client) = crate::forge::client(&subject.repository)?
+        else {
+            bail!("Invalid Forgejo reaction target");
+        };
+        return client
+            .react_to_comment(
+                subject.comment,
+                normalize_reaction_content(reaction)?,
+                mutation == "removeReaction",
+            )
+            .await;
+    }
     let content = graphql_reaction_content(reaction)?;
     tracing::info!(
         subject = %subject_node_id,
@@ -720,7 +707,7 @@ fn normalize_reaction_content(reaction: &str) -> Result<&'static str> {
 }
 
 async fn post_pr_comment(
-    github: &dyn GitHub,
+    github: &dyn Forge,
     report_path: &Path,
     repo: &str,
     pr_number: u64,
@@ -742,39 +729,12 @@ async fn post_pr_comment(
     let report = tokio::fs::read_to_string(report_path)
         .await
         .context("Failed to read report file")?;
-    let body = tempfile::NamedTempFile::new().context("Failed to create comment body file")?;
-    tokio::fs::write(body.path(), format!("{report}\n\n{marker}\n"))
-        .await
-        .context("Failed to write comment body file")?;
-    let report_path_str = body
-        .path()
-        .to_str()
-        .context("Report path must be valid UTF-8")?;
-
     if !live_comments_allowed(github, repo, pr_number).await? {
         return Ok(None);
     }
-
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "comment",
-            &pr_number.to_string(),
-            "--repo",
-            repo,
-            "--body-file",
-            report_path_str,
-        ])
-        .output_bounded("posting a pull request comment")
-        .await
-        .context("Failed to run `gh pr comment`")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh pr comment failed: {stderr}");
-    }
-
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let url = github
+        .post_comment(repo, pr_number, &format!("{report}\n\n{marker}\n"))
+        .await?;
     tracing::info!("Successfully posted comment to PR #{}: {}", pr_number, url);
     Ok(Some(url))
 }
@@ -801,21 +761,9 @@ async fn create_sync_pr(
         .context("Failed to create temporary directory for sync PR")?;
 
     let repo_dir = tmp_dir.path().join("repo");
-    let repo_dir_str = repo_dir
-        .to_str()
-        .context("Sync repository path must be valid UTF-8")?;
-
-    // Clone the sync repo
-    let output = Command::new("gh")
-        .args(["repo", "clone", sync_repo, repo_dir_str])
-        .output_with_timeout("cloning the disclosure repository", LONG_COMMAND_TIMEOUT)
-        .await
-        .context("Failed to run `gh repo clone`")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to clone sync repo {}: {}", sync_repo, stderr);
-    }
+    let forge = crate::forge::client(sync_repo)?;
+    forge.clone_repository(sync_repo, &repo_dir).await?;
+    let report_directory = crate::forge::Repository::parse(repo)?.storage_path();
 
     let report_content = tokio::fs::read_to_string(report_path)
         .await
@@ -827,19 +775,29 @@ async fn create_sync_pr(
 
     let branch_name = sync_branch_name(repo, pr_number, review_kind);
     let base_branch = current_git_branch(&repo_dir).await?;
-    let existing_open_pr = find_open_sync_pr(&repo_dir, &branch_name, &base_branch).await?;
+    let existing_open_pr = forge
+        .find_sync_pr(sync_repo, &branch_name, &base_branch)
+        .await?;
 
     // Check if the branch exists on remote
-    let output = Command::new("git")
+    let output = forge
+        .git_command()
         .args(["ls-remote", "--heads", "origin", &branch_name])
         .current_dir(&repo_dir)
         .output_bounded("checking for an existing disclosure branch")
         .await
         .context("Failed to run git ls-remote")?;
 
+    if !output.status.success() {
+        bail!(
+            "Failed to check the remote disclosure branch: {}",
+            output.status
+        );
+    }
     let branch_exists = !output.stdout.is_empty();
 
     checkout_report_branch(
+        &forge,
         &repo_dir,
         &branch_name,
         &base_branch,
@@ -848,7 +806,7 @@ async fn create_sync_pr(
     .await?;
 
     let existing_report_path = repo_dir
-        .join(repo)
+        .join(&report_directory)
         .join(sync_report_file_name(pr_number, review_kind));
 
     let final_report_content = if existing_report_path.exists() {
@@ -870,7 +828,7 @@ async fn create_sync_pr(
         report_content.clone()
     };
 
-    let dest_dir = repo_dir.join(repo);
+    let dest_dir = repo_dir.join(&report_directory);
 
     tokio::fs::create_dir_all(&dest_dir)
         .await
@@ -904,7 +862,18 @@ async fn create_sync_pr(
     } else {
         commit_hash
     };
-    let safe_repo_name = repo.replace("/", "-");
+    let safe_repo_name: String = repo
+        .strip_prefix("https://")
+        .unwrap_or(repo)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
     let commit_msg = format!(
         "audit({}-pr{}): {} ({})",
         safe_repo_name, pr_number, title, short_hash
@@ -942,7 +911,8 @@ async fn create_sync_pr(
     }
 
     // Git push
-    let output = Command::new("git")
+    let output = forge
+        .git_command()
         .args(["push", "-u", "origin", &branch_name, "--force"])
         .current_dir(&repo_dir)
         .output_with_timeout("pushing the disclosure report", LONG_COMMAND_TIMEOUT)
@@ -954,7 +924,10 @@ async fn create_sync_pr(
         bail!("Failed to git push: {}", stderr);
     }
 
-    if let Some(pr) = find_open_sync_pr(&repo_dir, &branch_name, &base_branch).await? {
+    if let Some(pr) = forge
+        .find_sync_pr(sync_repo, &branch_name, &base_branch)
+        .await?
+    {
         let pr_url = pr.url;
         tracing::info!("Updated existing Sync PR: {}", pr_url);
         return Ok(pr_url);
@@ -966,42 +939,33 @@ async fn create_sync_pr(
         repo, pr_number, commit_hash
     );
     let display_title = format!("{}#{} ({}): {}", repo, pr_number, short_hash, title);
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "create",
-            "--title",
-            &display_title,
-            "--body",
-            &pr_body,
-            "--base",
-            &base_branch,
-            "--head",
-            &branch_name,
-        ])
-        .current_dir(&repo_dir)
-        .output_bounded("creating the disclosure pull request")
-        .await
-        .context("Failed to run gh pr create")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to create PR: {}", stderr);
-    }
-
-    let pr_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let pr_url = forge
+        .adapter()
+        .create_sync_pr(SyncPullRequest {
+            repository: sync_repo,
+            head: &branch_name,
+            base: &base_branch,
+            title: &display_title,
+            body: &pr_body,
+        })
+        .await?;
     tracing::info!("Successfully created Sync PR: {}", pr_url);
 
     Ok(pr_url)
 }
 
 fn sync_branch_name(repo: &str, pr_number: u64, review_kind: &str) -> String {
-    let safe_repo_name = repo.replace("/", "-");
+    let prefix = match repo.strip_prefix("https://") {
+        // A separate ref namespace prevents collisions with legacy GitHub
+        // report branches. Preserve host/owner/repo boundaries within it.
+        Some(target) => format!("report/forgejo/{}", target.replace(':', "%3A")),
+        None => format!("report/{}", repo.replace('/', "-")),
+    };
     if review_kind == crate::state::DEFAULT_REVIEW_KIND {
-        format!("report/{safe_repo_name}-pr{pr_number}")
+        format!("{prefix}-pr{pr_number}")
     } else {
         format!(
-            "report/{safe_repo_name}-pr{pr_number}-{}",
+            "{prefix}-pr{pr_number}-{}",
             sync_safe_component(review_kind)
         )
     }
@@ -1059,6 +1023,7 @@ async fn current_git_branch(repo_dir: &Path) -> Result<String> {
 }
 
 async fn checkout_report_branch(
+    forge: &crate::forge::Client,
     repo_dir: &Path,
     branch_name: &str,
     base_branch: &str,
@@ -1066,7 +1031,8 @@ async fn checkout_report_branch(
 ) -> Result<()> {
     let remote_ref = if update_existing_pr_branch {
         let branch_ref = format!("refs/heads/{branch_name}:refs/remotes/origin/{branch_name}");
-        let output = Command::new("git")
+        let output = forge
+            .git_command()
             .args(["fetch", "origin", &branch_ref])
             .current_dir(repo_dir)
             .output_bounded("fetching the existing disclosure branch")
@@ -1085,7 +1051,8 @@ async fn checkout_report_branch(
         format!("origin/{branch_name}")
     } else {
         let base_ref = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
-        let output = Command::new("git")
+        let output = forge
+            .git_command()
             .args(["fetch", "origin", &base_ref])
             .current_dir(repo_dir)
             .output_bounded("fetching the disclosure base branch")
@@ -1118,74 +1085,6 @@ async fn checkout_report_branch(
     }
 
     Ok(())
-}
-
-async fn find_open_sync_pr(
-    repo_dir: &Path,
-    branch_name: &str,
-    base_branch: &str,
-) -> Result<Option<ExistingSyncPr>> {
-    let pr_list = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--head",
-            branch_name,
-            "--state",
-            "open",
-            "--json",
-            "number,url,baseRefName",
-        ])
-        .current_dir(repo_dir)
-        .output_bounded("listing disclosure pull requests")
-        .await
-        .context("Failed to run gh pr list")?;
-
-    if !pr_list.status.success() {
-        let stderr = String::from_utf8_lossy(&pr_list.stderr);
-        bail!("Failed to list sync PRs: {}", stderr);
-    }
-
-    let prs = parse_open_sync_prs(&pr_list.stdout)?;
-
-    if let Some(pr) = prs
-        .iter()
-        .find(|pr| pr.base_ref_name == base_branch)
-        .cloned()
-    {
-        return Ok(Some(pr));
-    }
-
-    if let Some(mut pr) = prs.into_iter().next() {
-        tracing::warn!(
-            pr = pr.number,
-            current_base = %pr.base_ref_name,
-            target_base = %base_branch,
-            "Retargeting sync PR to repository default branch"
-        );
-
-        let pr_number = pr.number.to_string();
-        let output = Command::new("gh")
-            .args(["pr", "edit", &pr_number, "--base", base_branch])
-            .current_dir(repo_dir)
-            .output_bounded("retargeting the disclosure pull request")
-            .await
-            .context("Failed to run gh pr edit")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to retarget sync PR: {}", stderr);
-        }
-
-        pr.base_ref_name = base_branch.to_string();
-        return Ok(Some(pr));
-    }
-
-    Ok(None)
-}
-
-fn parse_open_sync_prs(stdout: &[u8]) -> Result<Vec<ExistingSyncPr>> {
-    serde_json::from_slice(stdout).context("Failed to parse gh pr list output")
 }
 
 fn combine_reports(old: &str, new: &str) -> String {
@@ -1247,7 +1146,7 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::github::{DiscoveryRequest, GitHubFuture, PullRequestSummary, SyncPullRequest};
+    use crate::forge::{DiscoveryRequest, ForgeFuture, PullRequestSummary, SyncPullRequest};
 
     struct PublicationGitHub {
         lifecycle: serde_json::Value,
@@ -1269,8 +1168,8 @@ mod tests {
         }
     }
 
-    impl GitHub for PublicationGitHub {
-        fn pr_context<'a>(&'a self, _: &'a str, _: u64) -> GitHubFuture<'a, serde_json::Value> {
+    impl Forge for PublicationGitHub {
+        fn pr_context<'a>(&'a self, _: &'a str, _: u64) -> ForgeFuture<'a, serde_json::Value> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("context");
                 if self.fail_context {
@@ -1279,7 +1178,7 @@ mod tests {
                 Ok(self.lifecycle.clone())
             })
         }
-        fn discussion<'a>(&'a self, _: &'a str, _: u64) -> GitHubFuture<'a, serde_json::Value> {
+        fn discussion<'a>(&'a self, _: &'a str, _: u64) -> ForgeFuture<'a, serde_json::Value> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("discussion");
                 Ok(if self.existing {
@@ -1294,7 +1193,7 @@ mod tests {
             _: &'a str,
             _: u64,
             payload: &'a serde_json::Value,
-        ) -> GitHubFuture<'a, serde_json::Value> {
+        ) -> ForgeFuture<'a, serde_json::Value> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("publish");
                 *self.payload.lock().unwrap() = Some(payload.clone());
@@ -1304,16 +1203,19 @@ mod tests {
         fn discover<'a>(
             &'a self,
             _: DiscoveryRequest<'a>,
-        ) -> GitHubFuture<'a, Vec<PullRequestSummary>> {
+        ) -> ForgeFuture<'a, Vec<PullRequestSummary>> {
             panic!("unexpected discovery")
         }
-        fn react<'a>(&'a self, _: &'a str, _: u64, _: &'a str) -> GitHubFuture<'a, ()> {
+        fn react<'a>(&'a self, _: &'a str, _: u64, _: &'a str) -> ForgeFuture<'a, ()> {
             panic!("unexpected reaction")
         }
-        fn clone_workspace<'a>(&'a self, _: &'a str, _: u64, _: &'a Path) -> GitHubFuture<'a, ()> {
+        fn post_comment<'a>(&'a self, _: &'a str, _: u64, _: &'a str) -> ForgeFuture<'a, String> {
+            panic!("unexpected comment")
+        }
+        fn clone_workspace<'a>(&'a self, _: &'a str, _: u64, _: &'a Path) -> ForgeFuture<'a, ()> {
             panic!("unexpected clone")
         }
-        fn create_sync_pr<'a>(&'a self, _: SyncPullRequest<'a>) -> GitHubFuture<'a, String> {
+        fn create_sync_pr<'a>(&'a self, _: SyncPullRequest<'a>) -> ForgeFuture<'a, String> {
             panic!("unexpected sync")
         }
     }
@@ -1785,33 +1687,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_open_sync_prs_reads_base_branch() {
-        let prs = parse_open_sync_prs(
-            br#"[
-                {
-                    "number": 5,
-                    "url": "https://github.com/thesimplekid/cdk-reviews/pull/5",
-                    "baseRefName": "main"
-                }
-            ]"#,
-        )
-        .expect("valid PR JSON should parse");
-
-        assert_eq!(
-            prs,
-            vec![ExistingSyncPr {
-                number: 5,
-                url: "https://github.com/thesimplekid/cdk-reviews/pull/5".to_string(),
-                base_ref_name: "main".to_string(),
-            }]
+    fn forgejo_sync_branches_cannot_collide_with_github_branches() {
+        let forgejo = sync_branch_name(
+            "https://git.cashu.dev/owner/repo",
+            42,
+            crate::state::DEFAULT_REVIEW_KIND,
         );
-    }
-
-    #[test]
-    fn parse_open_sync_prs_rejects_invalid_json() {
-        let result = parse_open_sync_prs(b"not json");
-
-        assert!(result.is_err());
+        assert_eq!(forgejo, "report/forgejo/git.cashu.dev/owner/repo-pr42");
+        assert_ne!(
+            forgejo,
+            sync_branch_name(
+                "git.cashu.dev-owner/repo",
+                42,
+                crate::state::DEFAULT_REVIEW_KIND
+            )
+        );
+        assert_eq!(
+            sync_branch_name("https://forge.test:8443/owner/repo", 42, "security"),
+            "report/forgejo/forge.test%3A8443/owner/repo-pr42-security"
+        );
     }
 
     #[test]

@@ -2993,53 +2993,9 @@ pub(crate) async fn fetch_existing_pr_comments(
     repo: &str,
     pr_number: u64,
 ) -> Result<Vec<reporting::ExistingPrComment>> {
-    let mut comments = Vec::new();
-    let issue_endpoint = format!("repos/{repo}/issues/{pr_number}/comments");
-    for value in gh_api_paginated_array(&issue_endpoint).await? {
-        if let Some(comment) = reporting::ExistingPrComment::from_issue_comment(&value) {
-            comments.push(comment);
-        }
-    }
-
-    let inline_endpoint = format!("repos/{repo}/pulls/{pr_number}/comments");
-    for value in gh_api_paginated_array(&inline_endpoint).await? {
-        if let Some(comment) = reporting::ExistingPrComment::from_inline_comment(&value) {
-            comments.push(comment);
-        }
-    }
-
-    let reviews_endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
-    for value in gh_api_paginated_array(&reviews_endpoint).await? {
-        if let Some(comment) = reporting::ExistingPrComment::from_review(&value) {
-            comments.push(comment);
-        }
-    }
-
-    Ok(comments)
-}
-
-async fn gh_api_paginated_array(endpoint: &str) -> Result<Vec<serde_json::Value>> {
-    let output = tokio::process::Command::new("gh")
-        .args(["api", "--paginate", "--slurp", endpoint])
-        .output_bounded("loading pull request discussion")
+    crate::forge::client(repo)?
+        .existing_comments(repo, pr_number)
         .await
-        .with_context(|| format!("Failed to run `gh api` for {endpoint}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh api failed for {endpoint}: {stderr}");
-    }
-
-    let pages: Vec<serde_json::Value> =
-        serde_json::from_slice(&output.stdout).context("Failed to parse paginated gh response")?;
-    let mut values = Vec::new();
-    for page in pages {
-        match page {
-            serde_json::Value::Array(items) => values.extend(items),
-            other => values.push(other),
-        }
-    }
-    Ok(values)
 }
 
 #[derive(Debug, Default)]
