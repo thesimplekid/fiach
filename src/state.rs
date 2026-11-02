@@ -540,16 +540,8 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                                 pr,
                                 age_secs,
                                 stale_after_secs,
-                                "Found stale in_progress lock, proceeding with review"
+                                "Found stale in_progress lock, checking retry eligibility"
                             );
-                            if metadata.commit_hash == current_hash {
-                                if max_failed_retries
-                                    .is_some_and(|limit| metadata.retry_count >= limit)
-                                {
-                                    return Ok(ReviewDecision::Skip);
-                                }
-                                return Ok(ReviewDecision::RetryFailed);
-                            }
                             // Fall through to commit hash check for newer commits.
                         } else {
                             tracing::debug!(repo, pr, "PR review is already in progress, skipping");
@@ -557,7 +549,7 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                         }
                     }
                     if metadata.commit_hash == current_hash {
-                        if metadata.status == "failed" {
+                        if metadata.status == "failed" || metadata.status == "in_progress" {
                             if let Some(limit) = max_failed_retries {
                                 let now = time::OffsetDateTime::now_utc().unix_timestamp();
                                 let next_retry = metadata.retry_not_before.unwrap_or_else(|| {
@@ -584,7 +576,7 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                                 commit = %current_hash,
                                 review_kind = %review_kind,
                                 retries = metadata.retry_count,
-                                "Retrying previously failed review at the same commit"
+                                "Retrying failed or interrupted review at the same commit"
                             );
                             return Ok(ReviewDecision::RetryFailed);
                         }
@@ -1544,6 +1536,58 @@ mod tests {
             .unwrap(),
             ReviewDecision::RetryFailed
         );
+    }
+
+    #[test]
+    fn stale_in_progress_review_obeys_retry_backoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let check = |commit| {
+            should_review_with_retry_limit(
+                &db_path,
+                "owner/repo",
+                42,
+                commit,
+                "security",
+                STALE_AFTER_SECS,
+                5,
+            )
+            .unwrap()
+        };
+
+        // A crashed fourth retry is stale before its 80-minute backoff expires.
+        // Exercise both the computed deadline and an explicitly stored deadline.
+        for explicit_deadline in [false, true] {
+            let mut crashed = metadata_with_timestamp(
+                "head",
+                "in_progress",
+                4,
+                now - STALE_AFTER_SECS as i64 - 60,
+            );
+            if explicit_deadline {
+                // Ensure the stored deadline takes precedence over the fallback.
+                crashed.timestamp = now - 10_000;
+                crashed.retry_not_before = Some(now + 600);
+            }
+            mark_reviewed(&db_path, "owner/repo", 42, &crashed).unwrap();
+            assert_eq!(check("head"), ReviewDecision::Skip);
+            assert_eq!(check("head"), ReviewDecision::Skip);
+            assert_eq!(check("new-head"), ReviewDecision::ReReview);
+
+            // Advance the persisted schedule without sleeping.
+            if explicit_deadline {
+                crashed.retry_not_before = Some(now - 60);
+            } else {
+                crashed.timestamp = now - 10_000;
+            }
+            mark_reviewed(&db_path, "owner/repo", 42, &crashed).unwrap();
+            assert_eq!(check("head"), ReviewDecision::RetryFailed);
+
+            crashed.retry_count = 5;
+            mark_reviewed(&db_path, "owner/repo", 42, &crashed).unwrap();
+            assert_eq!(check("head"), ReviewDecision::Skip);
+        }
     }
 
     #[test]
