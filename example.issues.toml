@@ -2,9 +2,11 @@
 # Watch: fiach --config example.issues.toml issues --watch
 # The daemon also runs this workflow when [issues] is present in its config.
 [issues]
-publish = false # Set true to apply labels/comments and publish verified draft PRs.
+publish = false # Set true to acknowledge trusted mentions, apply labels/comments and publish verified draft PRs.
 auto_fix = true
 # Opt in to trusted issue-comment triggers (independent of PR review settings).
+# Accepted comment mentions receive 👀 before triage when publish is true.
+# This acknowledges receipt, not a promise to produce a fix.
 # trigger_mention = "fiach-bot"
 # allowed_mention_users = ["your-github-login"]
 # To enable PR revisions too, see [issues.iterations] at the end of this file.

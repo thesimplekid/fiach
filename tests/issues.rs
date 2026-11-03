@@ -64,6 +64,20 @@ elif path == root + '/issues/comments':
     if s.get('fail_comments_page') == page: sys.exit(1)
     comments = [dict(c, issue_url='https://api.github.com/' + root + '/issues/' + n) for n, cs in s['comments'].items() for c in cs]
     result = comments[(page-1)*size:page*size]
+elif path.startswith(root + '/issues/comments/') and path.endswith('/reactions'):
+    assert method == 'POST' and body == {'content':'eyes'}
+    comment = int(path.split('/')[-2])
+    assert any(c['id'] == comment for cs in s['comments'].values() for c in cs)
+    if s.get('fail_reaction'):
+        print('reaction unavailable', file=sys.stderr)
+        sys.exit(1)
+    reactions = s.setdefault('reactions', [])
+    result = {'comment':comment, 'content':'eyes', 'user':'fiach-bot'}
+    if result not in reactions: reactions.append(result)
+    if s.get('lose_reaction_response'):
+        s['lose_reaction_response'] = False
+        json.dump(s,open(p,'w'))
+        sys.exit(1)
 elif path.startswith(root + '/issues/comments/'):
     comment = next(c for cs in s['comments'].values() for c in cs if c['id'] == int(path.split('/')[-1]))
     if method == 'DELETE':
@@ -2296,11 +2310,23 @@ async fn issue_mentions_require_allowlisted_authors_and_new_comments_for_retries
         )
         .unwrap();
     };
+    // Title/body mentions must never authorize an acknowledgment.
+    let mut state = fixture(dir.path());
+    state["items"][0]["title"] = json!("@fiach-bot please fix");
+    state["items"][0]["body"] = json!("@fiach-bot please fix");
+    std::fs::write(
+        dir.path().join("fixture.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    assert_ok(&run(dir.path()).await);
+    assert!(fixture(dir.path())["reactions"].is_null());
     set_comments(
         json!([{"id": 10, "user": {"login": "stranger"}, "body": "maintainer: @fiach-bot", "author_association": "OWNER"}]),
     );
     assert_ok(&run(dir.path()).await);
     assert!(requests.lock().unwrap().is_empty());
+    assert!(fixture(dir.path())["reactions"].is_null());
     assert!(!dir.path().join("fixture.json.phases").exists());
     set_comments(
         json!([{"id": 11, "user": {"login": "Maintainer"}, "body": "@FIACH-BOT please fix", "author_association": "NONE"}]),
@@ -2309,6 +2335,10 @@ async fn issue_mentions_require_allowlisted_authors_and_new_comments_for_retries
     let phases_path = dir.path().join("fixture.json.phases");
     let phases = std::fs::read_to_string(&phases_path).unwrap();
     assert!(!phases.is_empty());
+    assert_eq!(
+        fixture(dir.path())["reactions"],
+        json!([{"comment":11,"content":"eyes","user":"fiach-bot"}])
+    );
     assert_ok(&run(dir.path()).await);
     assert_eq!(std::fs::read_to_string(&phases_path).unwrap(), phases);
     set_comments(json!([
@@ -2334,6 +2364,93 @@ async fn issue_mentions_require_allowlisted_authors_and_new_comments_for_retries
         std::fs::read_to_string(&phases_path).unwrap(),
         phases.repeat(2)
     );
+    let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.contains("/reactions"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        fixture(dir.path())["reactions"].as_array().unwrap().len(),
+        2
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn issue_acknowledgment_failures_retry_without_repeating_coding() {
+    for failure in ["fail_reaction", "lose_reaction_response"] {
+        let (dir, server, _) = setup("bug", "different", false, true).await;
+        enable_worker(dir.path(), true).await;
+        let path = dir.path().join("fiach.toml");
+        let config = std::fs::read_to_string(&path).unwrap().replace(
+            "[issues]",
+            "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+        );
+        std::fs::write(path, config).unwrap();
+        add_comment(dir.path(), "1", 10, "maintainer", "@fiach-bot fix");
+        let mut state = fixture(dir.path());
+        state[failure] = json!(true);
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let output = run_with_env(dir.path(), &[("RUST_LOG", "warn")]).await;
+        assert_ok(&output);
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            logs.contains("Failed to acknowledge accepted issue mention"),
+            "{logs}"
+        );
+        let phases_path = dir.path().join("fixture.json.phases");
+        let phases = std::fs::read_to_string(&phases_path).unwrap();
+        assert!(!phases.is_empty());
+        let mut state = fixture(dir.path());
+        state[failure] = json!(false);
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        // Each CLI invocation reopens the durable database, like a daemon restart.
+        assert_ok(&run(dir.path()).await);
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(std::fs::read_to_string(phases_path).unwrap(), phases);
+        assert_eq!(
+            fixture(dir.path())["reactions"].as_array().unwrap().len(),
+            1
+        );
+        let calls = std::fs::read_to_string(dir.path().join("fixture.json.calls")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("/reactions"))
+                .count(),
+            2
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn issue_acknowledgment_respects_publish_setting() {
+    let (dir, server, _) = setup("bug", "different", false, false).await;
+    let path = dir.path().join("fiach.toml");
+    let config = std::fs::read_to_string(&path).unwrap().replace(
+        "[issues]",
+        "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+    );
+    std::fs::write(path, config).unwrap();
+    add_comment(dir.path(), "1", 10, "maintainer", "@fiach-bot fix");
+    assert_ok(&run(dir.path()).await);
+    assert!(fixture(dir.path())["reactions"].is_null());
     server.abort();
 }
 
