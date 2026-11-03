@@ -184,6 +184,18 @@ impl Github {
         ))
     }
 
+    /// GitHub returns the existing reaction when this user already added it, so
+    /// retrying after a lost response or interrupted local save is safe.
+    pub async fn acknowledge_issue_trigger(&self, repo: &str, comment: u64) -> Result<()> {
+        api(
+            &format!("repos/{repo}/issues/comments/{comment}/reactions"),
+            "POST",
+            Some(json!({"content": "eyes"})),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Existing references are only a comment deduplication signal, not fix evidence.
     pub async fn linked_work(
         &self,

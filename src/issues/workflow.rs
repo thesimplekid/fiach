@@ -37,6 +37,8 @@ struct Record {
     attempted: Option<String>,
     #[serde(default)]
     last_attempted_mention: Option<u64>,
+    #[serde(default)]
+    last_acknowledged_mention: Option<u64>,
     pr: Option<String>,
     pending: Option<Publication>,
 }
@@ -487,6 +489,27 @@ async fn process(
     let issue = issue?;
     if !issue.open || issue.is_pr {
         return Ok(iteration_worked);
+    }
+    // Acknowledgment is independent of triage caching and coding authorization.
+    // Retry failed reactions even when work is cached, without granting a new attempt.
+    if config.publish
+        && let Some(comment) = trigger
+        && record
+            .last_acknowledged_mention
+            .is_none_or(|last| comment > last)
+    {
+        match github
+            .acknowledge_issue_trigger(&project.repo, comment)
+            .await
+        {
+            Ok(()) => {
+                record.last_acknowledged_mention = Some(comment);
+                store.put(&key, &record)?;
+            }
+            Err(error) => {
+                tracing::warn!(repo = %project.repo, issue = number, comment, error = %error, "Failed to acknowledge accepted issue mention");
+            }
+        }
     }
     let fingerprint = digest(&(
         fingerprint(project, &issue, inventory, config.publish, config.auto_fix)?,
