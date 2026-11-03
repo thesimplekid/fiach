@@ -522,6 +522,7 @@ async fn process(
         &config.jev_base_url,
         super::triage::CACHE_VERSION,
         crate::jev::MODEL,
+        "trusted-request-dispatch-v1",
     ))?;
     if record.fingerprint == fingerprint {
         return Ok(iteration_worked);
@@ -553,6 +554,21 @@ async fn process(
     };
     let mut decision = match result {
         Ok(decision) => decision,
+        Err(error) if trigger.is_some() => {
+            tracing::warn!(repo = %project.repo, issue = number, %error, "Triage failed; handing trusted request to investigation worker");
+            Decision {
+                fix_kind: super::FixKind::Investigation,
+                route: Route::NeedsReview,
+                auto_fix_eligible: false,
+                area_uncertain: true,
+                labels: vec![route_label(project, &Route::NeedsReview).to_owned()],
+                matches: vec![],
+                related: vec![],
+                unresolved: vec![],
+                guidance: None,
+                explanation: "Triage could not complete. Investigate the requested issue and report concrete findings or missing information.".into(),
+            }
+        }
         Err(error) => {
             let failures = record
                 .retry
@@ -579,7 +595,7 @@ async fn process(
     store.put(&key, &record)?;
     if config.publish
         && config.auto_fix
-        && decision.ready_for_execution()
+        && (trigger.is_some() || decision.ready_for_execution())
         && record.pr.is_none()
         && record.pending.is_none()
     {
@@ -610,7 +626,8 @@ async fn process(
                 worker_config,
                 &issue,
                 project,
-                fix_kind,
+                &decision,
+                trigger.is_some(),
                 &config.scratch_dir,
                 cancel,
             )
@@ -774,6 +791,16 @@ async fn process(
                     );
                 }
             }
+        }
+    }
+    if trigger.is_some() && record.pr.is_none() && record.pending.is_none() {
+        if !config.auto_fix {
+            decision.guidance = Some("The fix request cannot start because automatic fixes are disabled in the host configuration.".into());
+        } else if config.worker.is_none() {
+            decision.guidance =
+                Some("The fix request cannot start because no coding worker is configured.".into());
+        } else if decision.guidance.is_none() && !decision.ready_for_execution() {
+            decision.guidance = Some(decision.explanation.clone());
         }
     }
     if record.pending.is_some() && (!config.auto_fix || config.worker.is_none()) {

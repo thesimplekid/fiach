@@ -494,6 +494,12 @@ with open(os.environ['FIXTURE'] + '.sandbox','a') as f:
         'sockets': [os.path.exists(brokers[0] + '/' + r['socket']) for r in manifest['routes']],
         'real_key_in_manifest': os.environ.get('OPENROUTER_API_KEY', '') in json.dumps(manifest),
         'setenv': [a for a in args if a.startswith('--setenv=') and 'KEY' in a]}) + '\n')
+fixture = json.load(open(os.environ['FIXTURE']))
+if i['phase'] == 'code':
+    json.dump(i,open(os.environ['FIXTURE'] + '.request','w'))
+    if fixture.get('investigation_response'):
+        json.dump({'status':'needs_info','summary':'Which version reproduces the failure?', 'test_files':[], 'reproduction':[], 'approved':False},open(output + '/report.json','w'))
+        sys.exit(0)
 report = {'status':'candidate','summary':'Fix persisted amount','test_files':['tests/test_amount.py'],'reproduction':['python3','tests/test_amount.py'],'approved':False}
 if i['phase'] == 'code' and i['fix_kind'] == 'maintenance':
     open(workspace + '/rust-toolchain.toml','w').write('[toolchain]\nchannel = "1.98.1"\n')
@@ -2754,6 +2760,119 @@ async fn pr_iterations_never_update_closed_merged_or_forked_prs() {
                 .len(),
             1,
             "{mode}"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn trusted_requests_dispatch_triage_blocked_tasks_once_with_context() {
+    for (kind, body, coverage, expected_route) in [
+        ("bug", "UNCERTAIN_AREA", "different", "ready"),
+        ("bug", "Concrete bug", "uncertain", "ready"),
+        ("bug", "MISSING_INFO", "different", "needs_info"),
+        (
+            "feature",
+            "Choose reject or clamp for negative amounts",
+            "different",
+            "needs_decision",
+        ),
+        (
+            "uncertain",
+            "Unclear classification",
+            "different",
+            "needs_review",
+        ),
+    ] {
+        let (dir, server, _) = setup(kind, coverage, coverage == "uncertain", true).await;
+        enable_worker(dir.path(), false).await;
+        let mut state = fixture(dir.path());
+        state["items"][0]["body"] = json!(body);
+        state["investigation_response"] = json!(true);
+        save_fixture(dir.path(), &state);
+        // First cache the autonomous blocked decision, without any coding attempt.
+        assert_ok(&run(dir.path()).await);
+        let phases = dir.path().join("fixture.json.phases");
+        assert!(!phases.exists());
+        let path = dir.path().join("fiach.toml");
+        let config = std::fs::read_to_string(&path).unwrap().replace(
+            "[issues]",
+            "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+        );
+        std::fs::write(path, config).unwrap();
+        let mut state = fixture(dir.path());
+        state["comments"]["1"] = json!([{"id": 80, "user": {"login": "maintainer"}, "body": "@fiach-bot please fix this issue"}]);
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(std::fs::read_to_string(&phases).unwrap(), "code\n");
+        let request: Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("fixture.json.request")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request["triage"]["route"], expected_route);
+        assert_eq!(request["triage"]["auto_fix_eligible"], false);
+        assert!(
+            fixture(dir.path())["comments"]["1"]
+                .to_string()
+                .contains("Which version reproduces")
+        );
+        assert!(fixture(dir.path()).get("prs").is_none());
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(std::fs::read_to_string(&phases).unwrap(), "code\n");
+        let mut state = fixture(dir.path());
+        state["comments"]["1"].as_array_mut().unwrap().push(
+            json!({"id": 90, "user": {"login": "maintainer"}, "body": "@fiach-bot please retry"}),
+        );
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(std::fs::read_to_string(&phases).unwrap(), "code\ncode\n");
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn trusted_dispatch_preserves_patch_and_publication_gates() {
+    for (kind, body, response, phases) in [
+        (
+            "bug",
+            "UNCERTAIN_AREA",
+            false,
+            "code\ncheck\ncheck\nverify\n",
+        ),
+        ("uncertain", "Concrete investigation", false, "code\n"),
+        ("bug", "CLASSIFICATION_INVALID", true, "code\n"),
+    ] {
+        let (dir, server, _) = setup(kind, "different", false, true).await;
+        enable_worker(dir.path(), false).await;
+        let path = dir.path().join("fiach.toml");
+        let config = std::fs::read_to_string(&path).unwrap().replace(
+            "[issues]",
+            "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+        );
+        std::fs::write(path, config).unwrap();
+        let mut state = fixture(dir.path());
+        state["items"][0]["body"] = json!(body);
+        state["investigation_response"] = json!(response);
+        state["comments"]["1"] =
+            json!([{"id": 80, "user": {"login": "maintainer"}, "body": "@fiach-bot please fix"}]);
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("fixture.json.phases")).unwrap(),
+            phases
+        );
+        assert!(fixture(dir.path()).get("prs").is_none());
+        assert!(
+            fixture(dir.path())["comments"]["1"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["user"]["login"] == "fiach-bot")
+        );
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("fixture.json.phases")).unwrap(),
+            phases
         );
         server.abort();
     }

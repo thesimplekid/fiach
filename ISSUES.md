@@ -17,10 +17,12 @@ fiach --config issues.toml issues --watch     # continuous polling
 prints JSON decisions and saves state without GitHub writes or coding-agent runs.
 Set `publish = true` to apply labels and, when there are actionable details, a
 single bot-owned triage comment. Generic maintainer-review and ready statuses are
-label-only. Comments carry confirmed matching/related links, missing-information
+label-only for autonomous processing; trusted requests also receive execution
+blocker feedback. Comments carry confirmed matching/related links, missing-information
 requests, concrete worker guidance, or a draft PR link.
 Set up `[issues.worker]` to enable coding; without it, eligible issues receive the
-ready label but no coding job starts. `auto_fix = false` enables classification
+ready label but no coding job starts. Trusted requests receive an explanation of
+the missing worker. `auto_fix = false` enables classification
 and marking without coding jobs. Adding `[issues]` to the regular daemon config
 runs one sequential issue worker alongside the existing PR-review scheduler.
 Issue jobs currently do not appear in the review web dashboard.
@@ -43,8 +45,13 @@ Existing trusted comments count when enabling the setting.
 
 Each new trusted mention comment permits one coding attempt. Editing a comment
 or adding an untrusted comment does not authorize another attempt. A new trusted
-mention can retry a failed worker, but cannot bypass area permissions, triage,
-verification, or existing-PR checks. Removing the mention or revoking its author
+mention dispatches the issue to the coding agent regardless of its readiness
+label, triage route, area uncertainty, or unresolved coverage. Triage is supplied
+as investigation context; if classification fails, the worker receives an
+investigation task instead. The agent can report findings or ask for missing
+information. Global `auto_fix`, `publish`, and a configured worker are still
+required. Trusted requests do not bypass patch area permissions, verification,
+publication eligibility, or existing-PR checks. Removing the mention or revoking its author
 blocks further processing and pending publication. Without these settings, the
 existing automatic polling behavior is preserved.
 
@@ -75,7 +82,8 @@ If classification fails or exhausts its budget, completed requests remain
 cached. Retrying resumes the missing work with a fresh per-issue budget. A
 persistent cooldown starts at 60 seconds and doubles to a maximum of one hour;
 changed evidence or configuration can bypass it. The normal polling interval
-still applies. Partial scans never authorize marking or coding. Keep the state
+still applies. A trusted request can instead start an investigation after a
+classification failure. An incomplete GitHub inventory scan still stops the pass. Keep the state
 database across restarts to retain both progress and retry history.
 
 ## Classification and policy
@@ -89,7 +97,9 @@ changed file must match an allowed area, and any matching disabled area wins.
 Deletes and both sides of renames are checked. Description-only areas are valid
 for triage, but automatic fixes require explicit paths for every area.
 Every applicable area must permit automation, at least one area
-must match, and no area's applicability may be uncertain before coding starts.
+must match, and no area's applicability may be uncertain before autonomous coding starts.
+Trusted requests can start an investigation without those triage conditions;
+patch acceptance still requires explicit, permitted area paths.
 Readiness is independent of permissions: disabled global or area automation does
 not imply an unresolved maintainer choice. `ready-for-agent` means sufficient
 context and established direction; it does not authorize execution. The stored
@@ -103,9 +113,10 @@ Routine test maintenance, including concrete mutation-survivor investigation, is
 also actionable: selecting useful tests and assessing equivalent mutations are
 engineering work. A survivor is evidence to investigate, not proof of a production
 bug. Test maintenance currently uses `fix_kind = "investigation"` and cannot run
-automatically, even with all permissions enabled. The maintenance worker and its
+automatically. A trusted request can start its investigation, but an investigation
+report cannot authorize a candidate patch or publication. The maintenance worker and its
 verification rules support only Rust toolchain updates; broader maintenance needs
-its own validation policy before execution can be enabled.
+its own validation policy before patches can be accepted.
 
 Duplicate comparisons use both open/closed issues and open PRs. Fiach compares
 each entry in the complete inventory, including its full discussion. Duplicate

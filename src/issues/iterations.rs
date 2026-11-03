@@ -368,7 +368,7 @@ impl Iteration<'_> {
                 .context("Missing issue worker")?,
             &issue,
             self.project,
-            state.fix_kind,
+            (state.fix_kind, None),
             &self.config.scratch_dir,
             self.cancel,
             Some(&revision),

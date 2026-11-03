@@ -7,6 +7,8 @@ auto_fix = true
 # Opt in to trusted issue-comment triggers (independent of PR review settings).
 # Accepted comment mentions receive 👀 before triage when publish is true.
 # This acknowledges receipt, not a promise to produce a fix.
+# Trusted mentions dispatch coding regardless of triage readiness; patch permissions,
+# verification and publication checks still apply. auto_fix and a worker are required.
 # trigger_mention = "fiach-bot"
 # allowed_mention_users = ["your-github-login"]
 # To enable PR revisions too, see [issues.iterations] at the end of this file.
