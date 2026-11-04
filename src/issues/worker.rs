@@ -698,13 +698,22 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     Ok(serde_json::from_str(&read_regular(path, 1024 * 1024)?)?)
 }
 
-/// Internal worker entrypoint; runs only inside an isolated, pre-staged workspace.
-pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result<()> {
+fn validate_worker_environment(input_path: &Path, container_manager_path: &Path) -> Result<()> {
+    // nspawn writes this marker even in command mode. /run/systemd/container
+    // is written by guest systemd, which our minimal sandbox never starts.
+    // This is a startup sanity check, not authentication of the host launcher.
     ensure!(
         input_path == Path::new("/input/request.json")
-            && Path::new("/run/systemd/container").exists(),
+            && read_regular(container_manager_path, 128)
+                .is_ok_and(|manager| manager.trim() == "systemd-nspawn"),
         "issue-worker requires the host-managed container"
     );
+    Ok(())
+}
+
+/// Internal worker entrypoint; runs only inside an isolated, pre-staged workspace.
+pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result<()> {
+    validate_worker_environment(&input_path, Path::new("/run/host/container-manager"))?;
     let input: Input = read_json(&input_path)?;
     ensure!(
         input.fix_kind != FixKind::Investigation || input.phase == "code",
@@ -877,6 +886,34 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_worker_accepts_command_mode_nspawn_without_guest_systemd() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("run/host/container-manager");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "systemd-nspawn\n").unwrap();
+
+        assert!(!root.path().join("run/systemd/container").exists());
+        assert!(validate_worker_environment(Path::new("/input/request.json"), &marker).is_ok());
+        assert!(validate_worker_environment(Path::new("/tmp/request.json"), &marker).is_err());
+    }
+
+    #[test]
+    fn issue_worker_rejects_missing_or_invalid_container_manager() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("container-manager");
+        let input = Path::new("/input/request.json");
+
+        assert!(validate_worker_environment(input, &marker).is_err());
+        for manager in ["", "docker\n", "systemd-nspawn-other\n"] {
+            std::fs::write(&marker, manager).unwrap();
+            assert!(validate_worker_environment(input, &marker).is_err());
+        }
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(validate_worker_environment(input, &marker).is_err());
+    }
 
     #[test]
     fn issue_worker_machine_name_is_veth_safe() {
