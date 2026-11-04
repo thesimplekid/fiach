@@ -112,6 +112,7 @@ pub struct Labels {
     pub needs_decision: String,
     pub needs_review: String,
     pub ready: String,
+    pub execution_blocked: String,
 }
 
 impl Default for Labels {
@@ -127,6 +128,7 @@ impl Default for Labels {
             needs_decision: "needs-decision".into(),
             needs_review: "needs-review".into(),
             ready: "ready-for-agent".into(),
+            execution_blocked: "execution-blocked".into(),
         }
     }
 }
@@ -145,6 +147,7 @@ impl Project {
             &l.needs_decision,
             &l.needs_review,
             &l.ready,
+            &l.execution_blocked,
         ]
         .into_iter()
         .cloned()

@@ -2766,6 +2766,108 @@ async fn pr_iterations_never_update_closed_merged_or_forked_prs() {
 }
 
 #[tokio::test]
+async fn trusted_request_configuration_blockers_are_visible_and_reconsidered() {
+    for mode in ["disabled", "missing", "both"] {
+        let (dir, server, _) = setup("bug", "uncertain", true, true).await;
+        if mode == "disabled" {
+            enable_worker(dir.path(), false).await;
+        }
+        let path = dir.path().join("fiach.toml");
+        let config = std::fs::read_to_string(&path).unwrap().replace(
+            "[issues]",
+            "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+        );
+        let config = if mode == "missing" {
+            config.replacen("auto_fix = false", "auto_fix = true", 1)
+        } else if mode == "disabled" {
+            config.replacen("auto_fix = true", "auto_fix = false", 1)
+        } else {
+            config
+        };
+        std::fs::write(&path, config).unwrap();
+        let mut state = fixture(dir.path());
+        state["items"][0]["body"] = json!("UNCERTAIN_AREA");
+        state["investigation_response"] = json!(true);
+        state["comments"]["1"] =
+            json!([{"id": 80, "user": {"login": "maintainer"}, "body": "@fiach-bot please fix"}]);
+        save_fixture(dir.path(), &state);
+        assert_ok(&run(dir.path()).await);
+        let phases = dir.path().join("fixture.json.phases");
+        assert!(!phases.exists());
+        let blocked = fixture(dir.path());
+        let labels = blocked["items"][0]["labels"].as_array().unwrap();
+        assert!(labels.iter().any(|l| l["name"] == "ready-for-agent"));
+        assert!(labels.iter().any(|l| l["name"] == "execution-blocked"));
+        let comments = blocked["comments"]["1"].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        let comment = comments
+            .iter()
+            .find(|c| c["user"]["login"] == "fiach-bot")
+            .unwrap();
+        let body = comment["body"].as_str().unwrap();
+        assert_eq!(
+            body.contains("automatic fixes are disabled"),
+            mode != "missing"
+        );
+        assert_eq!(
+            body.contains("no coding worker is configured"),
+            mode != "disabled"
+        );
+        assert!(body.contains("update and reload"));
+        assert!(body.contains("next poll"));
+        assert!(!body.contains("Related work:"));
+        assert!(!body.contains("Matching work:"));
+        // Each CLI invocation reopens durable state, covering restart idempotency.
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(fixture(dir.path())["comments"], blocked["comments"]);
+        assert!(!phases.exists());
+        // The same request can run once configuration permits it.
+        if mode == "disabled" {
+            let config = std::fs::read_to_string(&path).unwrap().replacen(
+                "auto_fix = false",
+                "auto_fix = true",
+                1,
+            );
+            std::fs::write(&path, config).unwrap();
+        } else {
+            enable_worker(dir.path(), false).await;
+        }
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(std::fs::read_to_string(&phases).unwrap(), "code\n");
+        let updated = fixture(dir.path());
+        assert!(
+            !updated["items"][0]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["name"] == "execution-blocked")
+        );
+        let updated_comments = updated["comments"]["1"].as_array().unwrap();
+        assert_eq!(updated_comments.len(), 2);
+        let updated_comment = updated_comments
+            .iter()
+            .find(|c| c["user"]["login"] == "fiach-bot")
+            .unwrap();
+        assert_eq!(updated_comment["id"], comment["id"]);
+        assert!(
+            !updated_comment["body"]
+                .as_str()
+                .unwrap()
+                .contains("Execution blocked:")
+        );
+        assert!(
+            updated_comment["body"]
+                .as_str()
+                .unwrap()
+                .contains("Which version reproduces")
+        );
+        assert_ok(&run(dir.path()).await);
+        assert_eq!(std::fs::read_to_string(&phases).unwrap(), "code\n");
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn trusted_requests_dispatch_triage_blocked_tasks_once_with_context() {
     for (kind, body, coverage, expected_route) in [
         ("bug", "UNCERTAIN_AREA", "different", "ready"),

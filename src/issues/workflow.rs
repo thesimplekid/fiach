@@ -522,7 +522,7 @@ async fn process(
         &config.jev_base_url,
         super::triage::CACHE_VERSION,
         crate::jev::MODEL,
-        "trusted-request-dispatch-v1",
+        "trusted-request-dispatch-v2",
     ))?;
     if record.fingerprint == fingerprint {
         return Ok(iteration_worked);
@@ -794,11 +794,22 @@ async fn process(
         }
     }
     if trigger.is_some() && record.pr.is_none() && record.pending.is_none() {
+        let mut blockers = Vec::new();
         if !config.auto_fix {
-            decision.guidance = Some("The fix request cannot start because automatic fixes are disabled in the host configuration.".into());
-        } else if config.worker.is_none() {
-            decision.guidance =
-                Some("The fix request cannot start because no coding worker is configured.".into());
+            blockers.push("automatic fixes are disabled (enable issues.auto_fix)");
+        }
+        if config.worker.is_none() {
+            blockers.push("no coding worker is configured (configure issues.worker)");
+        }
+        if !blockers.is_empty() {
+            decision
+                .labels
+                .push(project.labels.execution_blocked.clone());
+            decision.guidance = Some(format!(
+                "Execution blocked: {}. A host operator must update and reload the configuration. Fiach will reconsider this request on the next poll after that change; unchanged polls do not retry or repeat this comment. A new trusted request also triggers reconsideration, but does not bypass these requirements. The {} label describes task readiness, not execution authorization.",
+                blockers.join("; "),
+                project.labels.ready
+            ));
         } else if decision.guidance.is_none() && !decision.ready_for_execution() {
             decision.guidance = Some(decision.explanation.clone());
         }

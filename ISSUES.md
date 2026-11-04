@@ -27,6 +27,16 @@ and marking without coding jobs. Adding `[issues]` to the regular daemon config
 runs one sequential issue worker alongside the existing PR-review scheduler.
 Issue jobs currently do not appear in the review web dashboard.
 
+Trusted requests blocked by disabled automation or a missing worker receive the
+`execution-blocked` label in addition to their task readiness label. The bot's
+single triage comment lists all configuration blockers and asks a host operator
+to update and reload the configuration. The next poll reconsiders changed
+configuration; unchanged polls preserve the status without repeating comments.
+A new trusted request also triggers reconsideration but cannot bypass these
+requirements. Once configuration permits execution, the blocked label is removed
+and the comment is updated to the worker outcome (or removed when no longer
+needed). Configure the label name with `issues.repos.labels.execution_blocked`.
+
 To require a trusted mention before processing an issue, configure:
 
 ```toml

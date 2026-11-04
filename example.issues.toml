@@ -78,6 +78,7 @@ addressed = "already-being-addressed"
 needs_info = "needs-info"
 needs_decision = "needs-decision"
 ready = "ready-for-agent"
+execution_blocked = "execution-blocked"
 
 # Enable fix workers by supplying a rootfs containing this version of fiach,
 # /bin/git, /bin/ip, CA certificates and your project's build/test tools.
