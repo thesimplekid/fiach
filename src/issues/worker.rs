@@ -524,6 +524,10 @@ fn validate_patch_paths(paths: &str, report: &Report, kind: FixKind) -> Result<(
     Ok(())
 }
 
+fn sandbox_machine_name() -> String {
+    crate::daemon::sandbox_machine_name(uuid::Uuid::new_v4())
+}
+
 async fn sandbox(
     input: &Input,
     checkout: &Path,
@@ -558,7 +562,7 @@ async fn sandbox(
     let output = tempfile::Builder::new()
         .prefix("fiach-artifacts-")
         .tempdir_in(scratch)?;
-    let machine = format!("fiach-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let machine = sandbox_machine_name();
     let network = if input.config.network == "veth" {
         Some(crate::daemon::SandboxVethReservation::reserve(&machine)?)
     } else {
@@ -873,6 +877,22 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_worker_machine_name_is_veth_safe() {
+        let machine = sandbox_machine_name();
+        let interface = crate::daemon::sandbox_host_interface_name(&machine);
+
+        assert!(machine.starts_with("fiach-"));
+        assert!(machine.len() <= 12);
+        assert!(interface.len() <= 15);
+        assert!(
+            machine
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+    }
+
     #[test]
     fn maintenance_allows_scoped_toolchain_and_lock_updates() {
         let mut report = Report {

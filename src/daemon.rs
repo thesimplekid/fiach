@@ -505,7 +505,7 @@ fn reserve_sandbox_veth_index(machine_name: &str, active_subnets: &mut HashSet<u
     );
 }
 
-fn sandbox_host_interface_name(machine_name: &str) -> String {
+pub(crate) fn sandbox_host_interface_name(machine_name: &str) -> String {
     format!("ve-{machine_name}")
 }
 
@@ -2243,15 +2243,13 @@ fn sandbox_machine_name_for_run(repo: &str, pr_number: u64, review_kind: &str) -
         .unwrap_or(0)
         ^ u128::from(std::process::id());
 
-    sandbox_machine_name(repo, pr_number, review_kind, nonce)
+    sandbox_machine_name((repo, pr_number, review_kind, nonce))
 }
 
-fn sandbox_machine_name(repo: &str, pr_number: u64, review_kind: &str, nonce: u128) -> String {
+/// Leave room for nspawn's `ve-` prefix within Linux's 15-byte interface limit.
+pub(crate) fn sandbox_machine_name(seed: impl Hash) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    repo.hash(&mut hasher);
-    pr_number.hash(&mut hasher);
-    review_kind.hash(&mut hasher);
-    nonce.hash(&mut hasher);
+    seed.hash(&mut hasher);
 
     format!("fiach-{}", base36_suffix(hasher.finish(), 6))
 }
@@ -2668,8 +2666,8 @@ mod tests {
 
     #[test]
     fn sandbox_machine_name_is_short_and_veth_safe() {
-        let name = sandbox_machine_name("owner/repo", 42, "security", 123);
-        let host_interface_name = format!("ve-{name}");
+        let name = sandbox_machine_name(("owner/repo", 42, "security", 123_u128));
+        let host_interface_name = sandbox_host_interface_name(&name);
 
         assert!(name.starts_with("fiach-"));
         assert_eq!(name.len(), 12);
@@ -2683,8 +2681,8 @@ mod tests {
     #[test]
     fn sandbox_machine_name_varies_by_nonce() {
         assert_ne!(
-            sandbox_machine_name("owner/repo", 42, "security", 123),
-            sandbox_machine_name("owner/repo", 42, "security", 124)
+            sandbox_machine_name(("owner/repo", 42, "security", 123_u128)),
+            sandbox_machine_name(("owner/repo", 42, "security", 124_u128))
         );
     }
 
