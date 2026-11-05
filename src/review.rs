@@ -3672,7 +3672,7 @@ pub fn is_fatal_provider_error(e: &anyhow::Error) -> bool {
 /// Retry budget shared by every reply-stream (re)start within one agent phase.
 pub(crate) struct ReplyRetry<'a> {
     agent: &'a Agent,
-    session_config: &'a SessionConfig,
+    session_config: SessionConfig,
     cancel_token: &'a CancellationToken,
     phase: &'static str,
     max_retries: u32,
@@ -3693,13 +3693,19 @@ impl<'a> ReplyRetry<'a> {
     ) -> Self {
         Self {
             agent,
-            session_config,
+            session_config: session_config.clone(),
             cancel_token,
             phase,
             max_retries,
             retries: 0,
             delay_secs,
         }
+    }
+
+    /// Bound final reporting turns without resetting the transport retry budget.
+    pub(crate) fn limit_turns(&mut self, limit: u32) {
+        self.session_config.max_turns =
+            Some(self.session_config.max_turns.unwrap_or(limit).min(limit));
     }
 
     fn exhausted(&self) -> bool {
@@ -4136,6 +4142,9 @@ Reviewed the PR and found no vulnerabilities.
             );
             retry.backoff().await;
         }
+        retry.limit_turns(3);
+        assert_eq!(retry.session_config.max_turns, Some(1));
+        // Switching to final reporting must not replenish an exhausted network budget.
         let error = retry
             .stream_error(anyhow::anyhow!("Stream decode error"))
             .unwrap_err();

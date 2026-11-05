@@ -298,8 +298,22 @@ No repository code or reproduction command executes on the host.
 Jev has a per-pass cost limit; publication rechecks use another pass. Coding has
 turn and wall-time limits, not a dollar limit in this version. Set provider-side
 spending limits as appropriate. Worker logs, structured reports and transcripts
-are retained in `scratch_dir/fiach-artifacts-*`; temporary clones and rootfs copies
-are removed. Successful candidate patches and verification reports are also
+are retained in `scratch_dir/fiach-artifacts-*`. Each directory includes
+`context.json` identifying the issue, phase, base, and validation policy. Failed
+workers also retain their checkout (including untracked files) in `workspace/`
+and a host failure summary in `failure.txt`; temporary clones and the remaining
+rootfs are removed. Retained work is diagnostic evidence, never automatically
+reused or published.
+
+Coders submit `submit_candidate` or `submit_blocked`; verifiers submit
+`submit_verdict`. Tools validate fields and phase rules immediately, and save an
+accepted `report.json` before acknowledging it. Assistant prose is not parsed as
+a report. Transcripts are flushed after each message. Transient provider failures
+share three transport retries. A session ending without a submission gets at most
+two reporting-only continuations, each capped at three turns with the developer
+tools removed. Turn exhaustion is logged separately from transport errors.
+Host patch policy, regression checks, and independent verification still gate
+publication. Successful candidate patches and verification reports are also
 stored beside the database under `issues.artifacts/OWNER_REPO/NUMBER/`. These
 artifacts can contain repository/issue data; apply your own retention policy.
 
