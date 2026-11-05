@@ -720,7 +720,10 @@ async fn process(
                                 .await?
                                 .trim()
                                 .to_owned();
-                            let summary = "The isolated coding agent prepared this patch. The host ran the same regression command against the original code with the new test (failed) and the complete patch (passed). An independent verifier approved the fix. Full evidence is retained in the local issue artifacts.".to_owned();
+                            let summary = match fix_kind {
+                                super::FixKind::Bug => "The isolated coding agent prepared this patch. The host ran the same regression command against the original code with the new test (failed) and the complete patch (passed). An independent verifier approved the fix. Full evidence is retained in the local issue artifacts.",
+                                _ => "The isolated coding agent prepared this maintenance patch. The host ran the validation command successfully on the patched tree. An independent verifier approved the changes. No failing baseline is required for this validation policy. Full evidence is retained in the local issue artifacts.",
+                            }.to_owned();
                             record.pending = Some(Publication {
                                 branch: branch.clone(),
                                 commit: commit.clone(),

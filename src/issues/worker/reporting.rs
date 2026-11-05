@@ -79,6 +79,7 @@ fn validate(name: &str, report: &Report, verify: bool, kind: FixKind) -> Result<
                     report.test_files.is_empty(),
                     "Maintenance requires empty test_files"
                 ),
+                FixKind::TestMaintenance => {}
                 FixKind::Investigation => anyhow::bail!("Investigation cannot submit a candidate"),
             }
             ensure!(
@@ -196,6 +197,24 @@ mod tests {
             .is_ok()
         );
         assert!(validate("submit_candidate", &maintenance, false, FixKind::Bug).is_err());
+        assert!(
+            validate(
+                "submit_candidate",
+                &maintenance,
+                false,
+                FixKind::TestMaintenance
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                "submit_candidate",
+                &candidate,
+                false,
+                FixKind::TestMaintenance
+            )
+            .is_ok()
+        );
         maintenance.reproduction.clear();
         assert!(
             validate(

@@ -141,6 +141,16 @@ You can copy the environment template to get started:
 cp .env.example .env
 ```
 
+### Issue test maintenance
+
+Issue fixes for test maintenance, including mutation-survivor reports, use the
+`test_maintenance` validation policy. Workers can propose test-only patches or
+justified mutation exclusions, including scoped `.config/mutants.toml` changes.
+The host requires a passing test command on the patched tree and independent
+verification before opening a draft PR for maintainer review. No failing baseline
+is required. Project area permissions still apply; the verifier must reject
+production behavior changes, weakened tests, and unjustified exclusions.
+
 ### Development Checks
 
 The repository pins Rust 1.98.1 in `rust-toolchain.toml`; the Nix shell uses the

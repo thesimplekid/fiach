@@ -513,6 +513,15 @@ if i['phase'] == 'code' and i['fix_kind'] == 'maintenance':
     subprocess.check_call(['git','add','-N','.'],cwd=workspace)
     patch = subprocess.check_output(['git','diff','--binary',i['base']],cwd=workspace)
     open(output + '/patch.diff','wb').write(patch)
+elif i['phase'] == 'code' and i['fix_kind'] == 'test_maintenance':
+    os.mkdir(workspace + '/tests')
+    open(workspace + '/tests/test_amount.py','w').write('import runpy\nassert runpy.run_path("calc.py")["amount"]() == 0\n')
+    report['summary'] = 'Cover existing amount behavior'
+    if fixture.get('fail_maintenance_check'):
+        report['reproduction'] = ['python3','-c','raise RuntimeError("test failed")']
+    subprocess.check_call(['git','add','-N','.'],cwd=workspace)
+    patch = subprocess.check_output(['git','diff','--binary',i['base']],cwd=workspace)
+    open(output + '/patch.diff','wb').write(patch)
 elif i['phase'] == 'code' and i.get('revision'):
     fixture = json.load(open(os.environ['FIXTURE']))
     assert i['base'] == i['revision']['head']
@@ -560,7 +569,7 @@ elif i['phase'] == 'check':
     json.dump({'success':p.returncode==0,'output':p.stdout+p.stderr},open(output + '/check.json','w'))
     sys.exit(0)
 elif i['phase'] == 'verify':
-    expected = 'Host maintenance build/test command' if i['fix_kind'] == 'maintenance' else 'Host regression command'
+    expected = 'Host maintenance build/test command' if i['fix_kind'] in ['maintenance', 'test_maintenance'] else 'Host regression command'
     assert expected in i['report']['summary']
     fixture = json.load(open(os.environ['FIXTURE']))
     report['approved'] = not fixture.get('reject_verifier',False)
@@ -722,15 +731,22 @@ async fn agent_phases_reach_models_only_through_the_host_broker() {
 
 #[tokio::test]
 async fn maintenance_requires_passing_checks_and_independent_verification() {
-    for (fail_check, reject_verifier) in [(false, false), (true, false), (false, true)] {
-        let (dir, server, _) = setup("toolchain_update", "different", false, true).await;
+    for (kind, (fail_check, reject_verifier)) in ["toolchain_update", "maintenance"]
+        .into_iter()
+        .flat_map(|kind| {
+            [(false, false), (true, false), (false, true)].map(move |case| (kind, case))
+        })
+    {
+        let (dir, server, _) = setup(kind, "different", false, true).await;
         enable_worker(dir.path(), reject_verifier).await;
-        let config_path = dir.path().join("fiach.toml");
-        let config = std::fs::read_to_string(&config_path).unwrap().replace(
-            "paths = [\"calc.py\", \"tests/**\"]",
-            "paths = [\"rust-toolchain.toml\", \"flake.lock\"]",
-        );
-        std::fs::write(config_path, config).unwrap();
+        if kind == "toolchain_update" {
+            let config_path = dir.path().join("fiach.toml");
+            let config = std::fs::read_to_string(&config_path).unwrap().replace(
+                "paths = [\"calc.py\", \"tests/**\"]",
+                "paths = [\"rust-toolchain.toml\", \"flake.lock\"]",
+            );
+            std::fs::write(config_path, config).unwrap();
+        }
         if fail_check {
             set_flag(dir.path(), "fail_maintenance_check");
         }
@@ -1819,8 +1835,8 @@ async fn actionable_tasks_keep_readiness_separate_from_execution_permissions() {
         .flat_map(|kind| ["different", "uncertain"].map(move |coverage| (kind, coverage)))
     {
         for (global, areas) in [(false, false), (false, true), (true, false), (true, true)] {
-            // Existing worker tests cover executable bugs and toolchain updates.
-            if global && areas && kind != "maintenance" && coverage == "different" {
+            // Existing worker tests cover executable bugs and both maintenance policies.
+            if global && areas && coverage == "different" {
                 continue;
             }
             let (dir, server, requests) =
@@ -1860,7 +1876,7 @@ async fn actionable_tasks_keep_readiness_separate_from_execution_permissions() {
             assert_eq!(result["decision"]["route"], "ready");
             assert_eq!(
                 result["decision"]["auto_fix_eligible"],
-                areas && kind != "maintenance" && coverage == "different"
+                areas && coverage == "different"
             );
             assert_eq!(
                 result["decision"]["unresolved"],
@@ -1883,7 +1899,7 @@ async fn actionable_tasks_keep_readiness_separate_from_execution_permissions() {
                 if kind == "toolchain_update" {
                     "maintenance"
                 } else if kind == "maintenance" {
-                    "investigation"
+                    "test_maintenance"
                 } else {
                     "bug"
                 }

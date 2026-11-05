@@ -42,6 +42,8 @@ pub enum FixKind {
     #[default]
     Bug,
     Maintenance,
+    /// Tests and justified mutation exclusions, without production behavior changes.
+    TestMaintenance,
     /// Actionable work without a supported automatic validation policy.
     Investigation,
 }
@@ -98,6 +100,8 @@ mod tests {
         decision.area_uncertain = false;
         decision.fix_kind = FixKind::Investigation;
         assert!(!decision.ready_for_execution());
+        decision.fix_kind = FixKind::TestMaintenance;
+        assert!(decision.ready_for_execution());
         decision.fix_kind = FixKind::Bug;
         decision.unresolved.push(42);
         assert!(!decision.ready_for_execution());
