@@ -968,6 +968,12 @@ async fn collect_worker_reply<W: tokio::io::AsyncWrite + Unpin>(
                 return Ok(end);
             }
             if message.role == rmcp::model::Role::Assistant {
+                // Authentication failures (and other structured Goose errors) are
+                // error blocks, not text. Keep their cause instead of asking the
+                // model to repair a supposedly missing report.
+                if let Some(error) = message.content.iter().find_map(|c| c.as_error()) {
+                    anyhow::bail!("Worker provider/transport failure: {}", error.message);
+                }
                 let text: String = message
                     .content
                     .iter()
@@ -1043,6 +1049,8 @@ mod tests {
         for text in [
             "Ran into this error: Stream decode error.\n\nPlease retry if you think this is a transient or recoverable error.",
             "Network error: connection reset\n\nPlease resend your message to try again.",
+            "Ran into this error: 503 Service Unavailable: no provider is available.\n\nPlease retry if you think this is a transient or recoverable error.",
+            "Ran into this error: 502 Bad Gateway: provider response was invalid.\n\nPlease retry if you think this is a transient or recoverable error.",
         ] {
             let mut stream = futures::stream::iter(vec![Ok(AgentEvent::Message(
                 Message::assistant().with_text(text),
@@ -1053,6 +1061,107 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("provider/transport failure"));
             assert!(error.to_string().contains(text));
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_preserves_structured_goose_errors() {
+        use goose::conversation::message::MessageErrorKind;
+
+        let mut stream = futures::stream::iter(vec![Ok(AgentEvent::Message(
+            Message::assistant().with_error(MessageErrorKind::Authentication, "Invalid API key"),
+        ))])
+        .boxed();
+        let error = collect_worker_reply(&mut stream, &mut Vec::new(), &Mutex::new(None))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid API key"));
+    }
+
+    #[tokio::test]
+    async fn fragmented_text_recovers_through_reporting_tool() {
+        use goose::agents::{mcp_client::McpClientTrait, tool_execution::ToolCallContext};
+
+        // Synthetic token-sized deltas reproduce the reported failure shape.
+        // The private diagnostic archive is not a repository fixture. Neither
+        // fragments nor cumulative snapshots are authoritative submissions.
+        for status in ["needs_review", "candidate"] {
+            let report = Report {
+                status: status.into(),
+                summary: "Result requiring host validation".into(),
+                test_files: vec!["tests/regression.rs".into()],
+                reproduction: vec!["cargo".into(), "test".into()],
+                approved: false,
+            };
+            let text = serde_json::to_string(&report).unwrap();
+            let reports = Arc::new(Mutex::new(None));
+            let mut events = vec![
+                Ok(AgentEvent::Message(
+                    Message::assistant().with_text("Investigating"),
+                )),
+                Ok(AgentEvent::Message(Message::user().with_text("Continue"))),
+                Ok(AgentEvent::Message(
+                    Message::assistant().with_thinking("reasoning", "sig"),
+                )),
+            ];
+            events.extend(text.chars().map(|c| {
+                Ok(AgentEvent::Message(
+                    Message::assistant().with_text(c.to_string()),
+                ))
+            }));
+            events.push(Ok(AgentEvent::Message(Message::assistant().with_text(""))));
+            events.push(Ok(AgentEvent::Message(
+                Message::assistant().with_text(&text),
+            )));
+            let mut stream = futures::stream::iter(events).boxed();
+            assert_eq!(
+                collect_worker_reply(&mut stream, &mut Vec::new(), &reports)
+                    .await
+                    .unwrap(),
+                ReplyEnd::Finished
+            );
+            assert!(reports.lock().await.is_none());
+
+            let output = tempfile::tempdir().unwrap();
+            let client = reporting::ReportingClient {
+                verify: false,
+                kind: FixKind::Bug,
+                output: output.path().into(),
+                report: reports.clone(),
+            };
+            let tool = if status == "candidate" {
+                "submit_candidate"
+            } else {
+                "submit_blocked"
+            };
+            let args = serde_json::from_str(&text).unwrap();
+            // Model a reporting-only recovery, with a lost provider connection
+            // after the real MCP submission has been persisted.
+            let mut recovery = futures::stream::once(async {
+                let result = client
+                    .call_tool(
+                        &ToolCallContext::new("test".into(), None, None),
+                        tool,
+                        Some(args),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(result.is_error, Some(true));
+                Err(anyhow::anyhow!("Stream decode error"))
+            })
+            .boxed();
+            let result = collect_worker_reply(&mut recovery, &mut Vec::new(), &reports).await;
+            assert!(result.is_err());
+            // run_agent checks the durable submission before handling this error.
+            assert_eq!(*reports.lock().await, Some(report.clone()));
+            let persisted: Report = serde_json::from_slice(
+                &tokio::fs::read(output.path().join("report.json"))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(persisted, report);
         }
     }
 

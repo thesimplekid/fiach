@@ -42,6 +42,12 @@ struct Record {
     pr: Option<String>,
     pending: Option<Publication>,
 }
+impl Record {
+    fn blocks_attempt(&self, attempt_key: &str, trigger: Option<u64>) -> bool {
+        self.attempted.as_deref() == Some(attempt_key)
+            || trigger.is_some_and(|id| self.last_attempted_mention.is_some_and(|last| id <= last))
+    }
+}
 #[derive(Serialize, Deserialize)]
 struct Retry {
     fingerprint: String,
@@ -603,10 +609,7 @@ async fn process(
             Some(id) => digest(&("mention", id))?,
             None => digest(&(content_key(&issue)?, super::triage::CACHE_VERSION))?,
         };
-        if record.attempted.as_deref() == Some(&attempt_key)
-            || trigger
-                .is_some_and(|id| record.last_attempted_mention.is_some_and(|last| id <= last))
-        {
+        if record.blocks_attempt(&attempt_key, trigger) {
             reroute(
                 project,
                 &mut decision,
@@ -1031,6 +1034,20 @@ fn fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_attempt_allows_a_fresh_trusted_command_but_not_replay() {
+        let record = super::Record {
+            attempted: Some("failed-attempt".into()),
+            last_attempted_mention: Some(100),
+            ..Default::default()
+        };
+        assert!(record.blocks_attempt("failed-attempt", None));
+        assert!(record.blocks_attempt("changed-content", Some(100)));
+        assert!(record.blocks_attempt("older-command", Some(99)));
+        assert!(!record.blocks_attempt("new-command", Some(101)));
+        assert!(!record.blocks_attempt("changed-content", None));
+    }
 
     #[test]
     fn rejected_request_waits_for_changed_evidence_and_legacy_retries_expire() {

@@ -285,7 +285,9 @@ A missing or changed pending branch stops for inspection.
 Closed prior bot PRs receive `needs-review` and do not trigger another PR.
 
 Failed/interrupted coding attempts are not repeated for unchanged issue content.
-A substantive issue/comment update permits another investigation. Keep the state
+A fresh trusted `@fiach-bot fix` command permits a deliberate retry after inspecting
+the failure artifacts; the consumed command and older commands cannot be replayed.
+Without a mention trigger, changed issue content permits another investigation. Keep the state
 file: deleting it loses the attempt history and is not a normal retry mechanism.
 
 The host GitHub credential is never forwarded to issue containers. Coding and
@@ -316,6 +318,15 @@ Host patch policy, regression checks, and independent verification still gate
 publication. Successful candidate patches and verification reports are also
 stored beside the database under `issues.artifacts/OWNER_REPO/NUMBER/`. These
 artifacts can contain repository/issue data; apply your own retention policy.
+
+Older workers parsed only the last assistant text event and could reject valid
+JSON split across streamed messages with `Worker finished without a valid
+structured JSON result`. The reporting-tool worker no longer uses that parser.
+If that exact error persists, check the revision used to build the running worker
+binary and deploy a build containing the reporting-tool change (`8e9e2b32`). A
+source checkout or a successful HTTP response does not establish which worker
+code ran or whether its response stream completed. A valid submitted report is
+still only a model claim until the host validation and verifier succeed.
 
 ## PR feedback and iteration
 
