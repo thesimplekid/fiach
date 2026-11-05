@@ -3670,7 +3670,7 @@ pub fn is_fatal_provider_error(e: &anyhow::Error) -> bool {
 }
 
 /// Retry budget shared by every reply-stream (re)start within one agent phase.
-struct ReplyRetry<'a> {
+pub(crate) struct ReplyRetry<'a> {
     agent: &'a Agent,
     session_config: &'a SessionConfig,
     cancel_token: &'a CancellationToken,
@@ -3683,7 +3683,7 @@ struct ReplyRetry<'a> {
 type ReplyStream<'a> = futures::stream::BoxStream<'a, Result<AgentEvent>>;
 
 impl<'a> ReplyRetry<'a> {
-    fn new(
+    pub(crate) fn new(
         agent: &'a Agent,
         session_config: &'a SessionConfig,
         cancel_token: &'a CancellationToken,
@@ -3708,7 +3708,7 @@ impl<'a> ReplyRetry<'a> {
 
     /// Classifies a mid-stream error: fatal provider errors are marked, and
     /// transient ones fail only once the retry budget is spent.
-    fn stream_error(&self, error: anyhow::Error) -> Result<anyhow::Error> {
+    pub(crate) fn stream_error(&self, error: anyhow::Error) -> Result<anyhow::Error> {
         if is_fatal_error(&error) {
             return Err(fatal_provider_error(error, self.phase));
         }
@@ -3730,7 +3730,7 @@ impl<'a> ReplyRetry<'a> {
     }
 
     /// Starts a reply stream, retrying transient failures within the shared budget.
-    async fn start(&mut self, message: Message) -> Result<ReplyStream<'a>> {
+    pub(crate) async fn start(&mut self, message: Message) -> Result<ReplyStream<'a>> {
         loop {
             match self
                 .agent
@@ -3770,7 +3770,7 @@ impl<'a> ReplyRetry<'a> {
     }
 
     /// Backs off, then restarts the stream with a follow-up prompt.
-    async fn restart(&mut self, message: Message) -> Result<ReplyStream<'a>> {
+    pub(crate) async fn restart(&mut self, message: Message) -> Result<ReplyStream<'a>> {
         self.backoff().await;
         self.start(message).await
     }
@@ -4115,6 +4115,38 @@ Reviewed the PR and found no vulnerabilities.
             let sandbox = anyhow::anyhow!("Sandboxed review failed: {error:#}");
             assert!(is_fatal_error(&sandbox));
         }
+    }
+
+    #[tokio::test]
+    async fn reply_retry_bounds_stream_failures_and_preserves_cause() {
+        let (agent, _, _dir) = coordinator_test_session().await;
+        let config = SessionConfig {
+            id: "retry-test".into(),
+            schedule_id: None,
+            max_turns: Some(1),
+            retry_config: None,
+        };
+        let cancel = CancellationToken::new();
+        let mut retry = ReplyRetry::new(&agent, &config, &cancel, "issue worker", 3, 0);
+        for _ in 0..3 {
+            assert!(
+                retry
+                    .stream_error(anyhow::anyhow!("Stream decode error"))
+                    .is_ok()
+            );
+            retry.backoff().await;
+        }
+        let error = retry
+            .stream_error(anyhow::anyhow!("Stream decode error"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("after 3 retries"));
+        assert!(format!("{error:#}").contains("Stream decode error"));
+        let retry = ReplyRetry::new(&agent, &config, &cancel, "issue worker", 3, 0);
+        assert!(is_fatal_provider_error(
+            &retry
+                .stream_error(anyhow::anyhow!("HTTP 401 unauthorized"))
+                .unwrap_err()
+        ));
     }
 
     #[test]

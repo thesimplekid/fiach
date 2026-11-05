@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use futures::StreamExt;
 use goose::{
-    agents::{Agent, AgentEvent, ExtensionConfig, SessionConfig, state_machine},
+    agents::{Agent, AgentEvent, ExtensionConfig, SessionConfig},
     config::GooseMode,
     conversation::message::{Message, MessageContent},
     model_config::model_config_from_user_config,
@@ -829,41 +829,27 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
         max_turns: Some(input.config.max_turns),
         retry_config: None,
     };
-    let mut stream = agent
-        .reply(
-            Message::user().with_text(&prompt),
-            config,
-            state_machine::enabled(),
-            Some(cancel),
-        )
-        .await?;
-    let mut last = String::new();
+    // Share the review harness's bounded budget across start and stream failures.
+    // Reuse the session so completed tool calls and their results remain available.
+    let mut retry = crate::review::ReplyRetry::new(&agent, &config, &cancel, "issue worker", 3, 10);
+    let mut stream = retry.start(Message::user().with_text(&prompt)).await?;
     let mut transcript = String::new();
-    while let Some(event) = stream.next().await {
-        if let AgentEvent::Message(message) = event? {
-            transcript.push_str(&serde_json::to_string(&message)?);
-            transcript.push('\n');
-            if message.role == rmcp::model::Role::Assistant {
-                let text: String = message
-                    .content
-                    .iter()
-                    .filter_map(|c| {
-                        if let MessageContent::Text(t) = c {
-                            Some(t.text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !text.trim().is_empty() {
-                    last = text;
-                }
+    let report = loop {
+        let result = collect_worker_reply(&mut stream, &mut transcript).await;
+        tokio::fs::write("/output/transcript.jsonl", &transcript).await?;
+        match result {
+            Ok(report) => break report,
+            Err(error) => {
+                let error = retry.stream_error(error)?;
+                tracing::warn!(error = %error, session_id = %config.id, "Worker reply interrupted or incomplete; resuming session");
+                // Drop the old stream before resuming any agent/tool activity.
+                drop(stream);
+                stream = retry.restart(Message::user().with_text(
+                    "Your previous reply was interrupted or did not produce the required JSON result. Continue in this session from the existing work and tool results. Do not repeat completed tool actions. If an action's outcome is uncertain, inspect the current state before acting. Finish with only the JSON object required by your worker contract.",
+                )).await?;
             }
         }
-    }
-    tokio::fs::write("/output/transcript.jsonl", transcript).await?;
-    let report: Report =
-        serde_json::from_str(last.trim()).context("Worker must return structured JSON")?;
+    };
     tokio::fs::write("/output/report.json", serde_json::to_vec(&report)?).await?;
     if !verify && report.status == "candidate" {
         let patch = git(
@@ -883,9 +869,113 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
     Ok(())
 }
 
+/// Goose currently surfaces some provider errors as terminal assistant messages,
+/// rather than stream errors. Match its wrappers, not arbitrary mentions of errors.
+fn worker_provider_error(text: &str) -> Option<anyhow::Error> {
+    let text = text.trim();
+    let wrapped = text.starts_with("Ran into this error: ")
+        && text.ends_with("Please retry if you think this is a transient or recoverable error.");
+    let network = text.ends_with("\n\nPlease resend your message to try again.");
+    (wrapped || network).then(|| anyhow::anyhow!("Worker provider/transport failure: {text}"))
+}
+
+async fn collect_worker_reply(
+    stream: &mut futures::stream::BoxStream<'_, Result<AgentEvent>>,
+    transcript: &mut String,
+) -> Result<Report> {
+    let mut last = String::new();
+    while let Some(event) = stream.next().await {
+        if let AgentEvent::Message(message) = event.context("Worker reply stream failed")? {
+            transcript.push_str(&serde_json::to_string(&message)?);
+            transcript.push('\n');
+            if message.role == rmcp::model::Role::Assistant {
+                let text: String = message
+                    .content
+                    .iter()
+                    .filter_map(|c| {
+                        if let MessageContent::Text(t) = c {
+                            Some(t.text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if let Some(error) = worker_provider_error(&text) {
+                    return Err(error);
+                }
+                if !text.trim().is_empty() {
+                    last = text;
+                }
+            }
+        }
+    }
+    serde_json::from_str(last.trim())
+        .context("Worker finished without a valid structured JSON result")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_preserves_stream_failure_instead_of_parsing_partial_json() {
+        let mut stream = futures::stream::iter(vec![
+            Ok(AgentEvent::Message(
+                Message::assistant().with_text("{\"status\":"),
+            )),
+            Err(anyhow::anyhow!("Stream decode error")),
+        ])
+        .boxed();
+        let mut transcript = String::new();
+        let error = collect_worker_reply(&mut stream, &mut transcript)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Stream decode error"));
+        assert!(!format!("{error:#}").contains("JSON"));
+        assert!(!transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_detects_goose_terminal_provider_messages() {
+        for text in [
+            "Ran into this error: Stream decode error.\n\nPlease retry if you think this is a transient or recoverable error.",
+            "Network error: connection reset\n\nPlease resend your message to try again.",
+        ] {
+            let mut stream = futures::stream::iter(vec![Ok(AgentEvent::Message(
+                Message::assistant().with_text(text),
+            ))])
+            .boxed();
+            let error = collect_worker_reply(&mut stream, &mut String::new())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("provider/transport failure"));
+            assert!(error.to_string().contains(text));
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_accepts_structured_result_and_rejects_incomplete_output() {
+        let report = r#"{"status":"needs_review","summary":"Stream decode error investigated","test_files":[],"reproduction":[],"approved":false}"#;
+        let mut stream = futures::stream::iter(vec![Ok(AgentEvent::Message(
+            Message::assistant().with_text(report),
+        ))])
+        .boxed();
+        assert_eq!(
+            collect_worker_reply(&mut stream, &mut String::new())
+                .await
+                .unwrap()
+                .status,
+            "needs_review"
+        );
+        let mut stream = futures::stream::empty().boxed();
+        assert!(
+            collect_worker_reply(&mut stream, &mut String::new())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("structured JSON")
+        );
+    }
 
     #[test]
     fn issue_worker_accepts_command_mode_nspawn_without_guest_systemd() {
