@@ -118,6 +118,15 @@ The review agent can execute shell commands. In sandbox mode, provider API keys 
 
 Issue worker code and verify phases use the same broker with only their phase's model; regression checks get no model access.
 
+For OpenAI-compatible endpoints such as Numes that may reject replayed reasoning,
+set `FIACH_OPENAI_OMIT_REASONING_CONTENT=true` on the host, or set
+`services.fiach.openaiOmitReasoningContent = true;` in NixOS. The default is
+`false`. This removes only the `reasoning_content` field from messages in
+brokered `openai` chat-completion requests, including assistant tool calls.
+It does not disable reasoning generation or change returned responses.
+Direct requests outside the broker, other providers, and the Responses API are
+unaffected. Only enable it for endpoints that do not require replayed reasoning.
+
 Sandboxed reviews get no GitHub credentials either. The host clones the PR and its context repositories into the container's rootfs under `/review` and writes `/fiach-input/review.json` with the PR lifecycle and base context, the PR title and body for skill discovery, and the existing PR discussion for deduplication. The child adopts that checkout after checking it is at the staged commit and makes no GitHub calls. The host rejects a result whose commit or disclosure-policy commits differ from what it staged. Deduplication therefore compares against discussion as of the start of the review rather than after verification.
 
 Inside the container, `GITHUB_TOKEN` and `/fiach-input/gh/hosts.yml` (via `GH_CONFIG_DIR`) hold a random token shaped like a GitHub PAT. It grants nothing; the broker treats it as a canary. The host `GITHUB_TOKEN` is never forwarded to the model-controlled process.

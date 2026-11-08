@@ -282,6 +282,8 @@ pub struct RouteConfig {
     pub sandbox_key: Credential,
     /// Exact model names the job may request, with their prices when known.
     pub models: BTreeMap<String, Option<Pricing>>,
+    /// Omit replayed reasoning from OpenAI chat-completion messages.
+    pub omit_reasoning_content: bool,
 }
 
 impl RouteConfig {
@@ -299,9 +301,23 @@ impl RouteConfig {
             .ok()
             .filter(|host| !host.trim().is_empty())
             .unwrap_or_else(|| provider.default_upstream().to_owned());
+        let omit_reasoning_content = if provider == Provider::OpenAi {
+            match std::env::var("FIACH_OPENAI_OMIT_REASONING_CONTENT") {
+                Ok(value) => value
+                    .parse::<bool>()
+                    .context("FIACH_OPENAI_OMIT_REASONING_CONTENT must be true or false")?,
+                Err(std::env::VarError::NotPresent) => false,
+                Err(error) => {
+                    return Err(error).context("Reading FIACH_OPENAI_OMIT_REASONING_CONTENT");
+                }
+            }
+        } else {
+            false
+        };
         Ok(Self {
             provider,
             upstream,
+            omit_reasoning_content,
             credential: Credential::new(credential),
             sandbox_key: Credential::new(sandbox_key()),
             models: models.into_iter().collect(),
@@ -472,6 +488,17 @@ impl Shared {
     }
 }
 
+/// Only remove the protocol field, never similarly named tool arguments or content.
+fn omit_reasoning_content(request: &mut Value) {
+    if let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(message) = message.as_object_mut() {
+                message.remove("reasoning_content");
+            }
+        }
+    }
+}
+
 struct RouteState {
     provider: Provider,
     upstream: String,
@@ -479,6 +506,7 @@ struct RouteState {
     sandbox_key: Credential,
     models: BTreeMap<String, Option<Pricing>>,
     max_request_bytes: usize,
+    omit_reasoning_content: bool,
     client: reqwest::Client,
     shared: Arc<Shared>,
 }
@@ -582,6 +610,7 @@ impl Broker {
                 credential: route.credential,
                 sandbox_key: route.sandbox_key.clone(),
                 models: route.models,
+                omit_reasoning_content: route.omit_reasoning_content,
                 max_request_bytes: config.max_request_bytes,
                 client,
                 shared: shared.clone(),
@@ -800,7 +829,7 @@ async fn forward(
     if route.shared.budget_exhausted() {
         return record.finish_denied(StatusCode::FORBIDDEN, "job cost budget exhausted");
     }
-    let body = match axum::body::to_bytes(body, route.max_request_bytes).await {
+    let mut body = match axum::body::to_bytes(body, route.max_request_bytes).await {
         Ok(body) => body,
         Err(_) => return record.finish_denied(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
     };
@@ -817,11 +846,26 @@ async fn forward(
         ModelLocation::None => None,
         ModelLocation::Path(model) => Some(model),
         ModelLocation::Body => {
-            let Ok(json) = serde_json::from_slice::<Value>(&body) else {
+            let Ok(mut json) = serde_json::from_slice::<Value>(&body) else {
                 return record.finish_denied(StatusCode::BAD_REQUEST, "request body is not JSON");
             };
             if let Err(message) = route.provider.check_body(&json) {
                 return record.finish_denied(StatusCode::FORBIDDEN, message);
+            }
+            if route.omit_reasoning_content
+                && route.provider == Provider::OpenAi
+                && path == "/v1/chat/completions"
+            {
+                omit_reasoning_content(&mut json);
+                body = match serde_json::to_vec(&json) {
+                    Ok(body) => Bytes::from(body),
+                    Err(_) => {
+                        return record.finish_denied(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "request serialization failed",
+                        );
+                    }
+                };
             }
             match json.get("model").and_then(Value::as_str) {
                 Some(model) => Some(model.to_owned()),
@@ -1443,6 +1487,7 @@ mod tests {
         RouteConfig {
             provider,
             upstream: upstream.to_owned(),
+            omit_reasoning_content: false,
             credential: Credential::new(format!("real-{provider}-key")),
             sandbox_key: Credential::new(sandbox_key()),
             models: BTreeMap::from([(
@@ -1629,6 +1674,78 @@ mod tests {
             let expected_cost = (case.input as f64 + 2.0 * case.output as f64) / 1_000_000.0;
             assert!((report.usage.cost_usd - expected_cost).abs() < 1e-12);
         }
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_omission_is_opt_in_and_scoped() {
+        for (provider, path, enabled, removed) in [
+            (Provider::OpenAi, "/v1/chat/completions", false, false),
+            (Provider::OpenAi, "/v1/chat/completions", true, true),
+            (Provider::OpenAi, "/v1/responses", true, false),
+            (
+                Provider::OpenRouter,
+                "/api/v1/chat/completions",
+                true,
+                false,
+            ),
+        ] {
+            let (upstream, mock) =
+                mock_upstream(|_| axum::Json(serde_json::json!({"choices": []})).into_response())
+                    .await;
+            let mut config = route(provider, &upstream, "test-model");
+            config.omit_reasoning_content = enabled;
+            let broker = start(vec![config], None).await;
+            let original = serde_json::json!({
+                "model": "test-model",
+                "reasoning_effort": "high",
+                "messages": [
+                    {"role": "assistant", "content": null, "reasoning_content": "thinking",
+                     "tool_calls": [{"id": "call_1", "type": "function",
+                        "function": {"name": "inspect", "arguments": "{\"reasoning_content\":\"keep\"}"}}]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "reasoning_content"}
+                ]
+            });
+            let response = reqwest::Client::new()
+                .post(format!("{}{path}", base(&broker)))
+                .bearer_auth(key(&broker))
+                .json(&original)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let forwarded: Value =
+                serde_json::from_slice(&mock.seen.lock().unwrap()[0].body).unwrap();
+            let mut expected = original;
+            if removed {
+                expected["messages"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reasoning_content");
+            }
+            assert_eq!(forwarded, expected);
+            broker.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_reasoning_still_triggers_canary_protection() {
+        let (upstream, mock) = mock_upstream(|_| StatusCode::OK.into_response()).await;
+        let mut config = route(Provider::OpenAi, &upstream, "test-model");
+        config.omit_reasoning_content = true;
+        let broker = start(vec![config], None).await;
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", base(&broker)))
+            .bearer_auth(key(&broker))
+            .json(&serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "assistant", "reasoning_content": key(&broker)}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 0);
+        broker.shutdown().await;
     }
 
     #[tokio::test]

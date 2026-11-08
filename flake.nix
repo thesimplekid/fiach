@@ -439,6 +439,12 @@
               description = "Compare verified findings with PR discussion using Jev when TYPESAFE_API_KEY is set, with coordinator fallback for unresolved decisions.";
             };
 
+            openaiOmitReasoningContent = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Omit replayed reasoning_content from brokered OpenAI chat-completion requests, for compatible endpoints that reject it. Does not affect direct requests or reasoning generation.";
+            };
+
             environmentFile = lib.mkOption {
               type = lib.types.path;
               description = "Path to environment file containing GITHUB_TOKEN and/or FORGEJO_TOKEN for the configured forges, the selected provider API key, TYPESAFE_API_KEY for live Jev deduplication, and optionally FIACH_SERVER_TOKEN and Buzz credentials.";
@@ -1037,7 +1043,8 @@
                       "HOME=${cfg.dataDir}"
                       "GH_CONFIG_DIR=${cfg.dataDir}/.config/gh"
                       "RUST_LOG=${cfg.logFilter}"
-                    ] ++ lib.optional (cfg.forgejoHost != null) "FORGEJO_HOST=${cfg.forgejoHost}";
+                    ] ++ lib.optional cfg.openaiOmitReasoningContent "FIACH_OPENAI_OMIT_REASONING_CONTENT=true"
+                    ++ lib.optional (cfg.forgejoHost != null) "FORGEJO_HOST=${cfg.forgejoHost}";
                     Restart = "always";
                     RestartSec = "10s";
                     UMask = "0077";
