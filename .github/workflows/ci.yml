@@ -19,7 +19,15 @@ jobs:
       - name: Show Nix caches
         run: nix config show substituters
       - name: Rust checks
-        run: nix develop --command just check
+        run: nix develop --profile "$RUNNER_TEMP/fiach-dev-shell" --command just check
+      - name: Push development shell to Attic
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          readlink -f "$RUNNER_TEMP/fiach-dev-shell" |
+            nix shell .#attic-client --command bash scripts/ci-attic-push.sh
 
   flake-checks:
     name: Flake checks
@@ -31,3 +39,15 @@ jobs:
         run: nix config show substituters
       - name: Flake checks
         run: nix flake check --no-write-lock-file -L
+      - name: Push flake checks to Attic
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          system=$(nix eval --impure --raw --expr builtins.currentSystem)
+          nix eval --raw ".#checks.$system" \
+            --apply 'checks: builtins.concatStringsSep "\n" (map (check: check.outPath) (builtins.attrValues checks)) + "\n"' \
+            > "$RUNNER_TEMP/fiach-check-paths"
+          nix shell .#attic-client --command bash scripts/ci-attic-push.sh \
+            < "$RUNNER_TEMP/fiach-check-paths"

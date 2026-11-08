@@ -85,6 +85,8 @@
           ];
         in
         rec {
+          packages.attic-client = pkgs.attic-client;
+
           packages.default = (pkgs.makeRustPlatform {
             cargo = stable_toolchain;
             rustc = stable_toolchain;

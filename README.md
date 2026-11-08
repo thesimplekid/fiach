@@ -176,6 +176,22 @@ checks exposed by the flake with:
 nix flake check --no-write-lock-file -L
 ```
 
+CI uses the `rith-nix` runner's NixOS-managed Attic substituters and trusted
+public keys. All PRs, including forks, can pull from the public
+`https://cache.thesimplekid.dev/tsk` cache without credentials.
+
+Successful checks on pushes to `main` also upload their Nix closures: the Rust
+job uploads its development environment, and the flake job uploads every check
+output for the runner's system, including the package. Cargo's mutable build
+directory from `just check` is not uploaded.
+
+Set the repository Actions secret `ATTIC_TOKEN` to an Attic token with pull and
+push permissions for the `tsk` cache. Only the upload steps receive it; PR runs
+never log in or upload. The upload helper uses temporary Attic configuration and
+removes it when finished, without modifying the runner's persistent settings.
+Missing credentials or upload failures fail the upload step on `main`.
+The Attic client comes from the repository's pinned nixpkgs input.
+
 ---
 
 ## 📖 Usage Examples
