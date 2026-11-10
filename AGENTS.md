@@ -50,7 +50,6 @@ High-signal constraints and instructions for AI agents working in this repositor
 ## Dependencies & Overrides (CRITICAL)
 
 - **DO NOT** casually change dependency pins or overrides in `Cargo.toml` / `Cargo.lock`; Goose and RMCP versions are sensitive. All Goose crates (`goose`, `goose-providers`, `goose-agent`, `goose-context-management`) share one git rev, and `flake.nix` pins its vendored hash.
-- Keep the manifest `rmcp = "3.4.1"` requirement (and the lockfile at 3.4.1, not the newest 3.x) unless you have verified Goose compatibility and the lockfile outcome. Keep Fiach and Goose on a single compatible RMCP version; do not change this as drive-by churn.
 
 ## Development Setup
 
