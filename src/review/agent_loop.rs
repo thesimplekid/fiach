@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -112,6 +112,8 @@ pub(crate) struct AgentLoop {
     conversation: Mutex<Conversation>,
     usage: UsageLog,
     turn_limit_reached: Arc<AtomicBool>,
+    /// Context size of the latest model call; drives proactive compaction.
+    context_tokens: Arc<AtomicU64>,
 }
 
 impl AgentLoop {
@@ -127,6 +129,7 @@ impl AgentLoop {
             conversation: Mutex::new(Conversation::empty()),
             usage: UsageLog::default(),
             turn_limit_reached: Arc::new(AtomicBool::new(false)),
+            context_tokens: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -205,6 +208,12 @@ impl AgentLoop {
                 max_turns: self.max_turns.load(Ordering::SeqCst),
                 reached: self.turn_limit_reached.clone(),
             })) as Step<'_, LoopSession, LoopEffect>,
+            Step::Operation(Arc::new(Compaction {
+                provider: self.provider.clone(),
+                model_config: self.model_config.clone(),
+                context_tokens: self.context_tokens.clone(),
+                reactive_attempted: AtomicBool::new(false),
+            })),
             Step::Inference(Arc::new(InferenceRunner::new(
                 self.provider.clone(),
                 self.model_config.clone(),
@@ -313,6 +322,8 @@ impl MachineSession for LoopSession {
 pub(crate) enum LoopEffect {
     Conversation(ConversationEffect),
     Usage(ProviderUsage),
+    /// Billable usage of a compaction call; it does not measure the context.
+    CompactionUsage(ProviderUsage),
 }
 
 impl MachineEffect for LoopEffect {
@@ -358,7 +369,16 @@ impl EffectHandler<LoopSession, LoopEffect> for AgentLoop {
     ) -> Result<()> {
         for effect in effects.iter_mut() {
             match effect {
-                LoopEffect::Usage(usage) => self.usage.push(usage.clone()),
+                LoopEffect::Usage(usage) => {
+                    let tokens = nonnegative(usage.usage.input_tokens)
+                        + nonnegative(usage.usage.output_tokens);
+                    self.context_tokens.store(tokens, Ordering::SeqCst);
+                    self.usage.push(usage.clone());
+                }
+                LoopEffect::CompactionUsage(usage) => {
+                    self.context_tokens.store(0, Ordering::SeqCst);
+                    self.usage.push(usage.clone());
+                }
                 LoopEffect::Conversation(ConversationEffect::AppendMessage(message)) => {
                     lock(&self.conversation).push(message.clone());
                 }
@@ -564,6 +584,99 @@ impl HostTools for McpTools {
     }
 }
 
+/// Summarizes the conversation before a model call once the previous call used
+/// most of the model's context window, or once after a context overflow. The
+/// summary replaces the history the model sees; the originals stay recorded.
+struct Compaction {
+    provider: Arc<dyn Provider>,
+    model_config: ModelConfig,
+    context_tokens: Arc<AtomicU64>,
+    reactive_attempted: AtomicBool,
+}
+
+impl Compaction {
+    async fn over_threshold(&self) -> bool {
+        let tokens = self.context_tokens.load(Ordering::SeqCst);
+        if tokens == 0 {
+            return false;
+        }
+        let limit = self
+            .provider
+            .get_context_limit(&self.model_config.model_name, None)
+            .await;
+        limit > 0
+            && tokens as f64 > limit as f64 * goose_context_management::DEFAULT_COMPACTION_THRESHOLD
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation<LoopSession, LoopEffect> for Compaction {
+    fn name(&self) -> &'static str {
+        "compaction"
+    }
+
+    async fn run(
+        &self,
+        session: &LoopSession,
+        conversation: &Conversation,
+        _emit: &Emitter,
+    ) -> Result<OperationResult<LoopEffect>> {
+        let turn = messages_since_kickoff(conversation)?;
+        let overflowed = conversation.last().and_then(Message::error_kind)
+            == Some(MessageErrorKind::ContextLengthExceeded);
+        let conversation = if overflowed {
+            // One reactive attempt per reply; a second overflow is final.
+            if self.reactive_attempted.swap(true, Ordering::SeqCst) {
+                return not_applicable();
+            }
+            let mut messages = conversation.messages().clone();
+            messages.pop();
+            Conversation::new_unvalidated(messages)
+        } else {
+            let awaiting_model = matches!(
+                last_effective_role(turn)?,
+                EffectiveRole::User | EffectiveRole::Tool
+            );
+            if !awaiting_model || !self.over_threshold().await {
+                return not_applicable();
+            }
+            conversation.clone()
+        };
+        tracing::info!(
+            session_id = %session.id,
+            overflowed,
+            context_tokens = self.context_tokens.load(Ordering::SeqCst),
+            "Compacting agent conversation"
+        );
+        match goose::context_mgmt::compact_messages(
+            self.provider.as_ref(),
+            &self.model_config,
+            &session.id,
+            &conversation,
+            false,
+        )
+        .await
+        {
+            Ok(result) => applied([
+                LoopEffect::Conversation(ConversationEffect::ReplaceConversation(
+                    result.conversation,
+                )),
+                LoopEffect::CompactionUsage(result.usage),
+            ]),
+            Err(error) => {
+                // Continue uncompacted; an overflow then ends the reply as a
+                // provider error.
+                tracing::warn!(session_id = %session.id, error = %error, "Compaction failed");
+                not_applicable()
+            }
+        }
+    }
+}
+
+fn nonnegative(tokens: Option<i32>) -> u64 {
+    tokens.unwrap_or(0).max(0) as u64
+}
+
 /// Stops the reply before a model call once the turn has used its budget.
 struct TurnLimit {
     max_turns: u32,
@@ -665,7 +778,10 @@ pub(crate) mod testing {
 
     use futures::stream;
     use goose::{
-        conversation::message::Message,
+        conversation::{
+            message::Message,
+            token_usage::{ProviderUsage, Usage},
+        },
         providers::base::{MessageStream, Provider},
     };
     use goose_providers::{errors::ProviderError, model::ModelConfig};
@@ -677,13 +793,23 @@ pub(crate) mod testing {
     pub(crate) struct Scripted {
         responses: Mutex<std::collections::VecDeque<Result<Message, ProviderError>>>,
         pub calls: Mutex<Vec<(String, Vec<String>)>>,
+        /// Input tokens reported for every call, if any.
+        input_tokens: Option<i32>,
     }
 
     impl Scripted {
         pub fn new(responses: Vec<Result<Message, ProviderError>>) -> Arc<Self> {
+            Self::reporting(responses, None)
+        }
+
+        pub fn reporting(
+            responses: Vec<Result<Message, ProviderError>>,
+            input_tokens: Option<i32>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(responses.into()),
                 calls: Mutex::new(Vec::new()),
+                input_tokens,
             })
         }
     }
@@ -709,7 +835,13 @@ pub(crate) mod testing {
                 .pop_front()
                 .unwrap_or_else(|| Ok(Message::assistant().with_text("done")));
             let message = next?;
-            Ok(Box::pin(stream::iter([Ok((Some(message), None))])))
+            let usage = self.input_tokens.map(|tokens| {
+                ProviderUsage::new(
+                    "scripted".into(),
+                    Usage::new(Some(tokens), Some(10), Some(tokens + 10)),
+                )
+            });
+            Ok(Box::pin(stream::iter([Ok((Some(message), usage))])))
         }
     }
 }
@@ -1033,6 +1165,93 @@ mod tests {
             .unwrap();
         assert_eq!(end, ReplyEnd::Finished);
         assert_eq!(agent.final_text(), "result");
+    }
+
+    fn agent_visible_text(agent: &AgentLoop) -> Vec<String> {
+        lock(&agent.conversation)
+            .iter()
+            .filter(|message| message.is_agent_visible())
+            .map(Message::as_concat_text)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_full_context_is_compacted_before_the_next_model_call() {
+        let provider = Scripted::reporting(
+            vec![
+                Ok(tool_call("call-1", "echo")),
+                Ok(Message::assistant().with_text("SUMMARY OF EARLIER WORK")),
+                Ok(Message::assistant().with_text("done")),
+            ],
+            Some(10_000_000),
+        );
+        let tools = Arc::new(Echo(Mutex::new(Vec::new())));
+        let agent = agent(provider.clone(), tools.clone(), 10);
+
+        let end = agent
+            .reply(
+                Message::user().with_text("go"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(end, ReplyEnd::Finished);
+        assert_eq!(lock(&tools.0).len(), 1);
+        assert_eq!(lock(&provider.calls).len(), 3);
+        let visible = agent_visible_text(&agent).join("\n");
+        assert!(visible.contains("SUMMARY OF EARLIER WORK"), "{visible}");
+        assert!(visible.contains("go"));
+        assert!(!visible.contains("echoed"));
+        assert_eq!(agent.final_text(), "done");
+        // The compaction call is billed like any other.
+        assert_eq!(agent.usage().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_is_compacted_and_retried_once() {
+        let provider = Scripted::new(vec![
+            Err(ProviderError::ContextLengthExceeded("too long".into())),
+            Ok(Message::assistant().with_text("SUMMARY")),
+            Ok(Message::assistant().with_text("done")),
+        ]);
+        let tools = Arc::new(Echo(Mutex::new(Vec::new())));
+        let recovered = agent(provider.clone(), tools, 10);
+
+        let end = recovered
+            .reply(
+                Message::user().with_text("go"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(end, ReplyEnd::Finished);
+        assert_eq!(recovered.final_text(), "done");
+
+        let provider = Scripted::new(vec![
+            Err(ProviderError::ContextLengthExceeded("too long".into())),
+            Ok(Message::assistant().with_text("SUMMARY")),
+            Err(ProviderError::ContextLengthExceeded(
+                "still too long".into(),
+            )),
+        ]);
+        let tools = Arc::new(Echo(Mutex::new(Vec::new())));
+        let repeated = agent(provider.clone(), tools, 10);
+        let end = repeated
+            .reply(
+                Message::user().with_text("go"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let ReplyEnd::ProviderError(error) = end else {
+            panic!("expected a final overflow, got {end:?}");
+        };
+        assert_eq!(error.kind, MessageErrorKind::ContextLengthExceeded);
+        assert_eq!(lock(&provider.calls).len(), 3);
     }
 
     #[test]

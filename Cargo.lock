@@ -1868,6 +1868,7 @@ dependencies = [
  "futures",
  "goose",
  "goose-agent",
+ "goose-context-management",
  "goose-providers",
  "nostr",
  "process-wrap 9.1.0",
