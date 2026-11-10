@@ -1,18 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
-use goose::agents::{mcp_client::McpClientTrait, tool_execution::ToolCallContext};
-use rmcp::{
-    ServiceError,
-    model::{
-        CallToolResult, ContentBlock as Content, InitializeResult, JsonObject, ListToolsResult,
-        Tool,
-    },
-};
+use rmcp::model::{CallToolResult, ContentBlock as Content, JsonObject, Tool};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::{FixKind, Report};
+use crate::review::agent_loop::HostTools;
 
 pub(super) struct ReportingClient {
     pub verify: bool,
@@ -107,13 +101,8 @@ fn validate(name: &str, report: &Report, verify: bool, kind: FixKind) -> Result<
 }
 
 #[async_trait::async_trait]
-impl McpClientTrait for ReportingClient {
-    async fn list_tools(
-        &self,
-        _: &str,
-        _: Option<String>,
-        _: CancellationToken,
-    ) -> std::result::Result<ListToolsResult, ServiceError> {
+impl HostTools for ReportingClient {
+    fn tools(&self) -> Vec<Tool> {
         let names = if self.verify {
             vec!["submit_verdict"]
         } else {
@@ -130,29 +119,26 @@ impl McpClientTrait for ReportingClient {
                 "approved": {"type":"boolean"}
             }
         });
-        let schema = schema.as_object().cloned().unwrap_or_default();
-        Ok(ListToolsResult::with_all_items(names.into_iter().map(|name| Tool::new(name.to_owned(), "Submit the final worker report. Correct any validation error and resubmit. An accepted report is final; stop work. This does not publish a PR.".to_owned(), schema.clone())).collect()))
+        let schema = Arc::new(schema.as_object().cloned().unwrap_or_default());
+        names.into_iter().map(|name| Tool::new(name.to_owned(), "Submit the final worker report. Correct any validation error and resubmit. An accepted report is final; stop work. This does not publish a PR.".to_owned(), schema.clone())).collect()
     }
 
-    async fn call_tool(
+    fn instructions(&self) -> Option<String> {
+        Some("Finish by calling a reporting tool. Plain text or JSON in an assistant message is not a submission. Correct tool validation errors before stopping.".into())
+    }
+
+    async fn call(
         &self,
-        _: &ToolCallContext,
         name: &str,
         arguments: Option<JsonObject>,
         _: CancellationToken,
-    ) -> std::result::Result<CallToolResult, ServiceError> {
-        Ok(match self.submit(name, arguments).await {
+    ) -> CallToolResult {
+        match self.submit(name, arguments).await {
             Ok(()) => CallToolResult::success(vec![Content::text(
                 "Report accepted. Stop work; the host handles validation and publication.",
             )]),
             Err(error) => CallToolResult::error(vec![Content::text(format!("{error:#}"))]),
-        })
-    }
-    fn get_info(&self) -> Option<&InitializeResult> {
-        None
-    }
-    fn get_instructions(&self) -> Option<String> {
-        Some("Finish by calling a reporting tool. Plain text or JSON in an assistant message is not a submission. Correct tool validation errors before stopping.".into())
+        }
     }
 }
 

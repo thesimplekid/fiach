@@ -6,15 +6,17 @@
 
 use std::{
     collections::HashSet,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::{Result, bail};
 use goose::{
+    agents::{mcp_client::McpClientTrait, tool_execution::ToolCallContext},
     conversation::{
         Conversation, EffectiveRole,
         message::{ErrorContent, Message, MessageContent, MessageErrorKind},
@@ -66,7 +68,12 @@ pub(crate) struct LoopConfig {
     pub tools: Vec<Arc<dyn HostTools>>,
     /// Model turns allowed per reply.
     pub max_turns: u32,
+    /// Ends a reply before the next model call once it holds, e.g. after an
+    /// authoritative submission.
+    pub stop_when: Option<StopCondition>,
 }
+
+pub(crate) type StopCondition = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReplyEnd {
@@ -81,7 +88,12 @@ pub(crate) enum ReplyEnd {
 /// One in-memory agent session.
 pub(crate) struct AgentLoop {
     id: String,
-    config: LoopConfig,
+    provider: Arc<dyn Provider>,
+    model_config: ModelConfig,
+    system_prompt: String,
+    tools: Mutex<Vec<Arc<dyn HostTools>>>,
+    max_turns: AtomicU32,
+    stop_when: Option<StopCondition>,
     conversation: Mutex<Conversation>,
     usage: Mutex<Vec<ProviderUsage>>,
     turn_limit_reached: Arc<AtomicBool>,
@@ -91,11 +103,27 @@ impl AgentLoop {
     pub fn new(id: impl Into<String>, config: LoopConfig) -> Self {
         Self {
             id: id.into(),
-            config,
+            provider: config.provider,
+            model_config: config.model_config,
+            system_prompt: config.system_prompt,
+            tools: Mutex::new(config.tools),
+            max_turns: AtomicU32::new(config.max_turns),
+            stop_when: config.stop_when,
             conversation: Mutex::new(Conversation::empty()),
             usage: Mutex::new(Vec::new()),
             turn_limit_reached: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Replaces the tools offered from the next reply on. Earlier tool calls and
+    /// results stay in the conversation.
+    pub fn set_tools(&self, tools: Vec<Arc<dyn HostTools>>) {
+        *lock(&self.tools) = tools;
+    }
+
+    /// Lowers the per-reply turn budget; it is never raised.
+    pub fn limit_turns(&self, limit: u32) {
+        self.max_turns.fetch_min(limit, Ordering::SeqCst);
     }
 
     /// Provider usage recorded so far, one entry per model call.
@@ -117,36 +145,34 @@ impl AgentLoop {
         on_message(&message);
         lock(&self.conversation).push(message.with_generated_id_if_missing());
 
-        let tools = self
-            .config
-            .tools
-            .iter()
-            .fold(ToolOperation::new(), |op, tools| {
-                op.with_provider(Arc::new(HostToolProvider(tools.clone())))
-            });
-        let known: HashSet<String> = self
-            .config
-            .tools
+        let host_tools = lock(&self.tools).clone();
+        let tools = host_tools.iter().fold(ToolOperation::new(), |op, tools| {
+            op.with_provider(Arc::new(HostToolProvider(tools.clone())))
+        });
+        let known: HashSet<String> = host_tools
             .iter()
             .flat_map(|tools| tools.tools())
             .map(|tool| tool.name.to_string())
             .collect();
-        let machine = StateMachine::new(
-            vec![
-                Step::Operation(Arc::new(SystemPrompt(self.system_prompt()))),
-                Step::Operation(Arc::new(tools)),
-                Step::Operation(Arc::new(UnknownTools(known))),
-                Step::Operation(Arc::new(TurnLimit {
-                    max_turns: self.config.max_turns,
-                    reached: self.turn_limit_reached.clone(),
-                })),
-                Step::Inference(Arc::new(InferenceRunner::new(
-                    self.config.provider.clone(),
-                    self.config.model_config.clone(),
-                ))),
-            ],
-            cancel.clone(),
-        );
+        let mut steps: Vec<Step<'_, LoopSession, LoopEffect>> = vec![
+            Step::Operation(Arc::new(SystemPrompt(self.system_prompt(&host_tools)))),
+            Step::Operation(Arc::new(tools)),
+            Step::Operation(Arc::new(UnknownTools(known))),
+        ];
+        if let Some(stop_when) = &self.stop_when {
+            steps.push(Step::Operation(Arc::new(StopWhen(stop_when.clone()))));
+        }
+        steps.extend([
+            Step::Operation(Arc::new(TurnLimit {
+                max_turns: self.max_turns.load(Ordering::SeqCst),
+                reached: self.turn_limit_reached.clone(),
+            })) as Step<'_, LoopSession, LoopEffect>,
+            Step::Inference(Arc::new(InferenceRunner::new(
+                self.provider.clone(),
+                self.model_config.clone(),
+            ))),
+        ]);
+        let machine = StateMachine::new(steps, cancel.clone());
 
         // The emitter applies backpressure, so drain events while the machine runs.
         let (tx, mut rx) = mpsc::channel(64);
@@ -186,14 +212,9 @@ impl AgentLoop {
         })
     }
 
-    fn system_prompt(&self) -> String {
-        std::iter::once(self.config.system_prompt.clone())
-            .chain(
-                self.config
-                    .tools
-                    .iter()
-                    .filter_map(|tools| tools.instructions()),
-            )
+    fn system_prompt(&self, tools: &[Arc<dyn HostTools>]) -> String {
+        std::iter::once(self.system_prompt.clone())
+            .chain(tools.iter().filter_map(|tools| tools.instructions()))
             .collect::<Vec<_>>()
             .join("\n\n")
     }
@@ -403,6 +424,90 @@ impl Operation<LoopSession, LoopEffect> for UnknownTools {
     }
 }
 
+/// Ends the reply once the host's stop condition holds.
+struct StopWhen(StopCondition);
+
+#[async_trait::async_trait]
+impl Operation<LoopSession, LoopEffect> for StopWhen {
+    fn name(&self) -> &'static str {
+        "stop_when"
+    }
+
+    async fn run(
+        &self,
+        _session: &LoopSession,
+        _conversation: &Conversation,
+        _emit: &Emitter,
+    ) -> Result<OperationResult<LoopEffect>> {
+        if (self.0)() {
+            yielded()
+        } else {
+            not_applicable()
+        }
+    }
+}
+
+/// Serves an in-process Goose MCP client, such as the developer tools, as
+/// host tools rooted in one working directory.
+pub(crate) struct McpTools {
+    client: Arc<dyn McpClientTrait>,
+    tools: Vec<Tool>,
+    instructions: Option<String>,
+    session_id: String,
+    working_dir: PathBuf,
+}
+
+impl McpTools {
+    pub async fn new(
+        client: Arc<dyn McpClientTrait>,
+        session_id: &str,
+        working_dir: PathBuf,
+    ) -> Result<Self> {
+        let tools = client
+            .list_tools(session_id, None, CancellationToken::new())
+            .await
+            .map_err(|error| anyhow::anyhow!("Listing tools failed: {error}"))?
+            .tools;
+        Ok(Self {
+            instructions: client.get_instructions(),
+            client,
+            tools,
+            session_id: session_id.to_owned(),
+            working_dir,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl HostTools for McpTools {
+    fn tools(&self) -> Vec<Tool> {
+        self.tools.clone()
+    }
+
+    fn instructions(&self) -> Option<String> {
+        self.instructions.clone()
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Option<JsonObject>,
+        cancel: CancellationToken,
+    ) -> CallToolResult {
+        let context = ToolCallContext::new(
+            self.session_id.clone(),
+            Some(self.working_dir.clone()),
+            None,
+        );
+        self.client
+            .call_tool(&context, name, arguments, cancel)
+            .await
+            .unwrap_or_else(|error| {
+                CallToolResult::error(vec![ContentBlock::text(format!("Tool failed: {error}"))])
+            })
+    }
+}
+
 /// Stops the reply before a model call once the turn has used its budget.
 struct TurnLimit {
     max_turns: u32,
@@ -493,23 +598,29 @@ impl LoopRetry {
     }
 }
 
+/// A provider that replays scripted responses, for driving the loop in tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod testing {
+    use std::sync::{Arc, Mutex};
 
     use futures::stream;
-    use goose::{conversation::message::MessageContent, providers::base::MessageStream};
-    use goose_providers::errors::ProviderError;
-    use rmcp::model::Role;
+    use goose::{
+        conversation::message::Message,
+        providers::base::{MessageStream, Provider},
+    };
+    use goose_providers::{errors::ProviderError, model::ModelConfig};
+    use rmcp::model::Tool;
+
+    use super::lock;
 
     /// Replays one scripted response per model call.
-    struct Scripted {
+    pub(crate) struct Scripted {
         responses: Mutex<std::collections::VecDeque<Result<Message, ProviderError>>>,
-        calls: Mutex<Vec<(String, Vec<String>)>>,
+        pub calls: Mutex<Vec<(String, Vec<String>)>>,
     }
 
     impl Scripted {
-        fn new(responses: Vec<Result<Message, ProviderError>>) -> Arc<Self> {
+        pub fn new(responses: Vec<Result<Message, ProviderError>>) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(responses.into()),
                 calls: Mutex::new(Vec::new()),
@@ -541,6 +652,15 @@ mod tests {
             Ok(Box::pin(stream::iter([Ok((Some(message), None))])))
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{testing::Scripted, *};
+
+    use goose::conversation::message::MessageContent;
+    use goose_providers::errors::ProviderError;
+    use rmcp::model::Role;
 
     struct Echo(Mutex<Vec<String>>);
 
@@ -590,6 +710,7 @@ mod tests {
                 system_prompt: "Policy.".into(),
                 tools: vec![tools],
                 max_turns,
+                stop_when: None,
             },
         )
     }
@@ -738,6 +859,80 @@ mod tests {
                 .iter()
                 .all(|message| message.error_kind().is_none())
         );
+    }
+
+    #[tokio::test]
+    async fn stop_condition_ends_the_reply_before_another_model_call() {
+        let provider = Scripted::new(vec![
+            Ok(tool_call("call-1", "echo")),
+            Err(ProviderError::RequestFailed("must not be reached".into())),
+        ]);
+        let tools = Arc::new(Echo(Mutex::new(Vec::new())));
+        let echoes = tools.clone();
+        let agent = AgentLoop::new(
+            "test",
+            LoopConfig {
+                provider: provider.clone(),
+                model_config: ModelConfig::new("scripted"),
+                system_prompt: "Policy.".into(),
+                tools: vec![tools],
+                max_turns: 10,
+                stop_when: Some(Arc::new(move || !lock(&echoes.0).is_empty())),
+            },
+        );
+
+        let end = agent
+            .reply(
+                Message::user().with_text("go"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(end, ReplyEnd::Finished);
+        assert_eq!(lock(&provider.calls).len(), 1);
+        assert_eq!(tool_results(&agent), ["false:echoed"]);
+    }
+
+    #[tokio::test]
+    async fn swapped_tools_and_lowered_turns_apply_to_later_replies() {
+        let provider = Scripted::new(vec![
+            Ok(tool_call("call-1", "echo")),
+            Ok(Message::assistant().with_text("done")),
+            Ok(tool_call("call-2", "echo")),
+        ]);
+        let tools = Arc::new(Echo(Mutex::new(Vec::new())));
+        let agent = agent(provider.clone(), tools.clone(), 10);
+        agent
+            .reply(
+                Message::user().with_text("go"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        agent.set_tools(Vec::new());
+        agent.limit_turns(1);
+        agent.limit_turns(5);
+        let end = agent
+            .reply(
+                Message::user().with_text("report"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(end, ReplyEnd::TurnLimit);
+        assert_eq!(lock(&tools.0).len(), 1);
+        assert_eq!(
+            tool_results(&agent),
+            ["false:echoed", "true:Tool echo is not available"]
+        );
+        let calls = lock(&provider.calls);
+        assert_eq!(calls[2], ("Policy.".to_owned(), Vec::<String>::new()));
     }
 
     #[test]

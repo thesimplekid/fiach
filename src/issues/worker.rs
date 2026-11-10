@@ -6,23 +6,24 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use futures::StreamExt;
 use goose::{
-    agents::{Agent, AgentEvent, ExtensionConfig, SessionConfig},
-    config::GooseMode,
-    conversation::message::{Message, MessageContent},
+    agents::platform_extensions::{PlatformExtensionContext, developer::DeveloperClient},
+    conversation::message::Message,
     model_config::model_config_from_user_config,
     providers::create_with_named_model,
-    session::SessionType,
+    session::SessionManager,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
+use tokio::{process::Command, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     Decision, FixKind, Item,
     config::{Area, Project, WorkerConfig},
     github::{command, git},
+};
+use crate::review::agent_loop::{
+    AgentLoop, HostTools, LoopConfig, LoopRetry, McpTools, ReplyEnd, StopCondition,
 };
 
 mod reporting;
@@ -819,110 +820,73 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
     } else {
         &input.config.model
     };
-    let agent = Agent::new();
-    let session = agent
-        .config
-        .session_manager
-        .create_session(
-            workspace.to_path_buf(),
-            format!("issue-{}", input.phase),
-            SessionType::Hidden,
-            GooseMode::Auto,
-        )
-        .await?;
-    agent
-        .update_provider(
-            create_with_named_model(provider, vec![]).await?,
-            model_config_from_user_config(provider, model)?,
-            &session.id,
-        )
-        .await?;
-    agent
-        .add_extension(
-            ExtensionConfig::Platform {
-                name: "developer".into(),
-                description: "Inspect, edit and test repository code".into(),
-                display_name: None,
-                bundled: None,
-                available_tools: vec![],
-            },
-            &session.id,
-        )
-        .await?;
-    agent
-        .extend_system_prompt(
-            "issue-contract".into(),
-            if verify { VERIFIER } else { CODER }.into(),
-        )
-        .await;
+    let model_config = model_config_from_user_config(provider, model)?;
+    let provider = create_with_named_model(provider, vec![]).await?;
+    let developer = developer_tools(workspace).await?;
     let reports = Arc::new(Mutex::new(None));
-    agent
-        .extension_manager
-        .add_client(
-            "fiach-issue-reporting".into(),
-            ExtensionConfig::Platform {
-                name: "fiach-issue-reporting".into(),
-                description: "Submit structured issue worker results".into(),
-                display_name: None,
-                bundled: Some(true),
-                available_tools: vec![],
-            },
-            Arc::new(reporting::ReportingClient {
-                verify,
-                kind: input.fix_kind,
-                output: "/output".into(),
-                report: reports.clone(),
-            }),
-            None,
-        )
-        .await;
+    let reporting: Arc<dyn HostTools> = Arc::new(reporting::ReportingClient {
+        verify,
+        kind: input.fix_kind,
+        output: "/output".into(),
+        report: reports.clone(),
+    });
+    let agent = AgentLoop::new(
+        format!("issue-{}", input.phase),
+        LoopConfig {
+            provider,
+            model_config,
+            system_prompt: if verify { VERIFIER } else { CODER }.into(),
+            tools: vec![developer, reporting.clone()],
+            max_turns: input.config.max_turns,
+            stop_when: Some(submission_stop(reports.clone())),
+        },
+    );
     let prompt = serde_json::to_string(
         &serde_json::json!({"issue": input.issue, "base": input.base, "candidate": input.report, "project_areas": input.areas, "fix_kind": input.fix_kind, "revision": input.revision, "triage": input.triage}),
     )?;
-    let config = SessionConfig {
-        id: session.id,
-        schedule_id: None,
-        max_turns: Some(input.config.max_turns),
-        retry_config: None,
-    };
-    // Share the review harness's bounded budget across start and stream failures.
-    // Reuse the session so completed tool calls and their results remain available.
-    let mut retry = crate::review::ReplyRetry::new(&agent, &config, &cancel, "issue worker", 3, 10);
-    let mut stream = retry.start(Message::user().with_text(&prompt)).await?;
-    let mut transcript = tokio::fs::File::create("/output/transcript.jsonl").await?;
+    let mut transcript = std::fs::File::create("/output/transcript.jsonl")?;
+    // Share the review harness's bounded budget across provider failures. The
+    // session is kept, so completed tool calls and their results remain available.
+    let mut retry = LoopRetry::new("issue worker", 3, 10);
     let mut report_recoveries = 0;
+    let mut message = Message::user().with_text(&prompt);
     let report = loop {
-        let result = collect_worker_reply(&mut stream, &mut transcript, &reports).await;
+        let mut transcript_error = None;
+        let end = agent
+            .reply(message, &cancel, |message| {
+                if transcript_error.is_none() {
+                    transcript_error = append_transcript(&mut transcript, message).err();
+                }
+            })
+            .await;
+        if let Some(error) = transcript_error {
+            return Err(error.context("Writing worker transcript"));
+        }
         if let Some(report) = reports.lock().await.clone() {
-            // Submission is authoritative even if the provider subsequently disconnects.
+            // Submission is authoritative even if the provider subsequently fails.
             break report;
         }
-        let message = match result {
-            Err(error) => {
-                let error = retry.stream_error(error)?;
-                tracing::warn!(error = %error, phase = %input.phase, session_id = %config.id, "Worker transport interrupted; resuming session");
-                drop(stream);
-                stream = retry.restart(Message::user().with_text(
+        let end = match end? {
+            ReplyEnd::ProviderError(error) => {
+                let error = retry.provider_error(&error)?;
+                tracing::warn!(error = %error, phase = %input.phase, "Worker provider failed; resuming session");
+                retry.backoff().await;
+                message = Message::user().with_text(
                     "Your connection was interrupted. Continue from existing work and tool results; inspect uncertain action outcomes before repeating them. Finish by calling your reporting tool, not by returning JSON text.",
-                )).await?;
+                );
                 continue;
             }
-            Ok(end) => {
-                let message = report_recovery_message(&end, &mut report_recoveries)?;
-                tracing::warn!(?end, phase = %input.phase, report_recoveries, "Worker stopped without submitting; requesting final report");
-                message
-            }
+            ReplyEnd::Finished => WorkerEnd::Finished,
+            ReplyEnd::TurnLimit => WorkerEnd::TurnLimit,
         };
-        drop(stream);
+        let recovery = report_recovery_message(&end, &mut report_recoveries)?;
+        tracing::warn!(?end, phase = %input.phase, report_recoveries, "Worker stopped without submitting; requesting final report");
         // Finalization can only submit reports, with a small turn budget to correct errors.
-        if report_recoveries == 1 {
-            agent.remove_extension("developer", &config.id).await?;
-            retry.limit_turns(3);
-        }
-        // Report recovery has its own bounded budget; it does not consume network retries.
-        stream = retry.start(Message::user().with_text(message)).await?;
+        // Report recovery has its own bounded budget; it does not consume provider retries.
+        agent.set_tools(vec![reporting.clone()]);
+        agent.limit_turns(3);
+        message = Message::user().with_text(recovery);
     };
-    drop(stream);
     if !verify && report.status == "candidate" {
         let patch = git(
             workspace,
@@ -941,84 +905,55 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
     Ok(())
 }
 
-/// Goose currently surfaces some provider errors as terminal assistant messages,
-/// rather than stream errors. Match its wrappers, not arbitrary mentions of errors.
-fn worker_provider_error(text: &str) -> Option<anyhow::Error> {
-    let text = text.trim();
-    let wrapped = text.starts_with("Ran into this error: ")
-        && text.ends_with("Please retry if you think this is a transient or recoverable error.");
-    let network = text.ends_with("\n\nPlease resend your message to try again.");
-    (wrapped || network).then(|| anyhow::anyhow!("Worker provider/transport failure: {text}"))
-}
-
 #[derive(Debug, PartialEq, Eq)]
-enum ReplyEnd {
+enum WorkerEnd {
     Finished,
     TurnLimit,
 }
 
-fn report_recovery_message(end: &ReplyEnd, attempts: &mut u32) -> Result<&'static str> {
+fn report_recovery_message(end: &WorkerEnd, attempts: &mut u32) -> Result<&'static str> {
     ensure!(
         *attempts < 2,
         "Issue worker ended without a reporting tool submission after {attempts} report recovery attempts ({end:?})"
     );
     *attempts += 1;
     Ok(match end {
-        ReplyEnd::TurnLimit => {
+        WorkerEnd::TurnLimit => {
             "You reached the action limit without submitting a report. Stop investigation. Submit completed work now with your reporting tool, or report needs_review with the precise remaining work. Do not claim unfinished tests passed. Only reporting tools remain available."
         }
-        ReplyEnd::Finished => {
+        WorkerEnd::Finished => {
             "You stopped without an accepted reporting tool submission. Submit the result now using submit_candidate or submit_blocked (coder), or submit_verdict (verifier). Plain text JSON is not a submission. Correct any tool validation errors. If work is incomplete, submit needs_review with the precise blocker. Only reporting tools remain available."
         }
     })
 }
 
-async fn collect_worker_reply<W: tokio::io::AsyncWrite + Unpin>(
-    stream: &mut futures::stream::BoxStream<'_, Result<AgentEvent>>,
-    transcript: &mut W,
-    reports: &Mutex<Option<Report>>,
-) -> Result<ReplyEnd> {
-    let mut end = ReplyEnd::Finished;
-    while let Some(event) = stream.next().await {
-        if let AgentEvent::Message(message) = event.context("Worker reply stream failed")? {
-            let mut line = serde_json::to_vec(&message)?;
-            line.push(b'\n');
-            transcript.write_all(&line).await?;
-            transcript.flush().await?;
-            if reports.lock().await.is_some() {
-                return Ok(end);
-            }
-            if message.role == rmcp::model::Role::Assistant {
-                // Authentication failures (and other structured Goose errors) are
-                // error blocks, not text. Keep their cause instead of asking the
-                // model to repair a supposedly missing report.
-                if let Some(error) = message.content.iter().find_map(|c| c.as_error()) {
-                    anyhow::bail!("Worker provider/transport failure: {}", error.message);
-                }
-                let text: String = message
-                    .content
-                    .iter()
-                    .filter_map(|c| {
-                        if let MessageContent::Text(t) = c {
-                            Some(t.text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if let Some(error) = worker_provider_error(&text) {
-                    return Err(error);
-                }
-                // Goose's pinned max-turn sentinel is plain assistant text.
-                if text.trim()
-                    == "I've reached the maximum number of actions I can do without user input. Would you like me to continue?"
-                {
-                    end = ReplyEnd::TurnLimit;
-                }
-            }
-        }
-    }
-    Ok(end)
+/// An accepted submission is final; the worker spends no further turns.
+fn submission_stop(reports: Arc<Mutex<Option<Report>>>) -> StopCondition {
+    Arc::new(move || reports.try_lock().is_ok_and(|report| report.is_some()))
+}
+
+fn append_transcript(transcript: &mut std::fs::File, message: &Message) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut line = serde_json::to_vec(message)?;
+    line.push(b'\n');
+    transcript.write_all(&line)?;
+    transcript.flush()?;
+    Ok(())
+}
+
+/// Goose's developer tools, rooted in the workspace.
+async fn developer_tools(workspace: &Path) -> Result<Arc<dyn HostTools>> {
+    let client = DeveloperClient::new(PlatformExtensionContext {
+        extension_manager: None,
+        session_manager: Arc::new(SessionManager::instance()),
+        scheduler: None,
+        session: None,
+        use_login_shell_path: false,
+    })?;
+    Ok(Arc::new(
+        McpTools::new(Arc::new(client), "issue-worker", workspace.to_path_buf()).await?,
+    ))
 }
 
 #[cfg(test)]
@@ -1029,16 +964,16 @@ mod tests {
     fn report_recovery_is_bounded_and_explains_turn_exhaustion() {
         let mut attempts = 0;
         assert!(
-            report_recovery_message(&ReplyEnd::TurnLimit, &mut attempts)
+            report_recovery_message(&WorkerEnd::TurnLimit, &mut attempts)
                 .unwrap()
                 .contains("action limit")
         );
         assert!(
-            report_recovery_message(&ReplyEnd::Finished, &mut attempts)
+            report_recovery_message(&WorkerEnd::Finished, &mut attempts)
                 .unwrap()
                 .contains("Plain text JSON is not a submission")
         );
-        let error = report_recovery_message(&ReplyEnd::TurnLimit, &mut attempts).unwrap_err();
+        let error = report_recovery_message(&WorkerEnd::TurnLimit, &mut attempts).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1047,65 +982,29 @@ mod tests {
         assert_eq!(attempts, 2);
     }
 
-    #[tokio::test]
-    async fn worker_preserves_stream_failure_instead_of_parsing_partial_json() {
-        let mut stream = futures::stream::iter(vec![
-            Ok(AgentEvent::Message(
-                Message::assistant().with_text("{\"status\":"),
-            )),
-            Err(anyhow::anyhow!("Stream decode error")),
-        ])
-        .boxed();
-        let mut transcript = Vec::new();
-        let error = collect_worker_reply(&mut stream, &mut transcript, &Mutex::new(None))
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("Stream decode error"));
-        assert!(!format!("{error:#}").contains("JSON"));
-        assert!(!transcript.is_empty());
+    fn worker_loop(
+        provider: Arc<crate::review::agent_loop::testing::Scripted>,
+        client: reporting::ReportingClient,
+    ) -> AgentLoop {
+        let stop = submission_stop(client.report.clone());
+        AgentLoop::new(
+            "issue-code",
+            LoopConfig {
+                provider,
+                model_config: goose_providers::model::ModelConfig::new("scripted"),
+                system_prompt: CODER.into(),
+                tools: vec![Arc::new(client)],
+                max_turns: 10,
+                stop_when: Some(stop),
+            },
+        )
     }
 
     #[tokio::test]
-    async fn worker_detects_goose_terminal_provider_messages() {
-        for text in [
-            "Ran into this error: Stream decode error.\n\nPlease retry if you think this is a transient or recoverable error.",
-            "Network error: connection reset\n\nPlease resend your message to try again.",
-            "Ran into this error: 503 Service Unavailable: no provider is available.\n\nPlease retry if you think this is a transient or recoverable error.",
-            "Ran into this error: 502 Bad Gateway: provider response was invalid.\n\nPlease retry if you think this is a transient or recoverable error.",
-        ] {
-            let mut stream = futures::stream::iter(vec![Ok(AgentEvent::Message(
-                Message::assistant().with_text(text),
-            ))])
-            .boxed();
-            let error = collect_worker_reply(&mut stream, &mut Vec::new(), &Mutex::new(None))
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("provider/transport failure"));
-            assert!(error.to_string().contains(text));
-        }
-    }
+    async fn text_is_not_a_submission_but_an_accepted_report_is_final() {
+        use goose_providers::errors::ProviderError;
+        use rmcp::model::CallToolRequestParams;
 
-    #[tokio::test]
-    async fn worker_preserves_structured_goose_errors() {
-        use goose::conversation::message::MessageErrorKind;
-
-        let mut stream = futures::stream::iter(vec![Ok(AgentEvent::Message(
-            Message::assistant().with_error(MessageErrorKind::Authentication, "Invalid API key"),
-        ))])
-        .boxed();
-        let error = collect_worker_reply(&mut stream, &mut Vec::new(), &Mutex::new(None))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Invalid API key"));
-    }
-
-    #[tokio::test]
-    async fn fragmented_text_recovers_through_reporting_tool() {
-        use goose::agents::{mcp_client::McpClientTrait, tool_execution::ToolCallContext};
-
-        // Synthetic token-sized deltas reproduce the reported failure shape.
-        // The private diagnostic archive is not a repository fixture. Neither
-        // fragments nor cumulative snapshots are authoritative submissions.
         for status in ["needs_review", "candidate"] {
             let report = Report {
                 status: status.into(),
@@ -1115,67 +1014,48 @@ mod tests {
                 approved: false,
             };
             let text = serde_json::to_string(&report).unwrap();
-            let reports = Arc::new(Mutex::new(None));
-            let mut events = vec![
-                Ok(AgentEvent::Message(
-                    Message::assistant().with_text("Investigating"),
-                )),
-                Ok(AgentEvent::Message(Message::user().with_text("Continue"))),
-                Ok(AgentEvent::Message(
-                    Message::assistant().with_thinking("reasoning", "sig"),
-                )),
-            ];
-            events.extend(text.chars().map(|c| {
-                Ok(AgentEvent::Message(
-                    Message::assistant().with_text(c.to_string()),
-                ))
-            }));
-            events.push(Ok(AgentEvent::Message(Message::assistant().with_text(""))));
-            events.push(Ok(AgentEvent::Message(
-                Message::assistant().with_text(&text),
-            )));
-            let mut stream = futures::stream::iter(events).boxed();
-            assert_eq!(
-                collect_worker_reply(&mut stream, &mut Vec::new(), &reports)
-                    .await
-                    .unwrap(),
-                ReplyEnd::Finished
-            );
-            assert!(reports.lock().await.is_none());
-
-            let output = tempfile::tempdir().unwrap();
-            let client = reporting::ReportingClient {
-                verify: false,
-                kind: FixKind::Bug,
-                output: output.path().into(),
-                report: reports.clone(),
-            };
             let tool = if status == "candidate" {
                 "submit_candidate"
             } else {
                 "submit_blocked"
             };
-            let args = serde_json::from_str(&text).unwrap();
-            // Model a reporting-only recovery, with a lost provider connection
-            // after the real MCP submission has been persisted.
-            let mut recovery = futures::stream::once(async {
-                let result = client
-                    .call_tool(
-                        &ToolCallContext::new("test".into(), None, None),
-                        tool,
-                        Some(args),
-                        CancellationToken::new(),
-                    )
-                    .await
-                    .unwrap();
-                assert_ne!(result.is_error, Some(true));
-                Err(anyhow::anyhow!("Stream decode error"))
-            })
-            .boxed();
-            let result = collect_worker_reply(&mut recovery, &mut Vec::new(), &reports).await;
-            assert!(result.is_err());
-            // run_agent checks the durable submission before handling this error.
+            let provider = crate::review::agent_loop::testing::Scripted::new(vec![
+                Ok(Message::assistant().with_text(&text)),
+                Ok(Message::assistant().with_tool_request(
+                    "submit",
+                    Ok(CallToolRequestParams::new(tool)
+                        .with_arguments(serde_json::from_str(&text).unwrap())),
+                )),
+                // A lost provider connection after the submission must not lose it.
+                Err(ProviderError::NetworkError("reset".into())),
+            ]);
+            let output = tempfile::tempdir().unwrap();
+            let reports = Arc::new(Mutex::new(None));
+            let agent = worker_loop(
+                provider.clone(),
+                reporting::ReportingClient {
+                    verify: false,
+                    kind: FixKind::Bug,
+                    output: output.path().into(),
+                    report: reports.clone(),
+                },
+            );
+            let cancel = CancellationToken::new();
+
+            let end = agent
+                .reply(Message::user().with_text("issue"), &cancel, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(end, ReplyEnd::Finished);
+            assert!(reports.lock().await.is_none());
+
+            let end = agent
+                .reply(Message::user().with_text("submit"), &cancel, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(end, ReplyEnd::Finished);
             assert_eq!(*reports.lock().await, Some(report.clone()));
+            assert_eq!(provider.calls.lock().unwrap().len(), 2);
             let persisted: Report = serde_json::from_slice(
                 &tokio::fs::read(output.path().join("report.json"))
                     .await
@@ -1187,56 +1067,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_text_is_not_a_submission_and_turn_limit_is_distinct() {
-        for (text, expected) in [
-            (
-                r#"{"status":"needs_review","summary":"done","test_files":[],"reproduction":[],"approved":false}"#,
-                ReplyEnd::Finished,
-            ),
-            (
-                "I've reached the maximum number of actions I can do without user input. Would you like me to continue?",
-                ReplyEnd::TurnLimit,
-            ),
-        ] {
-            let mut stream = futures::stream::iter(vec![Ok(AgentEvent::Message(
-                Message::assistant().with_text(text),
-            ))])
-            .boxed();
-            assert_eq!(
-                collect_worker_reply(&mut stream, &mut Vec::new(), &Mutex::new(None))
-                    .await
-                    .unwrap(),
-                expected
-            );
+    async fn developer_tools_run_in_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = developer_tools(workspace.path()).await.unwrap();
+        let names: Vec<String> = tools
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for name in ["shell", "write", "edit", "tree"] {
+            assert!(names.iter().any(|tool| tool == name), "{names:?}");
         }
+        assert!(tools.instructions().is_some());
+
+        let result = tools
+            .call(
+                "shell",
+                serde_json::json!({"command": "pwd"}).as_object().cloned(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let observed = result.content[0].as_text().unwrap().text.trim().to_owned();
+        assert_eq!(
+            std::fs::canonicalize(observed).unwrap(),
+            std::fs::canonicalize(workspace.path()).unwrap()
+        );
     }
 
-    #[tokio::test]
-    async fn accepted_submission_survives_trailing_prose_or_provider_error() {
-        let report = Report {
-            status: "needs_review".into(),
-            summary: "Blocked".into(),
-            test_files: vec![],
-            reproduction: vec![],
-            approved: false,
-        };
-        for text in [
-            "All done!",
-            "Network error: reset\n\nPlease resend your message to try again.",
-        ] {
-            let reports = Mutex::new(Some(report.clone()));
-            let mut stream = futures::stream::iter(vec![Ok(AgentEvent::Message(
-                Message::assistant().with_text(text),
-            ))])
-            .boxed();
-            assert_eq!(
-                collect_worker_reply(&mut stream, &mut Vec::new(), &reports)
-                    .await
-                    .unwrap(),
-                ReplyEnd::Finished
-            );
-            assert_eq!(*reports.lock().await, Some(report.clone()));
-        }
+    #[test]
+    fn transcript_records_one_json_message_per_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        append_transcript(&mut file, &Message::user().with_text("one")).unwrap();
+        append_transcript(&mut file, &Message::assistant().with_text("two")).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<Message> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].as_concat_text(), "two");
     }
 
     #[test]

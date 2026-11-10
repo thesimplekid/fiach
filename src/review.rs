@@ -3425,6 +3425,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                 }),
             ],
             max_turns: params.max_turns,
+            stop_when: None,
         },
     );
     let usage_cost = |usage: &[goose::conversation::token_usage::ProviderUsage]| {
@@ -3676,12 +3677,6 @@ impl<'a> ReplyRetry<'a> {
             retries: 0,
             delay_secs,
         }
-    }
-
-    /// Bound final reporting turns without resetting the transport retry budget.
-    pub(crate) fn limit_turns(&mut self, limit: u32) {
-        self.session_config.max_turns =
-            Some(self.session_config.max_turns.unwrap_or(limit).min(limit));
     }
 
     fn exhausted(&self) -> bool {
@@ -4118,9 +4113,6 @@ Reviewed the PR and found no vulnerabilities.
             );
             retry.backoff().await;
         }
-        retry.limit_turns(3);
-        assert_eq!(retry.session_config.max_turns, Some(1));
-        // Switching to final reporting must not replenish an exhausted network budget.
         let error = retry
             .stream_error(anyhow::anyhow!("Stream decode error"))
             .unwrap_err();
