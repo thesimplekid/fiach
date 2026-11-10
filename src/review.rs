@@ -21,7 +21,7 @@ use rmcp::{
     ServiceError,
     model::{
         CallToolRequestParams, CallToolResult, ContentBlock as Content, InitializeResult,
-        JsonObject, ListToolsResult, Role,
+        JsonObject, ListToolsResult, Role, Tool,
     },
 };
 use tokio::sync::Mutex;
@@ -33,7 +33,9 @@ use crate::process::CommandExt as _;
 use crate::reporting::{self, ReportingArtifact, ReviewPhase};
 use crate::state;
 use crate::workspace;
+use agent_loop::{AgentLoop, HostTools, LoopConfig, LoopRetry, ReplyEnd};
 
+pub(crate) mod agent_loop;
 mod delegation;
 
 const SANDBOX_SKILLS_DIR: &str = "/etc/fiach/skills";
@@ -2602,6 +2604,28 @@ impl McpClientTrait for ReportingClient {
     }
 }
 
+#[async_trait::async_trait]
+impl HostTools for ReportingClient {
+    fn tools(&self) -> Vec<Tool> {
+        reporting::reporting_tools()
+    }
+
+    fn instructions(&self) -> Option<String> {
+        Some(REPORTING_INSTRUCTIONS.to_string())
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Option<JsonObject>,
+        _cancel: CancellationToken,
+    ) -> CallToolResult {
+        let mut tool_call = CallToolRequestParams::new(name.to_owned());
+        tool_call.arguments = arguments;
+        handle_reporting_tool_call(&tool_call, self.phase.clone(), self.artifact.clone()).await
+    }
+}
+
 struct FinderDelegationClient {
     inner: goose::agents::platform_extensions::summon::SummonClient,
     recovery: delegation::Recovery,
@@ -3367,23 +3391,6 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         })?;
     let (input_price_per_m, output_price_per_m) =
         resolve_price_overrides(params.provider_name, params.model, None, None).await;
-    let agent = Agent::new();
-    let session = agent
-        .config
-        .session_manager
-        .create_session(
-            params.workspace_path.to_path_buf(),
-            "review-verifier".to_string(),
-            SessionType::Hidden,
-            GooseMode::Auto,
-        )
-        .await
-        .context("Failed to create verifier session")?;
-    agent
-        .update_provider(provider, model_config, &session.id)
-        .await
-        .context("Failed to update verifier provider")?;
-
     // Reviews are static: the verifier inspects code like the finder and has
     // no shell. The host records its inspections for the disclosure gate.
     let (inspection, inspection_log) = crate::inspection::Inspection::new(
@@ -3393,19 +3400,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         &params.pr_context.head_commit,
     )?
     .with_log();
-    let inspection_config = inspection
-        .extension_config(&std::env::current_exe().context("Cannot locate Fiach executable")?);
-    agent
-        .extension_manager
-        .add_client(
-            crate::inspection::EXTENSION_NAME.into(),
-            inspection_config,
-            Arc::new(inspection),
-            None,
-        )
-        .await;
     params.artifact.lock().await.verifier_inspections = Some(Vec::new());
-    add_reporting_extension(&agent, ReviewPhase::Verifier, params.artifact.clone()).await;
 
     let candidates = serde_json::to_string_pretty(&params.artifact.lock().await.findings)?;
     let pr_context = serde_json::to_string_pretty(params.pr_context)?;
@@ -3416,87 +3411,76 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
         .replace("{pr_context}", &pr_context)
         .replace("{candidates}", &candidates);
 
-    agent
-        .extend_system_prompt("verifier_policy".to_string(), VERIFIER_POLICY.to_string())
-        .await;
-
-    let session_config = SessionConfig {
-        id: session.id,
-        schedule_id: None,
-        max_turns: Some(params.max_turns),
-        retry_config: None,
+    let agent = AgentLoop::new(
+        "review-verifier",
+        LoopConfig {
+            provider,
+            model_config,
+            system_prompt: VERIFIER_POLICY.to_string(),
+            tools: vec![
+                Arc::new(inspection),
+                Arc::new(ReportingClient {
+                    phase: ReviewPhase::Verifier,
+                    artifact: params.artifact.clone(),
+                }),
+            ],
+            max_turns: params.max_turns,
+        },
+    );
+    let usage_cost = |usage: &[goose::conversation::token_usage::ProviderUsage]| {
+        sum_known_costs(usage.iter().map(|usage| {
+            cost_from_provider_usage(
+                usage,
+                params.provider_name,
+                params.model,
+                input_price_per_m,
+                output_price_per_m,
+            )
+        }))
     };
 
     let phase_cancel_token = params.cancel_token.child_token();
     let mut budget_exceeded = false;
     let verifier_future = async {
-        let mut retry = ReplyRetry::new(
-            &agent,
-            &session_config,
-            &phase_cancel_token,
-            "verifier",
-            params.max_retries,
-            params.retry_delay_secs,
-        );
-        let mut stream = retry
-            .start(Message::user().with_text(&verifier_prompt))
-            .await?;
-
+        let mut retry = LoopRetry::new("verifier", params.max_retries, params.retry_delay_secs);
+        let mut message = Message::user().with_text(&verifier_prompt);
         loop {
-            tokio::select! {
-                _ = phase_cancel_token.cancelled() => {
-                    bail!("Verifier pass cancelled by user");
-                }
-                event = stream.next() => {
-                    match event {
-                        Some(Ok(AgentEvent::Message(_message))) => {
-                            let current_cost = agent
-                                .config
-                                .session_manager
-                                .get_session_usage_totals(&session_config.id)
-                                .await
-                                .ok()
-                                .and_then(|totals| {
-                                    cost_from_session_totals(
-                                        &totals,
-                                        params.provider_name,
-                                        params.model,
-                                        input_price_per_m,
-                                        output_price_per_m,
-                                    )
-                                });
-                            if cost_budget_reached(current_cost, params.max_cost_usd) {
-                                budget_exceeded = true;
-                                tracing::warn!(
-                                    cost = %format_cost(current_cost),
-                                    max = %format_cost(params.max_cost_usd),
-                                    "Verifier cost budget reached; cancelling the phase"
-                                );
-                                phase_cancel_token.cancel();
-                                return Ok(());
-                            }
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => {
-                            let e = retry.stream_error(e)?;
-                            let retry_prompt = format!(
-                                "The verifier stream was interrupted due to this error: {e}. Continue verification and call `submit_verdict` exactly once for every candidate before stopping."
-                            );
-                            stream = retry.restart(Message::user().with_text(&retry_prompt)).await?;
-                        }
-                        None => {
-                            if params.artifact.lock().await.verifier_complete() {
-                                return Ok(());
-                            }
-                            if retry.exhausted() {
-                                return Ok(());
-                            }
-                            let retry_prompt = "You stopped before submitting verdicts for all candidate findings. Continue verification and call `submit_verdict` exactly once for every remaining candidate.".to_string();
-                            stream = retry.restart(Message::user().with_text(&retry_prompt)).await?;
-                        }
+            let end = agent
+                .reply(message, &phase_cancel_token, |_| {
+                    let current_cost = usage_cost(&agent.usage());
+                    if !budget_exceeded && cost_budget_reached(current_cost, params.max_cost_usd) {
+                        budget_exceeded = true;
+                        tracing::warn!(
+                            cost = %format_cost(current_cost),
+                            max = %format_cost(params.max_cost_usd),
+                            "Verifier cost budget reached; cancelling the phase"
+                        );
+                        phase_cancel_token.cancel();
                     }
-                }
+                })
+                .await?;
+            if budget_exceeded {
+                return Ok(());
             }
+            if phase_cancel_token.is_cancelled() {
+                bail!("Verifier pass cancelled by user");
+            }
+            let follow_up = match end {
+                ReplyEnd::ProviderError(error) => {
+                    let error = retry.provider_error(&error)?;
+                    format!(
+                        "The verifier stream was interrupted due to this error: {error}. Continue verification and call `submit_verdict` exactly once for every candidate before stopping."
+                    )
+                }
+                ReplyEnd::Finished | ReplyEnd::TurnLimit => {
+                    if params.artifact.lock().await.verifier_complete() || retry.exhausted() {
+                        return Ok(());
+                    }
+                    "You stopped before submitting verdicts for all candidate findings. Continue verification and call `submit_verdict` exactly once for every remaining candidate.".to_string()
+                }
+            };
+            retry.backoff().await;
+            message = Message::user().with_text(&follow_up);
         }
     };
 
@@ -3509,30 +3493,22 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     params.artifact.lock().await.verifier_inspections = Some(inspection_log.records());
     verifier_result.context("Verifier pass timed out")??;
 
-    let mut stats = VerificationStats {
+    let usage = agent.usage();
+    let input: u64 = usage
+        .iter()
+        .map(|usage| nonnegative_token_count(usage.usage.input_tokens))
+        .sum();
+    let output: u64 = usage
+        .iter()
+        .map(|usage| nonnegative_token_count(usage.usage.output_tokens))
+        .sum();
+    Ok(VerificationStats {
+        peak_input_tokens: input,
+        output_tokens: output,
+        total_tokens: input + output,
+        cost_usd: usage_cost(&usage),
         budget_exceeded,
-        ..VerificationStats::default()
-    };
-    if let Ok(session_totals) = agent
-        .config
-        .session_manager
-        .get_session_usage_totals(&session_config.id)
-        .await
-    {
-        let (input, output) = session_accumulated_tokens(&session_totals);
-        stats.peak_input_tokens = input;
-        stats.output_tokens = output;
-        stats.total_tokens = input + output;
-        stats.cost_usd = cost_from_session_totals(
-            &session_totals,
-            params.provider_name,
-            params.model,
-            input_price_per_m,
-            output_price_per_m,
-        );
-    }
-
-    Ok(stats)
+    })
 }
 
 /// Extract a value from the YAML frontmatter of a report.

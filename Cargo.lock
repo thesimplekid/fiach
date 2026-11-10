@@ -1867,6 +1867,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "goose",
+ "goose-agent",
  "goose-providers",
  "nostr",
  "process-wrap 9.1.0",

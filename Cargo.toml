@@ -7,6 +7,7 @@ rust-version = "1.98.1"
 [dependencies]
 goose = { git = "https://github.com/aaif-goose/goose", rev = "8a460f964ef5b165e35ab231e76ccfa0c133abbd", default-features = false, features = ["rustls-tls"] }
 goose-providers = { git = "https://github.com/aaif-goose/goose", rev = "8a460f964ef5b165e35ab231e76ccfa0c133abbd", default-features = false, features = ["rustls-tls"] }
+goose-agent = { git = "https://github.com/aaif-goose/goose", rev = "8a460f964ef5b165e35ab231e76ccfa0c133abbd" }
 buzz-client = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }
 buzz-sdk = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }
 nostr = "0.44"

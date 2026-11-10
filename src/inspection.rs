@@ -20,7 +20,7 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, process::Command};
 use tokio_util::sync::CancellationToken;
 
-use crate::{process::output_limited, reporting::InspectionRecord};
+use crate::{process::output_limited, reporting::InspectionRecord, review::agent_loop::HostTools};
 
 pub const EXTENSION_NAME: &str = "fiach-inspection";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -388,6 +388,26 @@ impl McpClientTrait for Inspection {
     }
     fn get_instructions(&self) -> Option<String> {
         Some(self.instructions())
+    }
+}
+
+#[async_trait::async_trait]
+impl HostTools for Inspection {
+    fn tools(&self) -> Vec<Tool> {
+        Self::tools()
+    }
+
+    fn instructions(&self) -> Option<String> {
+        Some(Inspection::instructions(self))
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Option<JsonObject>,
+        cancel: CancellationToken,
+    ) -> CallToolResult {
+        self.dispatch(name, arguments, cancel).await
     }
 }
 
