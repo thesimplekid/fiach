@@ -100,7 +100,7 @@
               lockFile = ./Cargo.lock;
               outputHashes = {
                 "buzz-client-0.1.0" = "sha256-qxOkoR44k3pr9+TmRSZWmRZRXt+56ohCrE4zwF+/nMM=";
-                "goose-1.51.0" = "sha256-X/sDWRwyWOIjFuZ/V57ydp76rBiVVuzwxcoNvs/JjJY=";
+                "goose-1.58.1" = "sha256-HParN7kv/F5rP8RRzl7EkJM5mYYOboCe9p1KDGCQgvA=";
               };
             };
 

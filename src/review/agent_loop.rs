@@ -26,7 +26,7 @@ use goose::{
 };
 use goose_agent::{
     events::AgentEvent,
-    inference::{InferenceEffect, InferenceRunner},
+    inference::{InferenceEffect, InferenceRunner, is_empty_response_marker},
     machine::{EffectHandler, MachineSession, SessionLoader, StateMachine, Step},
     operation::{
         ConversationEffect, Emitter, MachineEffect, Operation, OperationResult, applied,
@@ -208,6 +208,7 @@ impl AgentLoop {
                 max_turns: self.max_turns.load(Ordering::SeqCst),
                 reached: self.turn_limit_reached.clone(),
             })) as Step<'_, LoopSession, LoopEffect>,
+            Step::Operation(Arc::new(EmptyResponse)),
             Step::Operation(Arc::new(Compaction {
                 provider: self.provider.clone(),
                 model_config: self.model_config.clone(),
@@ -221,8 +222,8 @@ impl AgentLoop {
         ]);
         let machine = StateMachine::new(steps, cancel.clone());
 
-        // The emitter applies backpressure, so drain events while the machine runs.
-        let (tx, mut rx) = mpsc::channel(64);
+        // Deliver events while the machine runs, not only once it finishes.
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let result = {
             let emit = Emitter::new(tx, cancel.clone());
             let run = machine.run(self, &self.id, &emit);
@@ -246,7 +247,9 @@ impl AgentLoop {
         result?;
 
         let mut conversation = lock(&self.conversation);
-        if conversation.last().is_some_and(is_empty_response_notice) {
+        // After its own retries, the GDK marks a still-empty response instead of
+        // failing; it is a transient failure, not a result.
+        if conversation.last().is_some_and(is_empty_response_marker) {
             conversation.pop();
             return Ok(ReplyEnd::ProviderError(ErrorContent {
                 kind: MessageErrorKind::Other,
@@ -284,17 +287,6 @@ impl AgentLoop {
             conversation.pop();
         }
     }
-}
-
-/// The GDK at Fiach's Goose pin reports an empty model response as this
-/// visible assistant text instead of an error; it is a transient failure, not
-/// a result. Later GDK releases mark it with `is_empty_response_marker`.
-const EMPTY_RESPONSE_NOTICE: &str =
-    "The model returned an empty response. Please resend your message to continue.";
-
-fn is_empty_response_notice(message: &Message) -> bool {
-    message.role == rmcp::model::Role::Assistant
-        && message.as_concat_text() == EMPTY_RESPONSE_NOTICE
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -400,6 +392,23 @@ impl EffectHandler<LoopSession, LoopEffect> for AgentLoop {
                         message.metadata.agent_visible = *agent_visible;
                     }
                 }
+                LoopEffect::Conversation(ConversationEffect::SetMessageOperationNote {
+                    message_id,
+                    operation,
+                    key,
+                    value,
+                }) => {
+                    let mut conversation = lock(&self.conversation);
+                    if let Some(message) = conversation
+                        .messages_mut()
+                        .iter_mut()
+                        .find(|message| message.id.as_deref() == Some(message_id.as_str()))
+                    {
+                        message
+                            .metadata
+                            .set_operation_note(operation, key, value.clone());
+                    }
+                }
                 // Only tool approval patches request metadata, and Fiach
                 // approves every host tool.
                 LoopEffect::Conversation(ConversationEffect::PatchToolRequestMeta { .. }) => {
@@ -496,7 +505,7 @@ impl Operation<LoopSession, LoopEffect> for UnknownTools {
         if response.get_tool_response_ids().is_empty() {
             return not_applicable();
         }
-        applied([LoopEffect::from(emit.message(response).await)])
+        applied([LoopEffect::from(emit.message(response))])
     }
 }
 
@@ -545,7 +554,7 @@ impl McpTools {
             .map_err(|error| anyhow::anyhow!("Listing tools failed: {error}"))?
             .tools;
         Ok(Self {
-            instructions: client.get_instructions(),
+            instructions: client.get_instructions(session_id, &working_dir).await,
             client,
             tools,
             session_id: session_id.to_owned(),
@@ -581,6 +590,30 @@ impl HostTools for McpTools {
             .unwrap_or_else(|error| {
                 CallToolResult::error(vec![ContentBlock::text(format!("Tool failed: {error}"))])
             })
+    }
+}
+
+/// Ends the reply when the model's response stayed empty after the GDK's own
+/// retries. Without this, inference would run again immediately.
+struct EmptyResponse;
+
+#[async_trait::async_trait]
+impl Operation<LoopSession, LoopEffect> for EmptyResponse {
+    fn name(&self) -> &'static str {
+        "empty_response"
+    }
+
+    async fn run(
+        &self,
+        _session: &LoopSession,
+        conversation: &Conversation,
+        _emit: &Emitter,
+    ) -> Result<OperationResult<LoopEffect>> {
+        if conversation.last().is_some_and(is_empty_response_marker) {
+            yielded()
+        } else {
+            not_applicable()
+        }
     }
 }
 
@@ -1129,13 +1162,30 @@ mod tests {
 
     #[tokio::test]
     async fn empty_responses_are_retryable_failures_not_results() {
+        // The GDK retries an empty response three times within one call.
+        let blank = || Ok(Message::assistant().with_text("  "));
+        let provider = Scripted::new(vec![blank(), Ok(Message::assistant().with_text("result"))]);
+        let recovered = agent(provider, Arc::new(Echo(Mutex::new(Vec::new()))), 10);
+        let end = recovered
+            .reply(
+                Message::user().with_text("go"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(end, ReplyEnd::Finished);
+        assert_eq!(recovered.final_text(), "result");
+
+        // A response that stays empty is a transient failure, not a result.
         let provider = Scripted::new(vec![
-            Ok(Message::assistant().with_text("  ")),
+            blank(),
+            blank(),
+            blank(),
+            blank(),
             Ok(Message::assistant().with_text("result")),
         ]);
-        let tools = Arc::new(Echo(Mutex::new(Vec::new())));
-        let agent = agent(provider, tools, 10);
-
+        let agent = agent(provider, Arc::new(Echo(Mutex::new(Vec::new()))), 10);
         let end = agent
             .reply(
                 Message::user().with_text("go"),
@@ -1144,16 +1194,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(end, ReplyEnd::ProviderError(_)));
+        let ReplyEnd::ProviderError(error) = &end else {
+            panic!("expected a provider error, got {end:?}");
+        };
+        assert!(LoopRetry::new("test", 1, 0).provider_error(error).is_ok());
         assert_eq!(agent.final_text(), "");
-        assert!(
-            LoopRetry::new("test", 1, 0)
-                .provider_error(match &end {
-                    ReplyEnd::ProviderError(error) => error,
-                    _ => unreachable!(),
-                })
-                .is_ok()
-        );
 
         let end = agent
             .reply(

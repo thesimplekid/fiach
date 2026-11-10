@@ -7,11 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use goose::{
-    agents::platform_extensions::{PlatformExtensionContext, developer::DeveloperClient},
-    conversation::message::Message,
-    model_config::model_config_from_user_config,
-    providers::create_with_named_model,
-    session::SessionManager,
+    agents::platform_extensions::developer::DeveloperClient, conversation::message::Message,
+    model_config::model_config_from_user_config, providers::create,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, sync::Mutex};
@@ -821,7 +818,7 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
         &input.config.model
     };
     let model_config = model_config_from_user_config(provider, model)?;
-    let provider = create_with_named_model(provider, vec![]).await?;
+    let provider = create(provider, vec![]).await?;
     let developer = developer_tools(workspace).await?;
     let reports = Arc::new(Mutex::new(None));
     let reporting: Arc<dyn HostTools> = Arc::new(reporting::ReportingClient {
@@ -944,13 +941,7 @@ fn append_transcript(transcript: &mut std::fs::File, message: &Message) -> Resul
 
 /// Goose's developer tools, rooted in the workspace.
 async fn developer_tools(workspace: &Path) -> Result<Arc<dyn HostTools>> {
-    let client = DeveloperClient::new(PlatformExtensionContext {
-        extension_manager: None,
-        session_manager: Arc::new(SessionManager::instance()),
-        scheduler: None,
-        session: None,
-        use_login_shell_path: false,
-    })?;
+    let client = DeveloperClient::new()?;
     Ok(Arc::new(
         McpTools::new(Arc::new(client), "issue-worker", workspace.to_path_buf()).await?,
     ))

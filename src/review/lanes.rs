@@ -325,6 +325,9 @@ mod tests {
         let provider = Scripted::new(vec![
             Err(ProviderError::ServerError("unavailable".into())),
             Ok(Message::assistant().with_text("   ")),
+            Ok(Message::assistant().with_text("   ")),
+            Ok(Message::assistant().with_text("   ")),
+            Ok(Message::assistant().with_text("   ")),
             Ok(Message::assistant().with_text(r#"{"status":"no_findings","candidates":[]}"#)),
         ]);
         let lanes = lane_runner(provider.clone(), workspace.path(), &["persona", "security"]);

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use goose::{
     conversation::{message::Message, token_usage::ProviderUsage},
     model_config::model_config_from_user_config,
-    providers::{canonical::maybe_get_canonical_model, create_with_named_model},
+    providers::{canonical::maybe_get_canonical_model, create},
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock as Content, JsonObject, Tool,
@@ -467,7 +467,7 @@ pub async fn answer_buzz_review_question(
         .replace("{evidence}", &evidence);
     let model_config = model_config_from_user_config(provider_name, model)
         .context("Failed to configure Buzz question model")?;
-    let provider = create_with_named_model(provider_name, Vec::new())
+    let provider = create(provider_name, Vec::new())
         .await
         .with_context(|| format!("Failed to create {provider_name} provider"))?;
     let messages = [Message::user().with_text(&user_prompt)];
@@ -1063,7 +1063,7 @@ pub async fn run_review(
     // 2. Create the configured LLM provider
     let model_config = model_config_from_user_config(&params.provider, &params.model)
         .context("Failed to configure finder model")?;
-    let provider = create_with_named_model(&params.provider, Vec::new())
+    let provider = create(&params.provider, Vec::new())
         .await
         .with_context(|| format!("Failed to create {} provider", params.provider))?;
     let (input_price_per_m, output_price_per_m) = resolve_price_overrides(
@@ -2577,7 +2577,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     }
     let model_config = model_config_from_user_config(params.provider_name, params.model)
         .context("Failed to configure verifier model")?;
-    let provider = create_with_named_model(params.provider_name, Vec::new())
+    let provider = create(params.provider_name, Vec::new())
         .await
         .with_context(|| {
             format!(
