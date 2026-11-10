@@ -15,15 +15,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use goose::{
-    agents::{mcp_client::McpClientTrait, tool_execution::ToolCallContext},
-    conversation::{
-        Conversation, EffectiveRole,
-        message::{ErrorContent, Message, MessageContent, MessageErrorKind},
-        token_usage::ProviderUsage,
-    },
-    providers::base::Provider,
-};
+use goose::agents::{mcp_client::McpClientTrait, tool_execution::ToolCallContext};
 use goose_agent::{
     events::AgentEvent,
     inference::{InferenceEffect, InferenceRunner, is_empty_response_marker},
@@ -34,7 +26,15 @@ use goose_agent::{
     },
     tool::{ToolOperation, ToolProvider},
 };
-use goose_providers::model::ModelConfig;
+use goose_providers::{
+    base::Provider,
+    conversation::{
+        Conversation, EffectiveRole,
+        message::{ErrorContent, Message, MessageContent, MessageErrorKind},
+        token_usage::ProviderUsage,
+    },
+    model::ModelConfig,
+};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, JsonObject, Tool,
 };
@@ -810,14 +810,15 @@ pub(crate) mod testing {
     use std::sync::{Arc, Mutex};
 
     use futures::stream;
-    use goose::{
+    use goose_providers::{
+        base::{MessageStream, Provider},
         conversation::{
             message::Message,
             token_usage::{ProviderUsage, Usage},
         },
-        providers::base::{MessageStream, Provider},
+        errors::ProviderError,
+        model::ModelConfig,
     };
-    use goose_providers::{errors::ProviderError, model::ModelConfig};
     use rmcp::model::Tool;
 
     use super::lock;
@@ -883,7 +884,7 @@ pub(crate) mod testing {
 mod tests {
     use super::{testing::Scripted, *};
 
-    use goose::conversation::message::MessageContent;
+    use goose_providers::conversation::message::MessageContent;
     use goose_providers::errors::ProviderError;
     use rmcp::model::Role;
 

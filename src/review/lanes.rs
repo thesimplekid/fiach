@@ -11,8 +11,7 @@ use std::{
 };
 
 use futures::future::join_all;
-use goose::{conversation::message::Message, providers::base::Provider};
-use goose_providers::model::ModelConfig;
+use goose_providers::{base::Provider, conversation::message::Message, model::ModelConfig};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 

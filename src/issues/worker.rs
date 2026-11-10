@@ -7,9 +7,10 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use goose::{
-    agents::platform_extensions::developer::DeveloperClient, conversation::message::Message,
+    agents::platform_extensions::developer::DeveloperClient,
     model_config::model_config_from_user_config, providers::create,
 };
+use goose_providers::conversation::message::Message;
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, sync::Mutex};
 use tokio_util::sync::CancellationToken;

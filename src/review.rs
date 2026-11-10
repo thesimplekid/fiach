@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use goose::{
+use goose::{model_config::model_config_from_user_config, providers::create};
+use goose_providers::{
+    canonical::maybe_get_canonical_model,
     conversation::{message::Message, token_usage::ProviderUsage},
-    model_config::model_config_from_user_config,
-    providers::{canonical::maybe_get_canonical_model, create},
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock as Content, JsonObject, Tool,
@@ -1109,7 +1109,7 @@ pub async fn run_review(
                     );
 
                     let discovery_message =
-                        goose::conversation::message::Message::user().with_text(&prompt);
+                        goose_providers::conversation::message::Message::user().with_text(&prompt);
 
                     // Call the LLM to pick the skill
                     match provider
@@ -3160,7 +3160,7 @@ Reviewed the PR and found no vulnerabilities.
 
     #[test]
     fn usage_snapshot_sums_calls_and_normalizes_values() {
-        use goose::conversation::token_usage::Usage;
+        use goose_providers::conversation::token_usage::Usage;
 
         let usage = [
             ProviderUsage::new(
@@ -3183,7 +3183,7 @@ Reviewed the PR and found no vulnerabilities.
 
     #[test]
     fn usage_cost_sums_reported_charges_and_falls_back_per_call() {
-        use goose::conversation::token_usage::{CostSource, Usage};
+        use goose_providers::conversation::token_usage::{CostSource, Usage};
 
         let reported = ProviderUsage::new(
             "unknown".into(),
@@ -3221,7 +3221,7 @@ Reviewed the PR and found no vulnerabilities.
 
     #[test]
     fn skill_selection_cost_prefers_charge_and_falls_back_to_prices() {
-        use goose::conversation::token_usage::{CostSource, ProviderUsage, Usage};
+        use goose_providers::conversation::token_usage::{CostSource, ProviderUsage, Usage};
 
         let mut usage = ProviderUsage::new(
             "unknown".to_string(),
@@ -3500,7 +3500,7 @@ Reviewed the PR and found no vulnerabilities.
         client: &ReportingClient,
         message: Message,
     ) -> CallToolResult {
-        let goose::conversation::message::MessageContent::ToolRequest(request) =
+        let goose_providers::conversation::message::MessageContent::ToolRequest(request) =
             &message.content[0]
         else {
             panic!("expected tool request");
