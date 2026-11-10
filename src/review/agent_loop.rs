@@ -75,6 +75,21 @@ pub(crate) struct LoopConfig {
 
 pub(crate) type StopCondition = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Provider usage, one entry per model call. Clones share the same log, so
+/// several sessions can account into one budget.
+#[derive(Clone, Default)]
+pub(crate) struct UsageLog(Arc<Mutex<Vec<ProviderUsage>>>);
+
+impl UsageLog {
+    pub fn snapshot(&self) -> Vec<ProviderUsage> {
+        lock(&self.0).clone()
+    }
+
+    fn push(&self, usage: ProviderUsage) {
+        lock(&self.0).push(usage);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReplyEnd {
     /// The model ended its turn.
@@ -95,7 +110,7 @@ pub(crate) struct AgentLoop {
     max_turns: AtomicU32,
     stop_when: Option<StopCondition>,
     conversation: Mutex<Conversation>,
-    usage: Mutex<Vec<ProviderUsage>>,
+    usage: UsageLog,
     turn_limit_reached: Arc<AtomicBool>,
 }
 
@@ -110,7 +125,7 @@ impl AgentLoop {
             max_turns: AtomicU32::new(config.max_turns),
             stop_when: config.stop_when,
             conversation: Mutex::new(Conversation::empty()),
-            usage: Mutex::new(Vec::new()),
+            usage: UsageLog::default(),
             turn_limit_reached: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -126,9 +141,32 @@ impl AgentLoop {
         self.max_turns.fetch_min(limit, Ordering::SeqCst);
     }
 
+    /// Records usage into a shared log instead of a private one.
+    pub fn sharing_usage(mut self, usage: UsageLog) -> Self {
+        self.usage = usage;
+        self
+    }
+
     /// Provider usage recorded so far, one entry per model call.
     pub fn usage(&self) -> Vec<ProviderUsage> {
-        lock(&self.usage).clone()
+        self.usage.snapshot()
+    }
+
+    /// Text of the assistant's final messages, after the last tool result or
+    /// user message.
+    pub fn final_text(&self) -> String {
+        let conversation = lock(&self.conversation);
+        let messages = conversation.messages();
+        let start = messages
+            .iter()
+            .rposition(|message| message.role != rmcp::model::Role::Assistant)
+            .map_or(0, |index| index + 1);
+        messages[start..]
+            .iter()
+            .filter(|message| message.error_kind().is_none())
+            .map(Message::as_concat_text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Sends `message` and runs the loop until the model ends its turn, the turn
@@ -198,7 +236,14 @@ impl AgentLoop {
         }
         result?;
 
-        let conversation = lock(&self.conversation);
+        let mut conversation = lock(&self.conversation);
+        if conversation.last().is_some_and(is_empty_response_notice) {
+            conversation.pop();
+            return Ok(ReplyEnd::ProviderError(ErrorContent {
+                kind: MessageErrorKind::Other,
+                message: "The model returned an empty response".into(),
+            }));
+        }
         if let Some(error) = conversation
             .last()
             .and_then(|message| message.content.iter().find_map(MessageContent::as_error))
@@ -230,6 +275,17 @@ impl AgentLoop {
             conversation.pop();
         }
     }
+}
+
+/// The GDK at Fiach's Goose pin reports an empty model response as this
+/// visible assistant text instead of an error; it is a transient failure, not
+/// a result. Later GDK releases mark it with `is_empty_response_marker`.
+const EMPTY_RESPONSE_NOTICE: &str =
+    "The model returned an empty response. Please resend your message to continue.";
+
+fn is_empty_response_notice(message: &Message) -> bool {
+    message.role == rmcp::model::Role::Assistant
+        && message.as_concat_text() == EMPTY_RESPONSE_NOTICE
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -302,7 +358,7 @@ impl EffectHandler<LoopSession, LoopEffect> for AgentLoop {
     ) -> Result<()> {
         for effect in effects.iter_mut() {
             match effect {
-                LoopEffect::Usage(usage) => lock(&self.usage).push(usage.clone()),
+                LoopEffect::Usage(usage) => self.usage.push(usage.clone()),
                 LoopEffect::Conversation(ConversationEffect::AppendMessage(message)) => {
                     lock(&self.conversation).push(message.clone());
                 }
@@ -556,6 +612,10 @@ impl LoopRetry {
             retries: 0,
             delay_secs,
         }
+    }
+
+    pub fn retries(&self) -> u32 {
+        self.retries
     }
 
     pub fn exhausted(&self) -> bool {
@@ -933,6 +993,46 @@ mod tests {
         );
         let calls = lock(&provider.calls);
         assert_eq!(calls[2], ("Policy.".to_owned(), Vec::<String>::new()));
+    }
+
+    #[tokio::test]
+    async fn empty_responses_are_retryable_failures_not_results() {
+        let provider = Scripted::new(vec![
+            Ok(Message::assistant().with_text("  ")),
+            Ok(Message::assistant().with_text("result")),
+        ]);
+        let tools = Arc::new(Echo(Mutex::new(Vec::new())));
+        let agent = agent(provider, tools, 10);
+
+        let end = agent
+            .reply(
+                Message::user().with_text("go"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(end, ReplyEnd::ProviderError(_)));
+        assert_eq!(agent.final_text(), "");
+        assert!(
+            LoopRetry::new("test", 1, 0)
+                .provider_error(match &end {
+                    ReplyEnd::ProviderError(error) => error,
+                    _ => unreachable!(),
+                })
+                .is_ok()
+        );
+
+        let end = agent
+            .reply(
+                Message::user().with_text("again"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(end, ReplyEnd::Finished);
+        assert_eq!(agent.final_text(), "result");
     }
 
     #[test]
