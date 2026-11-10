@@ -126,18 +126,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Internal read-only MCP server used by finder delegates.
-    #[command(hide = true)]
-    InspectionServer {
-        #[arg(long)]
-        workspace: PathBuf,
-        #[arg(long)]
-        read_root: Vec<PathBuf>,
-        #[arg(long)]
-        base: String,
-        #[arg(long)]
-        head: String,
-    },
     /// Internal sandbox entrypoint that relays model broker sockets to
     /// loopback ports and runs a command with provider variables set.
     #[command(hide = true)]
@@ -499,17 +487,6 @@ const DEFAULT_LOG_FILTER: &str = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqw
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    // MCP owns stdout. Do not load checkout .env/config or initialize the app
-    // when a delegated lane starts this fixed inspection service.
-    if let Commands::InspectionServer {
-        workspace,
-        read_root,
-        base,
-        head,
-    } = &cli.command
-    {
-        return fiach::inspection::serve(workspace, read_root, base, head).await;
-    }
     // The bridge only relays sockets and runs the job; the job loads its own
     // configuration and tracing.
     if let Commands::BrokerBridge { manifest, command } = &cli.command {
@@ -559,7 +536,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // Handled before app initialization.
-        Commands::InspectionServer { .. } | Commands::BrokerBridge { .. } => Ok(()),
+        Commands::BrokerBridge { .. } => Ok(()),
         Commands::Issues { watch, issue } => {
             let config = FiachConfig::load(cli.config.as_deref())?;
             let issues = config
