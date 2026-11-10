@@ -4,13 +4,16 @@ High-signal constraints and instructions for AI agents working in this repositor
 
 ## Architecture & Layout
 
-- **Pre-stage then delegate**: The app isolates work in a temp dir using host-side forge adapters *before* giving control to the `goose` agent. This prevents wasting agent turns on git operations.
-- **Structured reporting first**: Finder agents submit candidates through the in-process `fiach-reporting` MCP client (`submit_finding` / `submit_no_findings`). Markdown is rendered by the host from structured data.
-- **Separate verifier session**: Candidate findings are adjudicated in a second Goose session. The verifier submits one `submit_verdict` per finding; structured verdicts are authoritative for metadata and disclosure.
+- **Pre-stage then delegate**: The app isolates work in a temp dir using host-side forge adapters *before* giving control to an agent session. This prevents wasting agent turns on git operations.
+- **Own agent loop on the Goose GDK**: `src/review/agent_loop.rs` assembles every session (lanes, coordinator, verifier, issue worker) from `goose-agent` operations. Tools are host-side `HostTools` called in-process; none are resolved from Goose extension configuration, and Goose's `Agent`/`StateMachineServices` runtime is not used.
+- **Host-driven review lanes**: `src/review/lanes.rs` runs each selected lane as an inspection-only child session (bounded concurrency, one deadline per attempt, one replacement). The coordinator receives completed lane results and only synthesizes and submits.
+- **Structured reporting first**: The coordinator submits candidates through the host `ReportingClient` tools (`submit_finding` / `submit_no_findings`). Markdown is rendered by the host from structured data.
+- **Separate verifier session**: Candidate findings are adjudicated in a second agent session. The verifier submits one `submit_verdict` per finding; structured verdicts are authoritative for metadata and disclosure.
 - **Host-only disclosure**: Models never post to a forge. `src/disclose.rs` applies deterministic policy checks before any forge side effect.
 - `src/main.rs`: Entrypoint, clap CLI parsing, tracing init.
 - `src/daemon.rs`: Polling loop, PR discovery via GitHub CLI or Forgejo REST, deduplication.
-- `src/review.rs`: Sets up finder/verifier Goose sessions, reporting tools, artifact rendering, retries, and token/cost accounting.
+- `src/review.rs`: Runs lanes, the coordinator, verifier, and duplicate-suppression continuation; reporting tools, artifact rendering, retries, and token/cost accounting.
+- `src/review/agent_loop.rs`: In-memory agent session (`AgentLoop`), host tools, turn limit, stop condition, empty-response handling, compaction, and provider-error retry classification.
 - `src/reporting.rs`: Structured finding/verdict schemas, validation, Markdown rendering, diff-anchor parsing, and disclosure policy helpers.
 - `src/forge.rs`, `src/github.rs`, `src/forgejo.rs`: Forge selection and host adapters. Bare `owner/name` means GitHub; an HTTPS repository URL means Forgejo.
 - `src/workspace.rs`: Uses forge adapters to clone repo/PR to a temp dir and records PR lifecycle/base/default-branch context.
@@ -46,8 +49,8 @@ High-signal constraints and instructions for AI agents working in this repositor
 
 ## Dependencies & Overrides (CRITICAL)
 
-- **DO NOT** casually change dependency pins or overrides in `Cargo.toml` / `Cargo.lock`; Goose and RMCP versions are sensitive.
-- Keep the manifest `rmcp = "3.4.0"` requirement unless you have verified Goose compatibility and the lockfile outcome. Keep Fiach and Goose on a single compatible RMCP version; do not change this as drive-by churn.
+- **DO NOT** casually change dependency pins or overrides in `Cargo.toml` / `Cargo.lock`; Goose and RMCP versions are sensitive. All Goose crates (`goose`, `goose-providers`, `goose-agent`, `goose-context-management`) share one git rev, and `flake.nix` pins its vendored hash.
+- Keep the manifest `rmcp = "3.4.1"` requirement (and the lockfile at 3.4.1, not the newest 3.x) unless you have verified Goose compatibility and the lockfile outcome. Keep Fiach and Goose on a single compatible RMCP version; do not change this as drive-by churn.
 
 ## Development Setup
 

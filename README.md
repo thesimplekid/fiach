@@ -2,7 +2,7 @@
 
 > **Main repository:** `ssh://git@git.cashu.dev/thesimplekid/fiach.git`. The GitHub repository is just a mirror.
 
-**Fiach** (Irish for *Hunter* or *Seeker*) is an autonomous, AI-powered PR reviewer built in Rust using the [goose](https://github.com/block/goose) agent framework. 
+**Fiach** (Irish for *Hunter* or *Seeker*) is an autonomous, AI-powered PR reviewer built in Rust on the [goose](https://github.com/aaif-goose/goose) development kit (GDK). 
 
 It acts as a background daemon that monitors configured GitHub repositories, checks out active Pull Requests, and uses an LLM (OpenRouter by default, or OpenAI, Anthropic, or Google directly) to review the code against a fully customizable **Persona**. If the agent finds actionable issues (like security vulnerabilities or code quality violations), `fiach` can automatically report them by commenting on the PR or opening a dedicated disclosure PR on a centralized tracking repository.
 
@@ -95,10 +95,10 @@ The separate `fiach issues` triage/automatic-fix workflow remains GitHub-only.
 
 ### Credential Scope
 
-Finder sessions and their delegated lanes use a fixed `inspect` tool for reading
+Review lanes and the finder coordinator use a fixed `inspect` tool for reading
 files, listing paths, literal text searches, and diffs pinned to the reviewed
 commits. They cannot execute shell commands, edit files, run repository scripts,
-or add execution tools to a delegate. Read access is limited to the prepared
+or delegate; the host runs lanes and chooses every session's tools. Read access is limited to the prepared
 workspace, its context repositories, and the host-selected skills directory.
 The verifier uses the same `inspect` tool and has no shell either, so reviews
 are static: no PR code is built or run. The host records each inspect call the
@@ -210,7 +210,7 @@ Fiach treats HTTP 400/422 request rejections as terminal. PR reviews use the
 existing fatal-error policy (including stopping the daemon). Issue triage persists
 the rejection until its evidence/configuration fingerprint changes; transient
 failures retain timed backoff. Screening can still split oversized batches into
-smaller requests. Goose's own bounded transport retries remain separate.
+smaller requests. Provider-level transport retries remain separate.
 
 ### Review cost limits
 
@@ -223,8 +223,8 @@ funds. Without verification, discovery can use the full limit.
 Provider-reported charges take precedence over token prices, including explicit
 price overrides. OpenRouter returns the account charge in
 [`usage.cost`](https://openrouter.ai/docs/cookbook/administration/usage-accounting),
-which Goose includes in recursive session accounting. When charges are absent,
-Goose estimates or configured/model token prices are used as a fallback. Logged
+which Fiach sums per model call across lanes and sessions. When a call reports no
+charge, configured or model token prices are used as a fallback for that call. Logged
 costs can therefore include estimates and are not invoice reconciliation.
 
 Limits are checked against observed usage; in-flight requests and parallel lanes
@@ -378,7 +378,7 @@ A custom persona file can contain these placeholders which are filled at runtime
 
 ### Review Lanes
 
-Every review runs the configured persona as a mandatory `persona` lane, even when `review_lanes` is empty. The parent uses a small coordinator prompt and delegates code inspection to that lane. Additional review lanes provide narrower lenses within the same review, sharing one report and verifier/disclosure flow. The `persona` lane name is reserved; configure its methodology through `persona`, not `review_lane_prompts`.
+Every review runs the configured persona as a mandatory `persona` lane, even when `review_lanes` is empty. The host runs that lane and passes its result to a coordinator with a small prompt. Additional review lanes provide narrower lenses within the same review, sharing one report and verifier/disclosure flow. The `persona` lane name is reserved; configure its methodology through `persona`, not `review_lane_prompts`.
 
 This differs from `personas`: multiple personas create separate review jobs, state keys, and reports; lanes feed back into the same parent finder, which submits one combined structured result.
 
@@ -416,7 +416,7 @@ The built-in `summary` lane produces a neutral structured description of what
 the PR changes. It does not make a review decision and is stored separately
 from findings. Buzz delivery enables this lane automatically.
 
-The coordinator launches Goose delegate subagents, collects all lane results, merges candidates describing the same root cause, and submits `submit_finding` or `submit_no_findings`. `max_review_lanes` includes the mandatory persona lane and any summary lane. Lanes return candidate JSON and do not call reporting tools; custom persona files keep their methodology and placeholders, but the appended lane execution contract overrides old instructions to submit findings or write reports.
+The host runs the selected lanes as inspection-only sessions, at most `max_review_lanes` at a time (including the mandatory persona lane and any summary lane). Each lane gets a bounded deadline per attempt and one replacement; a lane that still fails leaves the finder incomplete. The coordinator receives the completed lane results, merges candidates describing the same root cause, and submits `submit_finding` or `submit_no_findings`. Lanes return candidate JSON and do not call reporting tools; custom persona files keep their methodology and placeholders, but the appended lane execution contract overrides old instructions to submit findings or write reports.
 
 You can optionally make a specialist lane conditional on the change being relevant:
 
@@ -439,7 +439,7 @@ Lanes without conditions always run. Conditions must name configured lanes;
 empty conditions, conflicting normalized names, and conditions on the mandatory
 `persona`, `summary`, or `pr-summary` lanes are configuration errors.
 
-With `TYPESAFE_API_KEY` available, Fiach evaluates conditions before delegation
+With `TYPESAFE_API_KEY` available, Fiach evaluates conditions before running lanes
 using the same diff base as the review, including incremental rereviews. Jev
 returns `run`, `skip`, or `uncertain`. Only `skip` with probability at least 0.98
 and confidence at least 0.95 removes a lane. Missing credentials, uncertainty,
@@ -448,7 +448,7 @@ diff context all run the configured lanes. No PR title or description can
 authorize skipping a lane by itself. Conditions and diff content are passed as
 data to a tool-free classification request.
 
-The selected lanes drive both delegation and completion tracking. Structured
+The selected lanes drive both lane execution and completion tracking. Structured
 artifacts include `lane_selection` decisions with conditions, actions, model,
 probability, and confidence where available; Markdown distinguishes lanes
 selected to run from lanes skipped as irrelevant. A skip is never recorded as a
@@ -457,7 +457,7 @@ timeout, uses the shared Jev request limits below, and counts against the finder
 budget. `dedupe_existing_comments` controls deduplication independently of lane
 selection.
 
-After the independent verifier finishes, Fiach fetches current PR discussion and uses TypeSafe Jev to compare verified findings with existing comments. Set `TYPESAFE_API_KEY` in the process environment or NixOS service environment file; review sandboxes reach Jev through the host model broker. Jev decisions take effect immediately, without shadow mode. The integration uses GDK’s `goose-providers` decision API with the direct TypeSafe provider and pins the model to `jev-1.13.0`. Goose and its provider crate are pinned together to upstream commit `8a460f964ef5b165e35ab231e76ccfa0c133abbd`, which includes decision-provider support. Fiach retains answer validation, caching, cost budgets, and shared provider cooldowns.
+After the independent verifier finishes, Fiach fetches current PR discussion and uses TypeSafe Jev to compare verified findings with existing comments. Set `TYPESAFE_API_KEY` in the process environment or NixOS service environment file; review sandboxes reach Jev through the host model broker. Jev decisions take effect immediately, without shadow mode. The integration uses GDK’s `goose-providers` decision API with the direct TypeSafe provider and pins the model to `jev-1.13.0`. The Goose crates are pinned together to upstream release v1.58.1 (commit `c97af00bca96442611bb95155c56d6109afa42d6`), which includes decision-provider support. Fiach retains answer validation, caching, cost budgets, and shared provider cooldowns.
 
 Jev compares each finding with batches of up to eight comments using typed choices: same root issue, different issue, or insufficient evidence. Suppression requires a same-issue probability of at least 0.98 and confidence of at least 0.95. A definite non-match requires a different-issue probability of at least 0.95 and confidence of at least 0.90 for every comment. Comment IDs come from the supplied discussion, and the artifact records the matched ID, model, probability, and confidence. These conservative thresholds are policy defaults, not an accuracy guarantee.
 
@@ -775,7 +775,7 @@ The following options are available under `services.fiach`:
 | `logFilter` | string | `"fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
 | `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |
-| `reviewLanes` | list of string | `[]` | Focused review lanes to run as Goose subagents inside each persona review before the parent finder submits one combined structured result. |
+| `reviewLanes` | list of string | `[]` | Focused review lanes the host runs as inspection-only sessions inside each persona review before the coordinator submits one combined structured result. |
 | `reviewLanePrompts` | attrset of string | `{}` | Custom prompt text keyed by review lane name. Keys are normalized like `reviewLanes` before matching. |
 | `maxReviewLanes` | integer | `3` | Maximum number of review lane subagents to run concurrently inside each review. |
 | `withSkill` | string or null | `null` | Optional skill name to instruct the agent to use. |
@@ -880,14 +880,12 @@ This lets NixOS/systemd deployments keep using bundled skills such as `rust-secu
 - `src/disclose.rs`: Handles the `ReportMode` logic (commenting or creating Sync PRs).
 - `src/state.rs`: Typed, versioned, async redb state adapter.
 
-Delegated review lanes have host-enforced recovery. Each selected lane may start
-once and receive at most one replacement. Two unsuccessful waits (or one terminal
-task failure) trigger cancellation before replacement. Each wait is bounded by
-one eighth of the finder deadline, capped at 150 seconds; a lane watchdog stops
-uncollected work after four such intervals. Goose cancellation allows five seconds
-before abort, with a seven-second host bound including bookkeeping. Completed
-lanes remain available when another lane fails. A missing, cancelled, or exhausted
-lane makes the review incomplete and prevents disclosure.
+Review lanes have host-enforced recovery. Each selected lane runs once and
+receives at most one replacement after a deadline, provider failure, turn limit,
+or empty result. Each attempt is bounded by one quarter of the finder deadline,
+capped at 300 seconds. Completed lanes remain available when another lane fails.
+A missing, cancelled, or exhausted lane makes the review incomplete and prevents
+disclosure; the coordinator does not run.
 
 Finder timeouts and other incomplete finder exits preserve `report.md` and its
 structured JSON sibling in the normal report location (the per-run artifact

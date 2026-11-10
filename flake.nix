@@ -542,7 +542,7 @@
               type = lib.types.listOf lib.types.str;
               default = [ ];
               example = [ "security" "correctness" "concurrency" "api-compat" "tests" ];
-              description = "Focused review lanes to run as Goose subagents inside each review before the parent finder submits one combined structured result.";
+              description = "Focused review lanes the host runs as inspection-only sessions inside each review before the coordinator submits one combined structured result.";
             };
 
             reviewLanePrompts = lib.mkOption {
