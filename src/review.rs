@@ -390,6 +390,8 @@ pub struct ReviewParams {
     pub max_turns: u32,
     /// Timeout in minutes for the session
     pub timeout_mins: u64,
+    /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
+    pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     /// Path to the redb database
     pub db_path: PathBuf,
     /// Persona-specific review identity used for report paths and state keys.
@@ -1294,9 +1296,9 @@ pub async fn run_review(
     }
     reporting_artifact.lock().await.lane_selection = selection.decisions;
     let normalized_review_lanes = selection.lanes;
-    // Two bounded attempts per lane fit well inside the finder deadline.
-    let lane_attempt_timeout =
-        Duration::from_secs((params.timeout_mins.saturating_mul(60) / 4).clamp(1, 300));
+    // Each attempt, including the replacement, gets this allowance. The finder
+    // phase deadline still bounds all lanes, queueing, and coordinator work.
+    let lane_attempt_timeout = lane_attempt_timeout(params.timeout_mins, params.lane_timeout_mins);
     let require_pr_summary = normalized_review_lanes
         .iter()
         .any(|lane| is_summary_lane(lane));
@@ -2839,8 +2841,29 @@ fn std_lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn lane_attempt_timeout(
+    timeout_mins: u64,
+    lane_timeout_mins: Option<std::num::NonZeroU64>,
+) -> Duration {
+    Duration::from_secs(match lane_timeout_mins {
+        Some(minutes) => minutes.get().saturating_mul(60),
+        None => (timeout_mins.saturating_mul(60) / 4).clamp(1, 300),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lane_timeout_preserves_defaults_and_allows_longer_attempts() {
+        assert_eq!(super::lane_attempt_timeout(60, None).as_secs(), 300);
+        assert_eq!(super::lane_attempt_timeout(4, None).as_secs(), 60);
+        assert_eq!(super::lane_attempt_timeout(0, None).as_secs(), 1);
+        assert_eq!(
+            super::lane_attempt_timeout(60, std::num::NonZeroU64::new(20)).as_secs(),
+            1200
+        );
+    }
+
     #[test]
     fn incomplete_finder_artifacts_preserve_partial_work_without_disclosure() {
         for partial in [false, true] {

@@ -465,6 +465,8 @@ Uncertain comparisons, oversized inputs, missing credentials, and service failur
 
 Lane selection captures the complete diff with three context lines per hunk, up to 80 KiB, plus up to 8 KiB of changed paths. Its serialized Jev request is capped at 96 KiB; deduplication requests retain a 24 KiB cap. These are byte limits, not token counts: Jev separately enforces its 32k-token state-plus-longest-question limit and 64k-token total request limit. API context-limit errors run all configured lanes. Diff-size failures and Git failures have distinct diagnostics, also recorded in lane-selection artifacts. Requests have a ten-second timeout and each Jev phase has a thirty-second total timeout. Inputs are never truncated to force a decision. Reported usage is included in review totals, using the pinned model's [published price](https://docs.typesafe.ai/models) of $0.042 per million input tokens (output is free). Estimated request cost is checked against the remaining budget before sending. Usage from requests that fail without a usable response cannot be accounted for; Fiach does not retry those requests before falling back.
 
+`lane_timeout_mins` in `[review]` or `[daemon]` (CLI: `--lane-timeout-mins`, NixOS: `services.fiach.laneTimeoutMins`) sets a positive timeout in minutes for each lane attempt. Each lane can run once plus one replacement, each receiving this allowance. For example, `timeoutMins = 60; laneTimeoutMins = 20;` allows up to twenty minutes per attempt. The overall finder phase deadline still includes lane selection, queued lanes, both attempts, and coordinator work, so it can cut an attempt short. Unset, the per-attempt timeout remains one quarter of `timeout_mins`, capped at five minutes.
+
 `dedupe_existing_comments = false` disables both Jev and coordinator discussion comparison. The fallback coordinator uses the finder provider/model. Verifier provider/model settings remain independent. `timeout_mins` applies separately to the initial coordinator/lane phase, verifier phase, and fallback duplicate-decision continuation. The sandbox hard limit allows those enabled phases plus five minutes for setup and the bounded Jev phases.
 
 ### Buzz Review Threads
@@ -784,6 +786,7 @@ The following options are available under `services.fiach`:
 | `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no findings were found. |
 | `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
 | `timeoutMins` | integer | `30` | Timeout in minutes for each review session. |
+| `laneTimeoutMins` | positive integer or null | `null` | Timeout per lane attempt; the one replacement gets the same allowance. Null preserves the derived default (one quarter of the phase timeout, capped at five minutes). |
 | `maxRetries` | integer | `3` | Maximum number of retries for LLM provider failures and failed review attempts. |
 | `retryDelaySecs` | integer | `10` | Initial delay in seconds before retrying an LLM failure. |
 | `maxCostUsd` | float or null | `null` | Maximum observed budget in USD for each review. Cancels finder, verifier, and duplicate-suppression work at the limit. |

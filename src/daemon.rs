@@ -143,6 +143,8 @@ pub struct DaemonParams {
     pub max_review_lanes: usize,
     pub max_turns: u32,
     pub timeout_mins: u64,
+    /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
+    pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     pub db_path: PathBuf,
     pub max_retries: u32,
     pub max_review_retries: u32,
@@ -1304,6 +1306,7 @@ async fn process_daemon_job(
                 max_review_lanes: params.max_review_lanes,
                 max_turns: params.max_turns,
                 timeout_mins: params.timeout_mins,
+                lane_timeout_mins: params.lane_timeout_mins,
                 db_path: params.db_path.clone(),
                 review_kind: job.review_kind.clone(),
                 force: false,
@@ -1820,6 +1823,9 @@ async fn run_sandboxed_review(
         .arg(review_params.max_turns.to_string());
     cmd.arg("--timeout-mins")
         .arg(review_params.timeout_mins.to_string());
+    if let Some(minutes) = review_params.lane_timeout_mins {
+        cmd.arg("--lane-timeout-mins").arg(minutes.to_string());
+    }
     cmd.arg("--db-path").arg(&review_params.db_path);
     cmd.arg("--sandbox-child");
     cmd.arg("--staged-review").arg(SANDBOX_STAGED_REVIEW);

@@ -60,6 +60,8 @@ pub struct DaemonConfig {
     pub max_review_lanes: Option<usize>,
     pub max_turns: Option<u32>,
     pub timeout_mins: Option<u64>,
+    /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
+    pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     pub db_path: Option<PathBuf>,
     pub max_retries: Option<u32>,
     pub max_review_retries: Option<u32>,
@@ -111,6 +113,8 @@ pub struct ReviewConfig {
     pub max_review_lanes: Option<usize>,
     pub max_turns: Option<u32>,
     pub timeout_mins: Option<u64>,
+    /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
+    pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     pub db_path: Option<PathBuf>,
     pub force: Option<bool>,
     pub max_retries: Option<u32>,
@@ -354,6 +358,26 @@ impl FiachConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lane_timeout_config_requires_positive_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fiach.toml");
+        for section in ["review", "daemon"] {
+            std::fs::write(&path, format!("[{section}]\nlane_timeout_mins = 20")).unwrap();
+            let config = FiachConfig::load(Some(&path)).unwrap();
+            let value = if section == "review" {
+                config.review.unwrap().lane_timeout_mins
+            } else {
+                config.daemon.unwrap().lane_timeout_mins
+            };
+            assert_eq!(value.unwrap().get(), 20);
+            for invalid in [0, -1] {
+                std::fs::write(&path, format!("[{section}]\nlane_timeout_mins = {invalid}"))
+                    .unwrap();
+                assert!(FiachConfig::load(Some(&path)).is_err());
+            }
+        }
+    }
 
     #[test]
     fn config_loads_custom_review_lane_prompts() {

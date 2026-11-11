@@ -133,6 +133,7 @@
                       skipPrs = [ "123" "owner/repo#456" ];
                       drafts = true;
                       timeoutMins = 45;
+                      laneTimeoutMins = 15;
                       maxRetries = 7;
                       maxReviewRetries = 4;
                       retryDelaySecs = 20;
@@ -244,6 +245,7 @@
               grep -F '"owner/repo#456"' "$config_path" >/dev/null
               grep -F 'drafts = true' "$config_path" >/dev/null
               grep -F 'timeout_mins = 45' "$config_path" >/dev/null
+              grep -F 'lane_timeout_mins = 15' "$config_path" >/dev/null
               grep -F 'max_retries = 7' "$config_path" >/dev/null
               grep -F 'max_review_retries = 4' "$config_path" >/dev/null
               grep -F 'retry_delay_secs = 20' "$config_path" >/dev/null
@@ -586,6 +588,12 @@
               type = lib.types.int;
               default = 30;
               description = "Timeout in minutes for each review session.";
+            };
+
+            laneTimeoutMins = lib.mkOption {
+              type = lib.types.nullOr lib.types.ints.positive;
+              default = null;
+              description = "Timeout in minutes per lane attempt. The one replacement gets the same allowance. The overall timeoutMins phase limit still applies, including queueing and coordinator work. Null uses one quarter of timeoutMins, capped at five minutes.";
             };
 
             maxRetries = lib.mkOption {
@@ -985,6 +993,8 @@
                         max_retries = cfg.maxRetries;
                         max_review_retries = cfg.maxReviewRetries;
                         retry_delay_secs = cfg.retryDelaySecs;
+                      } // lib.optionalAttrs (cfg.laneTimeoutMins != null) {
+                        lane_timeout_mins = cfg.laneTimeoutMins;
                       } // personaConfig // buzzConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
                         verifier_provider = cfg.verifierProvider;
                       } // lib.optionalAttrs (cfg.verifierModel != null) {
