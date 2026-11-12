@@ -484,6 +484,28 @@ pub async fn answer_buzz_review_question(
     Ok(answer)
 }
 
+const PROVIDER_PROBE_SYSTEM_PROMPT: &str = r#"Reply with the single word OK."#;
+
+/// Sends one minimal completion to check that the provider serves the model
+/// again. Runs on the host with the host's provider credentials.
+pub async fn probe_provider(provider_name: &str, model: &str) -> Result<()> {
+    let model_config = model_config_from_user_config(provider_name, model)
+        .context("Failed to configure provider probe model")?;
+    let provider = create(provider_name, Vec::new())
+        .await
+        .with_context(|| format!("Failed to create {provider_name} provider"))?;
+    provider
+        .complete(
+            &model_config,
+            PROVIDER_PROBE_SYSTEM_PROMPT,
+            &[Message::user().with_text("ping")],
+            &[],
+        )
+        .await
+        .context("Provider probe request failed")?;
+    Ok(())
+}
+
 async fn load_buzz_review_evidence(metadata: &state::ReviewRecord) -> Result<String> {
     let primary = if let Some(path) = metadata.artifacts.structured_json.as_deref() {
         read_bounded_artifact(path).await.with_context(|| {
@@ -1596,6 +1618,9 @@ pub async fn run_review(
             params.timeout_mins
         ),
     }
+    if let Some(error) = lanes.take_provider_failure() {
+        return Err(error);
+    }
     if stop_reason.is_some() {
         bail!("Finder incomplete: not all delegated lanes completed");
     }
@@ -1867,6 +1892,8 @@ pub async fn run_review(
                 failure_stage: None,
                 review_retry_version: 1,
                 retry_not_before: None,
+                failure_class: None,
+                needs_intervention: false,
             },
             should_notify,
             report_path: report_file.to_path_buf(),

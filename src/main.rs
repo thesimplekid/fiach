@@ -10,7 +10,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use fiach::config::{FiachConfig, MultiString};
 use fiach::disclose::ReportMode;
 use fiach::execution::ReviewExecutor;
-use fiach::{daemon, disclose, persona, review, server, state};
+use fiach::{broker, daemon, disclose, persona, review, server, state};
 
 fn parse_report_mode(value: &str) -> Result<ReportMode> {
     ReportMode::from_str(value).map_err(|error| anyhow::anyhow!(error))
@@ -232,11 +232,11 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Maximum number of retries for LLM provider/session failures
+        /// In-session provider retries: how often one agent session re-prompts after a transient model error
         #[arg(long)]
         max_retries: Option<u32>,
 
-        /// Initial delay in seconds before retrying an LLM failure
+        /// Initial delay in seconds before an in-session provider retry (doubles each retry)
         #[arg(long)]
         retry_delay_secs: Option<u64>,
 
@@ -362,17 +362,25 @@ enum Commands {
         #[arg(long)]
         db_path: Option<PathBuf>,
 
-        /// Maximum number of retries for LLM provider/session failures
+        /// In-session provider retries: how often one agent session re-prompts after a transient model error. Distinct from --max-review-retries
         #[arg(long)]
         max_retries: Option<u32>,
 
-        /// Maximum whole-review retries per commit; a fresh trusted mention resets the limit
+        /// Whole-review retries per commit after a failed review attempt, with backoff from five minutes to six hours. Distinct from --max-retries. Failures while the provider circuit is open do not count; a fresh trusted mention resets the limit
         #[arg(long)]
         max_review_retries: Option<u32>,
 
-        /// Initial delay in seconds before retrying an LLM failure
+        /// Initial delay in seconds before an in-session provider retry (doubles each retry)
         #[arg(long)]
         retry_delay_secs: Option<u64>,
+
+        /// Consecutive transient provider failures (429, 408, 5xx, connection errors) that open the provider circuit and pause review dispatch; 0 disables the breaker
+        #[arg(long)]
+        provider_failure_threshold: Option<u32>,
+
+        /// Seconds between probe calls while the provider circuit is open
+        #[arg(long)]
+        provider_probe_interval_secs: Option<u64>,
 
         /// Directory to store reports (defaults to "./reports" in current dir if not provided)
         #[arg(long)]
@@ -749,6 +757,8 @@ async fn main() -> Result<()> {
             max_retries,
             max_review_retries,
             retry_delay_secs,
+            provider_failure_threshold,
+            provider_probe_interval_secs,
             out_dir,
             report_mode,
             sync_repo,
@@ -863,9 +873,28 @@ async fn main() -> Result<()> {
                 .or(daemon_cfg.allowed_mention_users)
                 .unwrap_or_default();
 
+            let provider_failure_threshold = provider_failure_threshold
+                .or(daemon_cfg.provider_failure_threshold)
+                .unwrap_or(broker::DEFAULT_CIRCUIT_FAILURE_THRESHOLD);
+            let provider_probe_interval = provider_probe_interval_secs
+                .or(daemon_cfg.provider_probe_interval_secs)
+                .map_or(broker::DEFAULT_CIRCUIT_PROBE_INTERVAL, |secs| {
+                    std::time::Duration::from_secs(secs.max(1))
+                });
+            let verify = verify_findings
+                .or(daemon_cfg.verify_findings)
+                .unwrap_or(true);
+            let provider_circuit = broker::CircuitBreaker::new(
+                daemon::provider_circuit_providers(&provider, verifier_provider.as_deref(), verify),
+                provider_failure_threshold,
+                provider_probe_interval,
+            );
+
             tracing::info!(
                 repos = %repos_str,
                 interval_secs = interval_secs,
+                provider_failure_threshold,
+                provider_probe_interval_secs = provider_probe_interval.as_secs(),
                 provider = %provider,
                 model = %model,
                 personas = ?personas,
@@ -909,6 +938,7 @@ async fn main() -> Result<()> {
                 retry_delay_secs: retry_delay_secs
                     .or(daemon_cfg.retry_delay_secs)
                     .unwrap_or(10),
+                provider_circuit,
                 out_dir: out_dir
                     .or(daemon_cfg.out_dir)
                     .or_else(|| Some(PathBuf::from("reports"))),
@@ -924,9 +954,7 @@ async fn main() -> Result<()> {
                     ),
                 },
                 buzz_config,
-                verify_findings: verify_findings
-                    .or(daemon_cfg.verify_findings)
-                    .unwrap_or(true),
+                verify_findings: verify,
                 context_groups: config.context_groups,
                 pr_states,
                 skip_prs: skip_prs_list,
@@ -974,6 +1002,7 @@ async fn main() -> Result<()> {
             let app_state = server::AppState {
                 state_store,
                 scheduler: scheduler.clone(),
+                provider_circuit: params.provider_circuit.clone(),
                 server_token: std::env::var("FIACH_SERVER_TOKEN")
                     .ok()
                     .filter(|token| !token.trim().is_empty()),

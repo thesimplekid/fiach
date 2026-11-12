@@ -752,6 +752,8 @@ mod tests {
             failure_stage: None,
             review_retry_version: 1,
             retry_not_before: None,
+            failure_class: None,
+            needs_intervention: false,
         }
     }
 

@@ -146,9 +146,15 @@ pub struct DaemonParams {
     /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     pub db_path: PathBuf,
+    /// In-session provider retries: how often one agent session re-prompts
+    /// after a transient model error.
     pub max_retries: u32,
+    /// Whole-review retries per commit after a failed attempt. Failures while
+    /// the provider circuit is open do not count.
     pub max_review_retries: u32,
     pub retry_delay_secs: u64,
+    /// Host-wide breaker for provider outages; pauses dispatch while open.
+    pub provider_circuit: crate::broker::CircuitBreaker,
     pub out_dir: Option<PathBuf>,
     pub disclose_config: DiscloseConfig,
     pub buzz_config: Option<crate::config::BuzzConfig>,
@@ -291,6 +297,7 @@ pub fn start_review_scheduler(
     cancel_token: CancellationToken,
 ) -> SchedulerHandle<DaemonWork> {
     let workers = params.max_workers;
+    let paused = params.provider_circuit.subscribe();
     let handler = std::sync::Arc::new(
         move |work: DaemonWork,
               cancel: CancellationToken|
@@ -351,7 +358,49 @@ pub fn start_review_scheduler(
             })
         },
     );
-    crate::scheduler::start(workers, cancel_token, handler)
+    crate::scheduler::start_gated(workers, cancel_token, handler, Some(paused))
+}
+
+/// The providers whose outages should pause review dispatch: the finder's
+/// and, when verification runs, the verifier's.
+pub fn provider_circuit_providers(
+    provider: &str,
+    verifier_provider: Option<&str>,
+    verify_findings: bool,
+) -> Vec<crate::broker::Provider> {
+    std::iter::once(provider)
+        .chain(verifier_provider.filter(|_| verify_findings))
+        .filter_map(crate::broker::Provider::supported)
+        .collect()
+}
+
+/// Probe each distinct provider/model used by a review, including verifier overrides.
+fn provider_probe_targets(
+    provider: &str,
+    model: &str,
+    verifier_provider: Option<&str>,
+    verifier_model: Option<&str>,
+    verify_findings: bool,
+) -> Vec<(String, String)> {
+    let mut targets = vec![(provider.to_owned(), model.to_owned())];
+    if verify_findings {
+        let verifier = (
+            verifier_provider.unwrap_or(provider).to_owned(),
+            verifier_model.unwrap_or(model).to_owned(),
+        );
+        if !targets.contains(&verifier) {
+            targets.push(verifier);
+        }
+    }
+    targets
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct SandboxReviewExecutor<'a> {
@@ -850,6 +899,29 @@ pub async fn run_daemon(
         }
     }
 
+    let probe_task = {
+        let circuit = params.provider_circuit.clone();
+        let targets = provider_probe_targets(
+            &params.provider,
+            &params.model,
+            params.verifier_provider.as_deref(),
+            params.verifier_model.as_deref(),
+            params.verify_findings,
+        );
+        let cancel = cancel_token.child_token();
+        tokio::spawn(async move {
+            circuit
+                .run_probes(cancel, || async {
+                    for (provider, model) in &targets {
+                        crate::review::probe_provider(provider, model).await?;
+                    }
+                    Ok(())
+                })
+                .await;
+        })
+    };
+    let _probe_guard = AbortOnDrop(probe_task);
+
     let sleep_duration = Duration::from_secs(params.interval);
     let (discovery_sender, discoveries) = tokio::sync::watch::channel(Vec::new());
     let submitter_cancel = cancel_token.child_token();
@@ -1041,6 +1113,8 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
                 failure_stage: None,
                 review_retry_version: 1,
                 retry_not_before: None,
+                failure_class: None,
+                needs_intervention: false,
             };
             let _ = crate::state::mark_reviewed(&params.db_path, repo, job.pr.number, &meta);
         }
@@ -1203,7 +1277,7 @@ async fn process_daemon_job(
                 crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
                     .ok()
                     .flatten()
-                    .map(|m| m.retry_count.saturating_add(1))
+                    .map(|m| m.next_retry_count())
                     .unwrap_or(1)
             } else {
                 0
@@ -1367,8 +1441,24 @@ async fn process_daemon_job(
                     .await
             };
 
+            let local = params.sandbox_rootfs.is_none();
             let outcome = if let Err(e) = execution_result {
-                let meta = crate::state::ReviewMetadata {
+                let fatal = !crate::review::is_nonfatal_review_completion_error(&e)
+                    && crate::review::is_fatal_provider_error(&e);
+                let mut failure = ExecutionFailure::classify("execution", &e);
+                if fatal {
+                    failure.class = crate::state::FailureClass::Provider;
+                } else if local && failure.class == crate::state::FailureClass::Provider {
+                    // Local reviews call the provider in-process without the
+                    // broker, so the breaker sees whole failed attempts.
+                    params
+                        .provider_circuit
+                        .record_failure("review_attempt_failed");
+                }
+                if !fatal && params.provider_circuit.is_open() {
+                    failure = failure.provider_unavailable();
+                }
+                let mut meta = crate::state::ReviewMetadata {
                     repository: repo.to_string(),
                     pr_number: pr.number,
                     review_kind: job.review_kind.clone(),
@@ -1398,26 +1488,38 @@ async fn process_daemon_job(
                     failure_stage: Some("execution".to_string()),
                     review_retry_version: 1,
                     retry_not_before: None,
+                    failure_class: None,
+                    needs_intervention: false,
                 };
+                meta.schedule_failure(failure.class, fatal, params.max_review_retries);
+                let failure = failure.scheduled(&meta);
                 let _ = crate::state::mark_reviewed(&params.db_path, repo, pr.number, &meta);
 
                 if cancel_token.is_cancelled() {
                     return Err(e);
                 }
-                tracing::error!(repo = %repo, pr = pr.number, error = %e, "Failed to review PR");
-                if !crate::review::is_nonfatal_review_completion_error(&e)
-                    && crate::review::is_fatal_provider_error(&e)
-                {
+                tracing::error!(
+                    repo = %repo,
+                    pr = pr.number,
+                    class = failure.class.as_str(),
+                    reason = %failure.reason,
+                    retry_count = meta.retry_count,
+                    needs_intervention = meta.needs_intervention,
+                    retry_not_before = ?meta.retry_not_before,
+                    error = %e,
+                    "Failed to review PR"
+                );
+                if fatal {
                     tracing::error!("Fatal error encountered, stopping daemon");
                     return Err(e);
                 }
-                return Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
-                    "execution",
-                    &e,
-                )));
+                return Ok(PrProcessStatus::Failed(failure));
             } else {
                 execution_result?
             };
+            if local && outcome.is_some() {
+                params.provider_circuit.record_success();
+            }
 
             let Some(outcome) = outcome else {
                 return Ok(PrProcessStatus::Skipped);
@@ -1427,20 +1529,32 @@ async fn process_daemon_job(
                 .finalize(&finalization, outcome, cancel_token.clone())
                 .await
             {
-                failed_finalization.status = crate::state::ReviewStatus::Failed;
                 failed_finalization.failure_stage = Some("finalization".to_string());
                 failed_finalization.retry_count = retry_count_for_attempt;
+                failed_finalization.timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+                failed_finalization.schedule_failure(
+                    crate::state::FailureClass::Review,
+                    false,
+                    params.max_review_retries,
+                );
                 let _ = crate::state::mark_reviewed(
                     &params.db_path,
                     repo,
                     pr.number,
                     &failed_finalization,
                 );
-                tracing::error!(repo = %repo, pr = pr.number, error = %error, "Review finalization failed");
-                return Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
-                    "finalization",
-                    &error,
-                )));
+                tracing::error!(
+                    repo = %repo,
+                    pr = pr.number,
+                    retry_count = failed_finalization.retry_count,
+                    needs_intervention = failed_finalization.needs_intervention,
+                    error = %error,
+                    "Review finalization failed"
+                );
+                return Ok(PrProcessStatus::Failed(
+                    ExecutionFailure::classify("finalization", &error)
+                        .scheduled(&failed_finalization),
+                ));
             }
 
             Ok(PrProcessStatus::Reviewed)
@@ -1727,8 +1841,13 @@ async fn run_sandboxed_review(
     plant_github_canary(&runtime_rootfs, &github_canary).await?;
     forward_sandbox_secret(&mut cmd, "GITHUB_TOKEN", &github_canary);
     cmd.arg(format!("--setenv=GH_CONFIG_DIR={SANDBOX_GH_CONFIG_DIR}"));
-    let broker =
-        start_review_broker(review_params, &broker_state_dir(&run_dir), &github_canary).await?;
+    let broker = start_review_broker(
+        review_params,
+        &broker_state_dir(&run_dir),
+        &github_canary,
+        &params.provider_circuit,
+    )
+    .await?;
     if let Some(broker) = &broker {
         cmd.arg(broker.nspawn_bind_arg());
     }
@@ -2086,6 +2205,7 @@ async fn start_review_broker(
     review_params: &ReviewParams,
     state_dir: &Path,
     github_canary: &str,
+    provider_circuit: &crate::broker::CircuitBreaker,
 ) -> Result<Option<crate::broker::SandboxBroker>> {
     use crate::broker::{Canary, Credential, Pricing, Provider, SandboxBroker, routes_for};
 
@@ -2145,6 +2265,7 @@ async fn start_review_broker(
             label: "planted GitHub token".to_owned(),
             value: Credential::new(github_canary),
         }],
+        Some(provider_circuit.clone()),
     )
     .await
     .map(Some)
@@ -2306,6 +2427,43 @@ fn tail_file(path: &Path, max_lines: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_probes_cover_verifier_overrides_and_deduplicate() {
+        let finder = ("openrouter".to_owned(), "finder".to_owned());
+        assert_eq!(
+            provider_probe_targets("openrouter", "finder", None, None, true),
+            vec![finder.clone()]
+        );
+        assert_eq!(
+            provider_probe_targets(
+                "openrouter",
+                "finder",
+                Some("openai"),
+                Some("verifier"),
+                false
+            ),
+            vec![finder.clone()]
+        );
+        assert_eq!(
+            provider_probe_targets(
+                "openrouter",
+                "finder",
+                Some("openai"),
+                Some("verifier"),
+                true
+            ),
+            vec![finder.clone(), ("openai".into(), "verifier".into())]
+        );
+        assert_eq!(
+            provider_probe_targets("openrouter", "finder", None, Some("verifier"), true),
+            vec![finder.clone(), ("openrouter".into(), "verifier".into())]
+        );
+        assert_eq!(
+            provider_probe_targets("openrouter", "finder", Some("openai"), None, true),
+            vec![finder, ("openai".into(), "finder".into())]
+        );
+    }
 
     fn poll_request(pr: u64) -> ReviewRequest<DaemonWork> {
         let repo = if pr <= 11 {

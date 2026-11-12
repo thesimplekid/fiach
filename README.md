@@ -787,8 +787,11 @@ The following options are available under `services.fiach`:
 | `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
 | `timeoutMins` | integer | `30` | Timeout in minutes for each review session. |
 | `laneTimeoutMins` | positive integer or null | `null` | Timeout per lane attempt; the one replacement gets the same allowance. Null preserves the derived default (one quarter of the phase timeout, capped at five minutes). |
-| `maxRetries` | integer | `3` | Maximum number of retries for LLM provider failures and failed review attempts. |
-| `retryDelaySecs` | integer | `10` | Initial delay in seconds before retrying an LLM failure. |
+| `maxRetries` | integer | `3` | In-session provider retries: how often one agent session re-prompts after a transient model error. Distinct from `maxReviewRetries`. |
+| `maxReviewRetries` | unsigned integer | `5` | Whole-review retries per commit after a failed review attempt, with backoff. Failures while the provider circuit is open do not count. |
+| `retryDelaySecs` | integer | `10` | Initial delay in seconds before an in-session provider retry; doubles after each retry. |
+| `providerFailureThreshold` | unsigned integer | `5` | Consecutive transient provider failures that open the provider circuit and pause review dispatch. `0` disables the breaker. |
+| `providerProbeIntervalSecs` | positive integer | `60` | Seconds between probe calls while the provider circuit is open. |
 | `maxCostUsd` | float or null | `null` | Maximum observed budget in USD for each review. Cancels finder, verifier, and duplicate-suppression work at the limit. |
 | `inputPricePerM` | float or null | `null` | Override input token price per 1M tokens in USD. |
 | `outputPricePerM` | float or null | `null` | Override output token price per 1M tokens in USD. |
@@ -884,8 +887,9 @@ This lets NixOS/systemd deployments keep using bundled skills such as `rust-secu
 - `src/state.rs`: Typed, versioned, async redb state adapter.
 
 Review lanes have host-enforced recovery. Each selected lane runs once and
-receives at most one replacement after a deadline, provider failure, turn limit,
-or empty result. Each attempt is bounded by one quarter of the finder deadline,
+receives at most one replacement after a deadline, turn limit, or empty result.
+A provider failure gets no replacement: the session already retried the
+provider, and a fresh session would hit the same outage. Each attempt is bounded by one quarter of the finder deadline,
 capped at 300 seconds. Completed lanes remain available when another lane fails.
 A missing, cancelled, or exhausted lane makes the review incomplete and prevents
 disclosure; the coordinator does not run.
@@ -898,16 +902,41 @@ are stored separately from structured findings. These artifacts are explicitly
 incomplete: no completed-review result is emitted and neither GitHub nor Buzz
 finding disclosure runs. Cleanup of outstanding lanes is bounded and concurrent.
 
-Whole-review retry policy is independent of model/session retries:
-`--max-retries` controls model recovery, while daemon `--max-review-retries`
+Whole-review retry policy is independent of in-session provider retries:
+`--max-retries` (NixOS `maxRetries`) controls how often one agent session
+re-prompts after a transient model error, while daemon `--max-review-retries`
 (`daemon.max_review_retries` in TOML; NixOS `maxReviewRetries`) defaults to five
-retries after the initial attempt. Failed reviews wait 5, 10, 20, 40, ... minutes,
+whole-review retries after the initial attempt. Failed reviews wait 5, 10, 20, 40, ... minutes,
 capped at six hours plus up to 59 seconds of stable jitter. The persisted attempt
 count and timestamp determine eligibility across restarts. Exhausted reviews wait
 for a fresh trusted mention, a new commit, or an explicit operator-triggered
 review; a fresh mention resets the attempt budget. New commits reset retry history
 but still obey the existing mention gate when that gate applies. Eligible fresh
 work is queued ahead of retries, preserving FIFO within each class.
+
+Each failed review records a failure class: `provider` (the provider failed
+while believed healthy, or rejected the job for auth or quota), `review` (the
+review itself failed: timeouts, incomplete lanes, finalization), or
+`provider_unavailable` (the provider circuit was open). The record also stores
+`retry_not_before` and sets `needs_intervention` when whole-review retries are
+exhausted or the provider rejected the job (auth, quota); those reviews will not
+recover without an operator.
+
+Provider circuit breaker: in sandboxed reviews every model call goes through the host model broker, and
+all brokers share one circuit breaker for the finder and verifier providers.
+After `provider_failure_threshold` consecutive transient failures (HTTP 408,
+429, 5xx, connection errors, or interrupted streams; default 5) the circuit
+opens: queued reviews stay queued and no new review starts. While open, the
+daemon probes each distinct finder/verifier provider and model every
+`provider_probe_interval_secs` (default 60). Each round has a 60-second timeout;
+only a fully successful round closes the circuit. Ordinary successful calls
+cannot clear another model’s outage. Failures recorded while the circuit is open
+are classed `provider_unavailable` and do not use up whole-review retries. There
+is no automatic model fallback. Unsandboxed daemon reviews call the provider
+in-process, so the breaker counts whole failed review attempts instead of model
+calls. Set the threshold to `0` to disable the breaker (CLI:
+`--provider-failure-threshold`, `--provider-probe-interval-secs`; NixOS:
+`providerFailureThreshold`, `providerProbeIntervalSecs`).
 
 On upgrade, legacy failed records receive a fresh retry budget and a persisted,
 staggered delay of 5–65 minutes. Their original attempt timestamp is preserved so
@@ -917,17 +946,23 @@ new mentions can override that delay. Repeated restarts do not move this schedul
 can accept work and read its state; review failures do not turn readiness into a
 restart trigger. `/health/reviews` (also included as `review_processing` in
 `/ready`) reports review processing separately: oldest queued age, recent failure
-rate, consecutive failures, last success time, and sanitized failure stage/reason.
+rate, consecutive failures, last success time, and the last failure's sanitized
+stage, reason, class, `needs_intervention`, and `retry_not_before`. It also
+reports the provider circuit (`provider_circuit`: state, consecutive failures,
+opened and last-probe times, open and probe counts), failed reviews by class,
+the number of reviews needing intervention, and the earliest scheduled retry.
 It does not describe issue triage, which runs outside the review scheduler.
 
 Processing is degraded after three consecutive failures, a failure rate of at
-least 50% over at least five recent attempts, or a queued job waiting ten minutes.
+least 50% over at least five recent attempts, a queued job waiting ten minutes,
+or while the provider circuit is open (`provider_circuit_open`).
 The recent window is fifteen minutes, bounded to the last 1,000 completed/failed
 attempts; skipped and cancelled jobs are excluded. Success resets the consecutive
 counter; sustained successes or expiry clear the rolling-rate alert. An idle
 installation without recent attempts or queued work is healthy. Health history
 is in memory and resets on restart; durable retry scheduling is independent.
 The JSON endpoint always returns HTTP 200 with an explicit `degraded` flag.
-Monitor that flag or `fiach_review_processing_*` gauges in `/metrics`, rather than
-using it as a liveness probe. Failure details use fixed categories, never raw
+Monitor that flag or the `fiach_review_processing_*`, `fiach_provider_circuit_*`,
+`fiach_failed_reviews{class}`, and `fiach_reviews_needing_intervention` metrics in
+`/metrics`, rather than using it as a liveness probe. Failure details use fixed categories, never raw
 provider responses or source/model content.

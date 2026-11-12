@@ -6,9 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+use crate::state::{FailureClass, ReviewRecord};
 
 const TERMINAL_JOB_LIMIT: usize = 1_000;
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
@@ -86,22 +88,54 @@ pub enum ExecutionStatus {
 pub struct ExecutionFailure {
     pub stage: String,
     pub reason: String,
+    #[serde(default = "default_failure_class")]
+    pub class: FailureClass,
+    /// The daemon will not recover this review without an operator.
+    #[serde(default)]
+    pub needs_intervention: bool,
+    /// Earliest automatic whole-review retry, when one is scheduled.
+    #[serde(default)]
+    pub retry_not_before: Option<i64>,
+}
+
+fn default_failure_class() -> FailureClass {
+    FailureClass::Review
 }
 
 impl ExecutionFailure {
+    /// Reclassifies a failure that happened while the provider circuit was open.
+    pub fn provider_unavailable(mut self) -> Self {
+        self.reason = "provider_unavailable".into();
+        self.class = FailureClass::ProviderUnavailable;
+        self
+    }
+
+    /// Copies the retry schedule recorded for the failed review.
+    pub fn scheduled(mut self, record: &ReviewRecord) -> Self {
+        if let Some(class) = record.failure_class {
+            self.class = class;
+        }
+        self.needs_intervention = record.needs_intervention;
+        self.retry_not_before = record.retry_not_before;
+        self
+    }
+
     pub fn classify(stage: &str, error: &anyhow::Error) -> Self {
         let text = format!("{error:#}").to_ascii_lowercase();
-        let reason = if text.contains("timed out") || text.contains("timeout") {
-            "timeout"
-        } else if text.contains("delegated lane") || text.contains("finder incomplete") {
-            "incomplete_lanes"
-        } else if text.contains("provider") {
-            "provider_failure"
-        } else if text.contains("cancelled") {
-            "cancelled"
-        } else {
-            "unknown"
-        };
+        let reason =
+            if text.contains("provider failed after") || text.contains("fatal provider error") {
+                "provider_failure"
+            } else if text.contains("timed out") || text.contains("timeout") {
+                "timeout"
+            } else if text.contains("delegated lane") || text.contains("finder incomplete") {
+                "incomplete_lanes"
+            } else if text.contains("provider") {
+                "provider_failure"
+            } else if text.contains("cancelled") {
+                "cancelled"
+            } else {
+                "unknown"
+            };
         let stage = if stage == "execution"
             && (text.contains("review session timed out") || text.contains("finder incomplete"))
         {
@@ -112,6 +146,13 @@ impl ExecutionFailure {
         Self {
             stage: stage.into(),
             reason: reason.into(),
+            class: if reason == "provider_failure" {
+                FailureClass::Provider
+            } else {
+                FailureClass::Review
+            },
+            needs_intervention: false,
+            retry_not_before: None,
         }
     }
 }
@@ -325,6 +366,17 @@ pub fn start<T: Send + 'static>(
     cancel: CancellationToken,
     handler: Handler<T>,
 ) -> SchedulerHandle<T> {
+    start_gated(max_workers, cancel, handler, None)
+}
+
+/// Like `start`, but queued jobs are not dispatched while `paused` reads
+/// `true`. Submissions are still accepted; running jobs are not interrupted.
+pub fn start_gated<T: Send + 'static>(
+    max_workers: usize,
+    cancel: CancellationToken,
+    handler: Handler<T>,
+    paused: Option<watch::Receiver<bool>>,
+) -> SchedulerHandle<T> {
     let capacity = max_workers.saturating_mul(2).max(16);
     let worker_limit = if max_workers == 0 {
         usize::MAX
@@ -339,8 +391,11 @@ pub fn start<T: Send + 'static>(
     let jobs = Arc::new(Mutex::new(HashMap::new()));
     let health = Arc::new(Mutex::new(HealthHistory::default()));
     tokio::spawn(run_scheduler(
-        worker_limit,
-        capacity.clone(),
+        Dispatch {
+            max_workers: worker_limit,
+            capacity: capacity.clone(),
+            paused,
+        },
         receiver,
         Arc::clone(&jobs),
         health.clone(),
@@ -355,15 +410,27 @@ pub fn start<T: Send + 'static>(
     }
 }
 
-async fn run_scheduler<T: Send + 'static>(
+/// When queued jobs may start.
+struct Dispatch {
     max_workers: usize,
     capacity: QueueCapacity,
+    /// Holds queued jobs while it reads `true`.
+    paused: Option<watch::Receiver<bool>>,
+}
+
+async fn run_scheduler<T: Send + 'static>(
+    dispatch: Dispatch,
     mut receiver: mpsc::Receiver<Submission<T>>,
     jobs: Arc<Mutex<HashMap<String, JobSnapshot>>>,
     health: Arc<Mutex<HealthHistory>>,
     cancel: CancellationToken,
     handler: Handler<T>,
 ) {
+    let Dispatch {
+        max_workers,
+        capacity,
+        mut paused,
+    } = dispatch;
     let mut queue: VecDeque<Queued<T>> = VecDeque::new();
     let mut active = HashSet::new();
     let mut by_target = HashMap::<ReviewTarget, String>::new();
@@ -371,7 +438,9 @@ async fn run_scheduler<T: Send + 'static>(
     let mut terminal = VecDeque::new();
 
     loop {
-        while running.len() < max_workers
+        let dispatch_paused = paused.as_ref().is_some_and(|paused| *paused.borrow());
+        while !dispatch_paused
+            && running.len() < max_workers
             && let Some(queued) = queue.pop_front()
         {
             capacity.changed.notify_one();
@@ -422,6 +491,17 @@ async fn run_scheduler<T: Send + 'static>(
                     health.lock().await.record(now(), status, failure);
                     terminal.push_back(id);
                     evict_terminal(&jobs, &mut terminal).await;
+                }
+            }
+            changed = async {
+                match paused.as_mut() {
+                    Some(paused) => paused.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if paused.is_some() => {
+                // The gate's sender is gone; dispatch without it.
+                if changed.is_err() {
+                    paused = None;
                 }
             }
             Some(submission) = receiver.recv() => {
@@ -690,6 +770,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_paused_gate_holds_queued_jobs_until_it_reopens() {
+        let cancel = CancellationToken::new();
+        let handler = Arc::new(|_: u64, _: CancellationToken| {
+            Box::pin(async { Ok(ExecutionStatus::Completed) }) as BoxJobFuture
+        });
+        let (gate, paused) = watch::channel(true);
+        let scheduler = start_gated(2, cancel.clone(), handler, Some(paused));
+        for pr in 1..=3 {
+            scheduler.submit(request(pr)).await.unwrap();
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let stats = scheduler.stats().await;
+        assert_eq!((stats.queued, stats.running, stats.completed), (3, 0, 0));
+        assert!(stats.accepting);
+
+        gate.send_replace(false);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while scheduler.stats().await.completed < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+    }
+
+    #[tokio::test]
     async fn live_scheduler_exposes_degradation_without_changing_acceptance() {
         let cancel = CancellationToken::new();
         let handler = Arc::new(|_: u64, _: CancellationToken| {
@@ -697,6 +806,9 @@ mod tests {
                 Ok(ExecutionStatus::Failed(ExecutionFailure {
                     stage: "finder".into(),
                     reason: "timeout".into(),
+                    class: FailureClass::Review,
+                    needs_intervention: false,
+                    retry_not_before: None,
                 }))
             }) as BoxJobFuture
         });

@@ -6,7 +6,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 
 - **Pre-stage then delegate**: The app isolates work in a temp dir using host-side forge adapters *before* giving control to an agent session. This prevents wasting agent turns on git operations.
 - **Own agent loop on the Goose GDK**: `src/review/agent_loop.rs` assembles every session (lanes, coordinator, verifier, issue worker) from `goose-agent` operations. Tools are host-side `HostTools` called in-process; none are resolved from Goose extension configuration, and Goose's `Agent`/`StateMachineServices` runtime is not used.
-- **Host-driven review lanes**: `src/review/lanes.rs` runs each selected lane as an inspection-only child session (bounded concurrency, one deadline per attempt, one replacement). The coordinator receives completed lane results and only synthesizes and submits.
+- **Host-driven review lanes**: `src/review/lanes.rs` runs each selected lane as an inspection-only child session (bounded concurrency, one deadline per attempt, one replacement except after a provider failure). The coordinator receives completed lane results and only synthesizes and submits.
 - **Structured reporting first**: The coordinator submits candidates through the host `ReportingClient` tools (`submit_finding` / `submit_no_findings`). Markdown is rendered by the host from structured data.
 - **Separate verifier session**: Candidate findings are adjudicated in a second agent session. The verifier submits one `submit_verdict` per finding; structured verdicts are authoritative for metadata and disclosure.
 - **Host-only disclosure**: Models never post to a forge. `src/disclose.rs` applies deterministic policy checks before any forge side effect.
@@ -19,7 +19,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 - `src/workspace.rs`: Uses forge adapters to clone repo/PR to a temp dir and records PR lifecycle/base/default-branch context.
 - `src/disclose.rs`: Report modes (`local`, `pr-comment`, `sync-pr`) and centralized forge review/sync disclosure.
 - `src/state.rs`: Uses `redb` to track reviewed commit hashes.
-- `src/broker.rs`: Per-job host model broker. Sandboxes get per-job keys and reach providers through it; real provider credentials never enter a sandbox.
+- `src/broker.rs`: Per-job host model broker. Sandboxes get per-job keys and reach providers through it; real provider credentials never enter a sandbox. Also holds the host-wide provider `CircuitBreaker` that every job's broker feeds; while open, the scheduler pauses dispatch and the daemon probes the provider.
 - `flake.nix`: Package, dev shell, and NixOS module. The module can configure finder and verifier provider/model settings.
 - `.agents/skills/`: Domain skills (e.g., `cashu`).
 

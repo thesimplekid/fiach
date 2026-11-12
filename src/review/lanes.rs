@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    agent_loop::{AgentLoop, LoopConfig, ReplyEnd, UsageLog},
+    agent_loop::{AgentLoop, LoopConfig, LoopRetry, ReplyEnd, UsageLog},
     classify_lane_load_text,
 };
 use crate::{
@@ -30,8 +30,11 @@ const LANE_SYSTEM: &str = r#"You are one inspection-only review lane in a PR rev
 const MAX_RESULT_CHARS: usize = 65_536;
 /// Lane output preserved in incomplete-finder artifacts.
 const MAX_NOTES_CHARS: usize = 16_384;
-/// Each lane gets its first attempt and one replacement.
+/// Each lane gets its first attempt and one replacement, unless the first
+/// attempt failed because of the provider.
 const ATTEMPTS: u32 = 2;
+/// A lane failure caused by the model provider; it gets no replacement.
+const PROVIDER_FAILURE: &str = "provider_failure";
 
 pub(super) struct LaneTask {
     pub lane: String,
@@ -53,6 +56,7 @@ pub(super) struct Lanes {
     pub usage: UsageLog,
     tasks: Vec<LaneTask>,
     snapshots: Mutex<BTreeMap<String, LaneSnapshot>>,
+    provider_failure: Mutex<Option<anyhow::Error>>,
 }
 
 impl Lanes {
@@ -92,12 +96,17 @@ impl Lanes {
             usage: UsageLog::default(),
             tasks,
             snapshots: Mutex::new(snapshots),
+            provider_failure: Mutex::new(None),
         }
     }
 
     /// Current lane states, sorted by lane name.
     pub fn snapshots(&self) -> Vec<LaneSnapshot> {
         lock(&self.snapshots).values().cloned().collect()
+    }
+
+    pub fn take_provider_failure(&self) -> Option<anyhow::Error> {
+        lock(&self.provider_failure).take()
     }
 
     pub fn complete(&self) -> bool {
@@ -186,14 +195,22 @@ impl Lanes {
             // Only fixed labels are logged; lane output and provider errors may
             // contain checkout content or attacker-controlled text.
             tracing::warn!(lane, session_id = %session_id, recovery_attempt = attempt, reason, "Review lane failed");
+            // The session already retried the provider; a fresh session would
+            // hit the same outage, so it keeps the replacement for review failures.
+            let replace = attempt + 1 < ATTEMPTS && reason != PROVIDER_FAILURE;
             self.update(lane, |snapshot| {
                 snapshot.status = LaneStatus::Incomplete;
-                snapshot.reason = Some(if attempt + 1 < ATTEMPTS || cancel.is_cancelled() {
-                    reason.into()
-                } else {
-                    "recovery_exhausted".into()
-                });
+                snapshot.reason = Some(
+                    if replace || reason == PROVIDER_FAILURE || cancel.is_cancelled() {
+                        reason.into()
+                    } else {
+                        "recovery_exhausted".into()
+                    },
+                );
             });
+            if !replace {
+                break;
+            }
         }
         None
     }
@@ -233,7 +250,16 @@ impl Lanes {
         match reply {
             Err(_) => Err("lane_deadline"),
             Ok(Err(_)) => Err("session_error"),
-            Ok(Ok(ReplyEnd::ProviderError(_))) => Err("provider_failure"),
+            Ok(Ok(ReplyEnd::ProviderError(error))) => {
+                let failure = match LoopRetry::new("lane", 0, 0).provider_error(&error) {
+                    Ok(failure) | Err(failure) => failure,
+                };
+                let mut stored = lock(&self.provider_failure);
+                if stored.is_none() || super::is_fatal_provider_error(&failure) {
+                    *stored = Some(failure);
+                }
+                Err(PROVIDER_FAILURE)
+            }
             Ok(Ok(ReplyEnd::TurnLimit)) => Err("turn_limit"),
             Ok(Ok(ReplyEnd::Finished)) => {
                 let output = agent.final_text();
@@ -321,12 +347,37 @@ mod tests {
     #[tokio::test]
     async fn a_failed_lane_is_replaced_once_then_incomplete() {
         let workspace = tempfile::tempdir().unwrap();
+        let provider = Scripted::new(vec![]);
+        let inspection =
+            Inspection::new(workspace.path(), &[], &"a".repeat(40), &"b".repeat(40)).unwrap();
+        // No turns left: every attempt stops at the turn limit, a review failure.
+        let lanes = Lanes::new(
+            provider.clone(),
+            ModelConfig::new("scripted"),
+            inspection,
+            0,
+            Duration::from_secs(10),
+            1,
+            vec![LaneTask {
+                lane: "persona".into(),
+                instructions: "Review lane: persona".into(),
+            }],
+        );
+
+        assert!(lanes.run(&CancellationToken::new()).await.is_empty());
+
+        let persona = status(&lanes, "persona");
+        assert_eq!(persona.status, LaneStatus::Incomplete);
+        assert_eq!(persona.recovery_attempt, 1);
+        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-2"));
+        assert_eq!(persona.reason.as_deref(), Some("recovery_exhausted"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_failure_does_not_spend_the_lane_replacement() {
+        let workspace = tempfile::tempdir().unwrap();
         let provider = Scripted::new(vec![
-            Err(ProviderError::ServerError("unavailable".into())),
-            Ok(Message::assistant().with_text("   ")),
-            Ok(Message::assistant().with_text("   ")),
-            Ok(Message::assistant().with_text("   ")),
-            Ok(Message::assistant().with_text("   ")),
+            Err(ProviderError::ServerError("request timed out".into())),
             Ok(Message::assistant().with_text(r#"{"status":"no_findings","candidates":[]}"#)),
         ]);
         let lanes = lane_runner(provider.clone(), workspace.path(), &["persona", "security"]);
@@ -338,10 +389,27 @@ mod tests {
         assert!(!lanes.complete());
         let persona = status(&lanes, "persona");
         assert_eq!(persona.status, LaneStatus::Incomplete);
-        assert_eq!(persona.recovery_attempt, 1);
-        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-2"));
-        assert_eq!(persona.reason.as_deref(), Some("recovery_exhausted"));
+        assert_eq!(persona.recovery_attempt, 0);
+        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-1"));
+        assert_eq!(persona.reason.as_deref(), Some(PROVIDER_FAILURE));
         assert_eq!(status(&lanes, "security").status, LaneStatus::Completed);
+        assert_eq!(provider.calls.lock().unwrap().len(), 2);
+        let error = lanes.take_provider_failure().unwrap();
+        let failure = crate::scheduler::ExecutionFailure::classify("execution", &error);
+        assert_eq!(failure.class, crate::state::FailureClass::Provider);
+        assert!(!super::super::is_fatal_provider_error(&error));
+    }
+
+    #[tokio::test]
+    async fn permanent_lane_provider_errors_remain_fatal() {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = Scripted::new(vec![Err(ProviderError::Authentication(
+            "invalid credentials".into(),
+        ))]);
+        let lanes = lane_runner(provider, workspace.path(), &["persona"]);
+        assert!(lanes.run(&CancellationToken::new()).await.is_empty());
+        let error = lanes.take_provider_failure().unwrap();
+        assert!(super::super::is_fatal_provider_error(&error));
     }
 
     #[tokio::test]

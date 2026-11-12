@@ -63,9 +63,14 @@ pub struct DaemonConfig {
     /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     pub db_path: Option<PathBuf>,
+    /// In-session provider retries within one agent session.
     pub max_retries: Option<u32>,
+    /// Whole-review retries per commit after a failed attempt.
     pub max_review_retries: Option<u32>,
     pub retry_delay_secs: Option<u64>,
+    /// Consecutive transient provider failures that open the provider circuit; 0 disables it.
+    pub provider_failure_threshold: Option<u32>,
+    pub provider_probe_interval_secs: Option<u64>,
     pub out_dir: Option<PathBuf>,
     pub report_mode: Option<String>,
     pub sync_repo: Option<String>,

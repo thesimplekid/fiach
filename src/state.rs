@@ -138,6 +138,30 @@ impl PartialEq<&str> for ReviewStatus {
     }
 }
 
+/// Why a review attempt failed, for operators and retry accounting.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    /// The model provider failed while it was believed healthy, or rejected
+    /// the job for auth or quota reasons.
+    Provider,
+    /// The provider circuit was open: the failure says nothing about the
+    /// review, so it does not use up a whole-review retry.
+    ProviderUnavailable,
+    /// The review itself failed (timeouts, incomplete lanes, finalization).
+    Review,
+}
+
+impl FailureClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::Review => "review",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReviewRecord {
     #[serde(default)]
@@ -181,9 +205,58 @@ pub struct ReviewRecord {
     pub failure_stage: Option<String>,
     #[serde(default)]
     pub review_retry_version: u8,
-    /// Migration-only scheduling anchor; ordinary retries derive from timestamp.
+    /// Earliest time a failed review may be retried. Older records leave it
+    /// unset, and their retries derive from `timestamp`. Unset with
+    /// `needs_intervention` once whole-review retries are exhausted.
     #[serde(default)]
     pub retry_not_before: Option<i64>,
+    #[serde(default)]
+    pub failure_class: Option<FailureClass>,
+    /// Set when the daemon will not recover on its own: whole-review retries
+    /// are exhausted or the provider rejected the job (auth, quota).
+    #[serde(default)]
+    pub needs_intervention: bool,
+}
+
+impl ReviewRecord {
+    /// The `retry_count` the next attempt at this commit gets. A failure while
+    /// the provider was unavailable does not use up a retry.
+    pub fn next_retry_count(&self) -> u32 {
+        if self.failure_class == Some(FailureClass::ProviderUnavailable) {
+            self.retry_count
+        } else {
+            self.retry_count.saturating_add(1)
+        }
+    }
+
+    /// When a failed or interrupted record may next be retried.
+    fn retry_due_at(&self, key: &str) -> i64 {
+        self.retry_not_before.unwrap_or_else(|| {
+            self.timestamp.saturating_add(
+                review_retry_delay_secs(self.retry_count) as i64 + retry_jitter(key, 60) as i64,
+            )
+        })
+    }
+
+    /// Classifies a failed attempt and schedules its whole-review retry.
+    /// `fatal` marks provider rejections (auth, quota) that need an operator.
+    pub fn schedule_failure(&mut self, class: FailureClass, fatal: bool, max_review_retries: u32) {
+        self.status = ReviewStatus::Failed;
+        self.failure_class = Some(class);
+        let exhausted = self.next_retry_count() > max_review_retries;
+        self.needs_intervention = fatal || exhausted;
+        self.retry_not_before = if self.needs_intervention {
+            None
+        } else if class == FailureClass::ProviderUnavailable {
+            // The scheduler holds dispatch until the circuit closes.
+            Some(self.timestamp)
+        } else {
+            let key = pr_state_key(&self.repository, self.pr_number, &self.review_kind);
+            Some(self.timestamp.saturating_add(
+                review_retry_delay_secs(self.retry_count) as i64 + retry_jitter(&key, 60) as i64,
+            ))
+        };
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -552,13 +625,11 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
                         if metadata.status == "failed" || metadata.status == "in_progress" {
                             if let Some(limit) = max_failed_retries {
                                 let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                                let next_retry = metadata.retry_not_before.unwrap_or_else(|| {
-                                    metadata.timestamp.saturating_add(
-                                        review_retry_delay_secs(metadata.retry_count) as i64
-                                            + retry_jitter(&key, 60) as i64,
-                                    )
-                                });
-                                if metadata.retry_count >= limit || now < next_retry {
+                                let next_retry = metadata.retry_due_at(&key);
+                                if metadata.needs_intervention
+                                    || metadata.next_retry_count() > limit
+                                    || now < next_retry
+                                {
                                     tracing::debug!(
                                         repo,
                                         pr,
@@ -717,16 +788,18 @@ pub fn lock_for_review(
                 failure_stage: None,
                 review_retry_version: 1,
                 retry_not_before: None,
+                failure_class: None,
+                needs_intervention: false,
             };
 
             if let Some(value) = pr_table.get(key.as_str())? {
                 let json_str = value.value();
                 if let Ok(previous) = serde_json::from_str::<ReviewMetadata>(json_str) {
-                    metadata.buzz_thread = previous.buzz_thread;
+                    metadata.buzz_thread = previous.buzz_thread.clone();
                     if previous.commit_hash == commit_hash
                         && (previous.status == "failed" || previous.status == "in_progress")
                     {
-                        metadata.retry_count = previous.retry_count.saturating_add(1);
+                        metadata.retry_count = previous.next_retry_count();
                     }
                 }
             }
@@ -1071,7 +1144,7 @@ impl RedbStateStore {
                             ReviewStatus::Failed | ReviewStatus::InProgress
                         )
                     {
-                        record.retry_count = previous.retry_count.saturating_add(1);
+                        record.retry_count = previous.next_retry_count();
                     }
                 }
                 record.status = ReviewStatus::InProgress;
@@ -1289,6 +1362,8 @@ mod tests {
             failure_stage: None,
             review_retry_version: 1,
             retry_not_before: None,
+            failure_class: None,
+            needs_intervention: false,
         }
     }
 
@@ -1797,6 +1872,122 @@ mod tests {
             .unwrap();
         assert_eq!(locked.status, "in_progress");
         assert_eq!(locked.retry_count, 2);
+    }
+
+    #[test]
+    fn provider_unavailable_failures_do_not_use_up_review_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let (repo, pr, commit, kind) = ("owner/repo", 42, "abcdef", "security");
+        let limit = 2;
+        let check = || {
+            should_review_with_retry_limit(
+                &db_path,
+                repo,
+                pr,
+                commit,
+                kind,
+                STALE_AFTER_SECS,
+                limit,
+            )
+            .unwrap()
+        };
+
+        // The last allowed retry failed while the provider was unavailable.
+        let mut failed = metadata(commit, "failed", limit);
+        failed.schedule_failure(FailureClass::ProviderUnavailable, false, limit);
+        assert_eq!(
+            failed.failure_class,
+            Some(FailureClass::ProviderUnavailable)
+        );
+        assert!(!failed.needs_intervention);
+        assert_eq!(failed.retry_not_before, Some(failed.timestamp));
+        assert_eq!(failed.next_retry_count(), limit);
+        mark_reviewed(&db_path, repo, pr, &failed).unwrap();
+        assert_eq!(check(), ReviewDecision::RetryFailed);
+
+        assert!(lock_for_review(&db_path, repo, pr, commit, kind, STALE_AFTER_SECS).unwrap());
+        let locked = get_pr_review(&db_path, repo, pr, kind).unwrap().unwrap();
+        assert_eq!(
+            locked.retry_count, limit,
+            "the unavailable attempt is not counted"
+        );
+        assert_eq!(locked.failure_class, None);
+
+        // The same attempt failing for a review reason exhausts the budget.
+        let mut failed = metadata(commit, "failed", limit);
+        failed.schedule_failure(FailureClass::Review, false, limit);
+        assert!(failed.needs_intervention);
+        assert_eq!(failed.retry_not_before, None);
+        mark_reviewed(&db_path, repo, pr, &failed).unwrap();
+        assert_eq!(check(), ReviewDecision::Skip);
+    }
+
+    #[test]
+    fn fatal_failures_wait_for_intervention_even_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.redb");
+        let mut fatal = metadata("abcdef", "failed", 0);
+        fatal.schedule_failure(FailureClass::Provider, true, 5);
+        mark_reviewed(&db_path, "owner/repo", 42, &fatal).unwrap();
+        assert_eq!(
+            should_review_with_retry_limit(
+                &db_path,
+                "owner/repo",
+                42,
+                "abcdef",
+                "security",
+                STALE_AFTER_SECS,
+                5,
+            )
+            .unwrap(),
+            ReviewDecision::Skip
+        );
+        assert_eq!(
+            should_review_with_retry_limit(
+                &db_path,
+                "owner/repo",
+                42,
+                "new-commit",
+                "security",
+                STALE_AFTER_SECS,
+                5,
+            )
+            .unwrap(),
+            ReviewDecision::ReReview
+        );
+    }
+
+    #[test]
+    fn scheduled_failures_back_off_and_flag_fatal_errors() {
+        let mut failed = metadata("abcdef", "failed", 1);
+        failed.schedule_failure(FailureClass::Provider, false, 5);
+        assert_eq!(failed.status, ReviewStatus::Failed);
+        assert!(!failed.needs_intervention);
+        let delay = failed.retry_not_before.unwrap() - failed.timestamp;
+        assert!((600..660).contains(&delay), "{delay}");
+
+        // Auth or quota failures require an operator and have no automatic retry.
+        let mut fatal = metadata("abcdef", "failed", 0);
+        fatal.schedule_failure(FailureClass::Provider, true, 5);
+        assert!(fatal.needs_intervention);
+        assert!(fatal.retry_not_before.is_none());
+
+        // Records written before classification keep the old accounting.
+        let legacy: ReviewRecord = serde_json::from_value(serde_json::json!({
+            "commit_hash": "abcdef",
+            "model": "m",
+            "timestamp": 0,
+            "findings_count": 0,
+            "status": "failed",
+            "severity": "none",
+            "pr_classification": "none",
+            "retry_count": 3
+        }))
+        .unwrap();
+        assert_eq!(legacy.failure_class, None);
+        assert!(!legacy.needs_intervention);
+        assert_eq!(legacy.next_retry_count(), 4);
     }
 
     #[test]

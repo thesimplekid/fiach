@@ -663,6 +663,7 @@ async fn sandbox(
                     routes,
                     None,
                     Vec::new(),
+                    None,
                 )
                 .await?;
                 cmd.arg(broker.nspawn_bind_arg());

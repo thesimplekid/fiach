@@ -363,6 +363,9 @@ pub struct BrokerConfig {
     /// Planted secrets beyond the routes' own keys, such as a fake GitHub
     /// token in the sandbox's `gh` config. Seeing one quarantines the job.
     pub canaries: Vec<Canary>,
+    /// Host-wide provider breaker fed with upstream outcomes for the
+    /// providers it watches.
+    pub breaker: Option<CircuitBreaker>,
 }
 
 /// A secret whose appearance in a request means the job is leaking it.
@@ -509,6 +512,21 @@ struct RouteState {
     omit_reasoning_content: bool,
     client: reqwest::Client,
     shared: Arc<Shared>,
+    breaker: Option<CircuitBreaker>,
+}
+
+impl RouteState {
+    fn record_success(&self) {
+        if let Some(breaker) = &self.breaker {
+            breaker.record_success();
+        }
+    }
+
+    fn record_failure(&self, reason: &'static str) {
+        if let Some(breaker) = &self.breaker {
+            breaker.record_failure(reason);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -543,6 +561,267 @@ pub struct BrokerReport {
     /// Set when the job tried to send a secret; its results must not be
     /// disclosed.
     pub quarantine: Option<Quarantine>,
+}
+
+/// Consecutive transient failures before the provider circuit opens.
+pub const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
+/// Delay between probe calls while the provider circuit is open.
+pub const DEFAULT_CIRCUIT_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitState {
+    Closed,
+    Open,
+    Disabled,
+}
+
+impl CircuitState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// What the provider circuit breaker currently believes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CircuitSnapshot {
+    pub state: CircuitState,
+    pub providers: Vec<Provider>,
+    pub failure_threshold: u32,
+    pub probe_interval_secs: u64,
+    pub consecutive_failures: u32,
+    pub opened_at: Option<i64>,
+    pub last_failure_at: Option<i64>,
+    /// A fixed category; never provider response text.
+    pub last_failure_reason: Option<&'static str>,
+    pub last_probe_at: Option<i64>,
+    pub opens_total: u64,
+    pub probes_total: u64,
+}
+
+#[derive(Debug, Default)]
+struct CircuitCounters {
+    consecutive_failures: u32,
+    opened_at: Option<i64>,
+    last_failure_at: Option<i64>,
+    last_failure_reason: Option<&'static str>,
+    last_probe_at: Option<i64>,
+    opens_total: u64,
+    probes_total: u64,
+}
+
+struct CircuitInner {
+    providers: BTreeSet<Provider>,
+    failure_threshold: u32,
+    probe_interval: Duration,
+    counters: Mutex<CircuitCounters>,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+/// A host-wide breaker for transient provider outages.
+///
+/// Every job's broker reports upstream outcomes for the watched providers
+/// here, so one outage is seen once instead of once per review. After
+/// `failure_threshold` consecutive transient failures the circuit opens: the
+/// scheduler stops dispatching jobs, and `run_probes` sends a single probe
+/// round every `probe_interval` until all configured review models succeed.
+/// Only a successful probe round closes an open circuit. A threshold of zero
+/// disables the breaker.
+#[derive(Clone)]
+pub struct CircuitBreaker {
+    inner: Arc<CircuitInner>,
+}
+
+impl fmt::Debug for CircuitBreaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CircuitBreaker")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
+impl CircuitBreaker {
+    pub fn new(
+        providers: impl IntoIterator<Item = Provider>,
+        failure_threshold: u32,
+        probe_interval: Duration,
+    ) -> Self {
+        let (open, _) = tokio::sync::watch::channel(false);
+        Self {
+            inner: Arc::new(CircuitInner {
+                providers: providers.into_iter().collect(),
+                failure_threshold,
+                probe_interval,
+                counters: Mutex::new(CircuitCounters::default()),
+                open,
+            }),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new([], 0, DEFAULT_CIRCUIT_PROBE_INTERVAL)
+    }
+
+    fn enabled(&self) -> bool {
+        self.inner.failure_threshold > 0
+    }
+
+    /// Whether upstream outcomes for this provider feed the breaker.
+    pub fn watches(&self, provider: Provider) -> bool {
+        self.enabled() && self.inner.providers.contains(&provider)
+    }
+
+    pub fn is_open(&self) -> bool {
+        *self.inner.open.borrow()
+    }
+
+    /// Receives `true` while the circuit is open.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.open.subscribe()
+    }
+
+    fn counters(&self) -> std::sync::MutexGuard<'_, CircuitCounters> {
+        self.inner
+            .counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn record_success(&self) {
+        if !self.enabled() {
+            return;
+        }
+        let mut counters = self.counters();
+        if counters.opened_at.is_none() {
+            counters.consecutive_failures = 0;
+        }
+    }
+
+    fn recover(&self) {
+        let mut counters = self.counters();
+        counters.consecutive_failures = 0;
+        if let Some(opened_at) = counters.opened_at.take() {
+            tracing::info!(
+                open_secs = unix_secs().saturating_sub(opened_at),
+                "Provider circuit closed after all review model probes succeeded"
+            );
+            self.inner.open.send_replace(false);
+        }
+    }
+
+    /// Records a transient failure; `reason` is a fixed category.
+    pub fn record_failure(&self, reason: &'static str) {
+        if !self.enabled() {
+            return;
+        }
+        let now = unix_secs();
+        let mut counters = self.counters();
+        counters.consecutive_failures = counters.consecutive_failures.saturating_add(1);
+        counters.last_failure_at = Some(now);
+        counters.last_failure_reason = Some(reason);
+        if counters.opened_at.is_none()
+            && counters.consecutive_failures >= self.inner.failure_threshold
+        {
+            counters.opened_at = Some(now);
+            counters.opens_total = counters.opens_total.saturating_add(1);
+            tracing::error!(
+                consecutive_failures = counters.consecutive_failures,
+                reason,
+                probe_interval_secs = self.inner.probe_interval.as_secs(),
+                "Provider circuit opened; pausing review dispatch until a probe succeeds"
+            );
+            self.inner.open.send_replace(true);
+        }
+    }
+
+    pub fn snapshot(&self) -> CircuitSnapshot {
+        let counters = self.counters();
+        CircuitSnapshot {
+            state: if !self.enabled() {
+                CircuitState::Disabled
+            } else if counters.opened_at.is_some() {
+                CircuitState::Open
+            } else {
+                CircuitState::Closed
+            },
+            providers: self.inner.providers.iter().copied().collect(),
+            failure_threshold: self.inner.failure_threshold,
+            probe_interval_secs: self.inner.probe_interval.as_secs(),
+            consecutive_failures: counters.consecutive_failures,
+            opened_at: counters.opened_at,
+            last_failure_at: counters.last_failure_at,
+            last_failure_reason: counters.last_failure_reason,
+            last_probe_at: counters.last_probe_at,
+            opens_total: counters.opens_total,
+            probes_total: counters.probes_total,
+        }
+    }
+
+    /// While the circuit is open, sends one probe every probe interval and
+    /// closes the circuit when a probe succeeds. Runs until cancelled.
+    pub async fn run_probes<F, Fut>(&self, cancel: CancellationToken, probe: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        if !self.enabled() {
+            return;
+        }
+        let mut open = self.subscribe();
+        loop {
+            while !*open.borrow_and_update() {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    changed = open.changed() => if changed.is_err() { return },
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(self.inner.probe_interval) => {}
+            }
+            if !self.is_open() {
+                continue;
+            }
+            {
+                let mut counters = self.counters();
+                counters.last_probe_at = Some(unix_secs());
+                counters.probes_total = counters.probes_total.saturating_add(1);
+            }
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return,
+                result = tokio::time::timeout(Duration::from_secs(60), probe()) => {
+                    result.context("Provider probe round timed out").and_then(|result| result)
+                },
+            };
+            match result {
+                Ok(()) => {
+                    tracing::info!("Provider probe succeeded");
+                    self.recover();
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "Provider probe failed; circuit stays open");
+                }
+            }
+        }
+    }
+}
+
+fn unix_secs() -> i64 {
+    (unix_ms() / 1000) as i64
+}
+
+/// The breaker category for an upstream status, if it is a transient failure.
+fn transient_status_reason(status: StatusCode) -> Option<&'static str> {
+    match status.as_u16() {
+        408 => Some("timeout"),
+        429 => Some("rate_limited"),
+        500..=599 => Some("server_error"),
+        _ => None,
+    }
 }
 
 pub struct Broker {
@@ -614,6 +893,10 @@ impl Broker {
                 max_request_bytes: config.max_request_bytes,
                 client,
                 shared: shared.clone(),
+                breaker: config
+                    .breaker
+                    .clone()
+                    .filter(|breaker| breaker.watches(route.provider)),
             });
             let app = Router::new().fallback(forward).with_state(state);
             let shutdown = cancel.clone().cancelled_owned();
@@ -923,11 +1206,15 @@ async fn forward(
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(provider = %route.provider, error = %error, "Model broker upstream request failed");
+            route.record_failure("connection_failed");
             return record.finish_denied(StatusCode::BAD_GATEWAY, "upstream request failed");
         }
     };
 
     let status = response.status();
+    if let Some(reason) = transient_status_reason(status) {
+        route.record_failure(reason);
+    }
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in response.headers() {
         let name_str = name.as_str();
@@ -962,6 +1249,9 @@ async fn forward(
                 None
             }
             Err(error) => {
+                if let Some(record) = &stream.record {
+                    record.route.record_failure("stream_interrupted");
+                }
                 stream.finish("upstream_error");
                 Some((Err(std::io::Error::other(error)), stream))
             }
@@ -1042,6 +1332,9 @@ impl ResponseStream {
         let Some(record) = self.record.take() else {
             return;
         };
+        if outcome == "ok" && (200..300).contains(&self.status) {
+            record.route.record_success();
+        }
         let (input, output) = self.scan.finish();
         let cost = record.route.shared.charge(record.pricing(), input, output);
         record.write(self.status, outcome, self.scan.bytes, input, output, cost);
@@ -1204,6 +1497,7 @@ impl SandboxBroker {
         routes: Vec<RouteConfig>,
         max_cost_usd: Option<f64>,
         canaries: Vec<Canary>,
+        breaker: Option<CircuitBreaker>,
     ) -> Result<Self> {
         let sockets = state_dir.join("sockets");
         match std::fs::remove_dir_all(&sockets) {
@@ -1225,6 +1519,7 @@ impl SandboxBroker {
             max_cost_usd,
             log_path: Some(log.clone()),
             canaries,
+            breaker,
         })
         .await?;
         broker.write_manifest(&sockets.join(MANIFEST_NAME))?;
@@ -1507,6 +1802,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_cost_usd,
             log_path: None,
+            breaker: None,
             canaries: Vec::new(),
         })
         .await
@@ -1817,6 +2113,245 @@ mod tests {
         assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
     }
 
+    async fn start_with_breaker(upstream: &str, breaker: CircuitBreaker) -> Broker {
+        Broker::start(BrokerConfig {
+            routes: vec![
+                route(Provider::OpenRouter, upstream, "openai/gpt-5"),
+                route(Provider::TypeSafe, upstream, "jev-1.13.0"),
+            ],
+            listen: Listen::Tcp("127.0.0.1:0".parse().unwrap()),
+            max_request_bytes: 64 * 1024,
+            max_cost_usd: None,
+            log_path: None,
+            canaries: Vec::new(),
+            breaker: Some(breaker),
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn post_model(broker: &Broker, provider: Provider, path: &str, model: &str) -> u16 {
+        let route = broker
+            .endpoints()
+            .iter()
+            .find(|route| route.provider == provider)
+            .unwrap();
+        let Endpoint::Tcp(addr) = &route.endpoint else {
+            panic!("expected a TCP route");
+        };
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth(route.sandbox_key.expose())
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        response.bytes().await.unwrap();
+        status
+    }
+
+    #[tokio::test]
+    async fn transient_upstream_failures_open_the_circuit_for_watched_providers() {
+        let (upstream, _mock) = mock_upstream(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({})),
+            )
+                .into_response()
+        })
+        .await;
+        let breaker = CircuitBreaker::new([Provider::OpenRouter], 2, Duration::from_secs(60));
+        let broker = start_with_breaker(&upstream, breaker.clone()).await;
+
+        // Unwatched routes never feed the breaker.
+        for _ in 0..3 {
+            assert_eq!(
+                post_model(&broker, Provider::TypeSafe, "/v1/systemone", "jev-1.13.0").await,
+                503
+            );
+        }
+        assert_eq!(breaker.snapshot().consecutive_failures, 0);
+
+        let path = "/api/v1/chat/completions";
+        assert_eq!(
+            post_model(&broker, Provider::OpenRouter, path, "openai/gpt-5").await,
+            503
+        );
+        assert!(!breaker.is_open());
+        // Refused requests never reach the upstream and are not provider failures.
+        assert_eq!(
+            post_model(&broker, Provider::OpenRouter, path, "other").await,
+            403
+        );
+        assert_eq!(breaker.snapshot().consecutive_failures, 1);
+        assert_eq!(
+            post_model(&broker, Provider::OpenRouter, path, "openai/gpt-5").await,
+            503
+        );
+
+        let snapshot = breaker.snapshot();
+        assert!(breaker.is_open());
+        assert_eq!(snapshot.state, CircuitState::Open);
+        assert_eq!(snapshot.last_failure_reason, Some("server_error"));
+        assert_eq!(snapshot.opens_total, 1);
+        assert!(snapshot.opened_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn successful_upstream_responses_do_not_recover_other_models() {
+        let (upstream, _mock) = mock_upstream(|_| json_response(serde_json::json!({}))).await;
+        let breaker = CircuitBreaker::new([Provider::OpenRouter], 1, Duration::from_secs(60));
+        breaker.record_failure("rate_limited");
+        assert!(breaker.is_open());
+        let broker = start_with_breaker(&upstream, breaker.clone()).await;
+
+        let path = "/api/v1/chat/completions";
+        assert_eq!(
+            post_model(&broker, Provider::OpenRouter, path, "openai/gpt-5").await,
+            200
+        );
+
+        let snapshot = breaker.snapshot();
+        assert_eq!(snapshot.state, CircuitState::Open);
+        assert_eq!(snapshot.consecutive_failures, 1);
+        assert!(snapshot.opened_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn interrupted_success_responses_accumulate_failures() {
+        let (upstream, _) = mock_upstream(|_| {
+            let body = futures::stream::unfold(0, |step| async move {
+                match step {
+                    0 => Some((Ok(Bytes::from_static(b"data: partial\n\n")), 1)),
+                    1 => {
+                        // Flush successful headers before interrupting the body.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Some((Err(std::io::Error::other("interrupted")), 2))
+                    }
+                    _ => None,
+                }
+            });
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(body))
+                .unwrap()
+        })
+        .await;
+        let breaker = CircuitBreaker::new([Provider::OpenRouter], 2, Duration::from_secs(60));
+        let broker = start_with_breaker(&upstream, breaker.clone()).await;
+        let route = &broker.endpoints()[0];
+        let Endpoint::Tcp(addr) = &route.endpoint else {
+            panic!("expected TCP")
+        };
+        for failures in 1..=2 {
+            let response = reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/chat/completions"))
+                .bearer_auth(route.sandbox_key.expose())
+                .json(&serde_json::json!({"model": "openai/gpt-5"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.bytes().await.is_err());
+            assert_eq!(breaker.snapshot().consecutive_failures, failures);
+        }
+        assert!(breaker.is_open());
+        assert_eq!(
+            breaker.snapshot().last_failure_reason,
+            Some("stream_interrupted")
+        );
+    }
+
+    #[test]
+    fn only_transient_statuses_count_as_provider_failures() {
+        for (status, reason) in [
+            (408, Some("timeout")),
+            (429, Some("rate_limited")),
+            (500, Some("server_error")),
+            (503, Some("server_error")),
+            (529, Some("server_error")),
+            (400, None),
+            (401, None),
+            (402, None),
+            (404, None),
+            (200, None),
+        ] {
+            assert_eq!(
+                transient_status_reason(StatusCode::from_u16(status).unwrap()),
+                reason,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_breaker_never_opens() {
+        let breaker = CircuitBreaker::disabled();
+        for _ in 0..10 {
+            breaker.record_failure("server_error");
+        }
+        assert!(!breaker.is_open());
+        assert!(!breaker.watches(Provider::OpenRouter));
+        assert_eq!(breaker.snapshot().state, CircuitState::Disabled);
+    }
+
+    #[tokio::test]
+    async fn probes_run_only_while_open_and_close_on_success() {
+        let interval = Duration::from_millis(20);
+        let breaker = CircuitBreaker::new([Provider::OpenRouter], 1, interval);
+        let probes = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let task = {
+            let breaker = breaker.clone();
+            let probes = probes.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                breaker
+                    .run_probes(cancel, || {
+                        let attempt = probes.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if attempt == 0 {
+                                bail!("still down")
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    })
+                    .await;
+            })
+        };
+
+        tokio::time::sleep(interval * 5).await;
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "closed circuits are not probed"
+        );
+
+        let mut open = breaker.subscribe();
+        breaker.record_failure("server_error");
+        tokio::time::timeout(Duration::from_secs(5), open.wait_for(|open| !*open))
+            .await
+            .unwrap()
+            .unwrap();
+        // The first probe failed and left the circuit open; the second closed it.
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        let snapshot = breaker.snapshot();
+        assert_eq!(snapshot.probes_total, 2);
+        assert!(snapshot.last_probe_at.is_some());
+        assert_eq!(snapshot.state, CircuitState::Closed);
+
+        tokio::time::sleep(interval * 5).await;
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "probing stops once closed"
+        );
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn rejects_openrouter_model_fallbacks() {
         let case = &cases()[0];
@@ -1953,6 +2488,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_cost_usd: None,
             log_path: Some(log_path.clone()),
+            breaker: None,
             canaries: Vec::new(),
         })
         .await
@@ -2002,6 +2538,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_cost_usd: None,
             log_path: None,
+            breaker: None,
             canaries: Vec::new(),
         })
         .await
@@ -2036,6 +2573,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_cost_usd: None,
             log_path: None,
+            breaker: None,
             canaries: vec![Canary {
                 label: "gh hosts token".into(),
                 value: Credential::new("ghp_canaryvalue0123456789"),
@@ -2087,6 +2625,7 @@ mod tests {
                 max_request_bytes: 64 * 1024,
                 max_cost_usd: None,
                 log_path: None,
+                breaker: None,
                 canaries: vec![Canary {
                     label: "gh hosts token".into(),
                     value: Credential::new("ghp_canaryvalue0123456789"),
@@ -2120,6 +2659,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_cost_usd: None,
             log_path: None,
+            breaker: None,
             canaries: Vec::new(),
         })
         .await
@@ -2207,6 +2747,7 @@ mod tests {
                 label: "review GitHub token".into(),
                 value: Credential::new("github_pat_canary"),
             }],
+            None,
         )
         .await
         .unwrap();

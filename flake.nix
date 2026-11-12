@@ -137,6 +137,8 @@
                       maxRetries = 7;
                       maxReviewRetries = 4;
                       retryDelaySecs = 20;
+                      providerFailureThreshold = 8;
+                      providerProbeIntervalSecs = 90;
                       maxCostUsd = 12.5;
                       inputPricePerM = 1.25;
                       outputPricePerM = 5.75;
@@ -249,6 +251,8 @@
               grep -F 'max_retries = 7' "$config_path" >/dev/null
               grep -F 'max_review_retries = 4' "$config_path" >/dev/null
               grep -F 'retry_delay_secs = 20' "$config_path" >/dev/null
+              grep -F 'provider_failure_threshold = 8' "$config_path" >/dev/null
+              grep -F 'provider_probe_interval_secs = 90' "$config_path" >/dev/null
               grep -F 'max_cost_usd = 12.5' "$config_path" >/dev/null
               grep -F 'input_price_per_m = 1.25' "$config_path" >/dev/null
               grep -F 'output_price_per_m = 5.75' "$config_path" >/dev/null
@@ -599,19 +603,31 @@
             maxRetries = lib.mkOption {
               type = lib.types.int;
               default = 3;
-              description = "Maximum number of retries for LLM provider/session failures.";
+              description = "In-session provider retries: how often one agent session re-prompts after a transient model error. Distinct from maxReviewRetries.";
             };
 
             maxReviewRetries = lib.mkOption {
               type = lib.types.ints.unsigned;
               default = 5;
-              description = "Maximum whole-review retries per commit; a fresh trusted mention resets the limit.";
+              description = "Whole-review retries per commit after a failed review attempt, with backoff from five minutes to six hours. Distinct from maxRetries. Failures while the provider circuit is open do not count; a fresh trusted mention resets the limit.";
             };
 
             retryDelaySecs = lib.mkOption {
               type = lib.types.int;
               default = 10;
-              description = "Initial delay in seconds before retrying an LLM failure.";
+              description = "Initial delay in seconds before an in-session provider retry; doubles after each retry.";
+            };
+
+            providerFailureThreshold = lib.mkOption {
+              type = lib.types.ints.unsigned;
+              default = 5;
+              description = "Consecutive transient provider failures (429, 408, 5xx, connection errors) seen by the model broker that open the provider circuit. While open, no new reviews are dispatched and each distinct finder/verifier provider and model is probed every providerProbeIntervalSecs. 0 disables the breaker.";
+            };
+
+            providerProbeIntervalSecs = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 60;
+              description = "Seconds between probe calls while the provider circuit is open.";
             };
 
             maxCostUsd = lib.mkOption {
@@ -993,6 +1009,8 @@
                         max_retries = cfg.maxRetries;
                         max_review_retries = cfg.maxReviewRetries;
                         retry_delay_secs = cfg.retryDelaySecs;
+                        provider_failure_threshold = cfg.providerFailureThreshold;
+                        provider_probe_interval_secs = cfg.providerProbeIntervalSecs;
                       } // lib.optionalAttrs (cfg.laneTimeoutMins != null) {
                         lane_timeout_mins = cfg.laneTimeoutMins;
                       } // personaConfig // buzzConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
