@@ -390,7 +390,7 @@ pub struct ReviewParams {
     pub max_turns: u32,
     /// Timeout in minutes for the session
     pub timeout_mins: u64,
-    /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
+    /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     /// Path to the redb database
     pub db_path: PathBuf,
@@ -1318,7 +1318,7 @@ pub async fn run_review(
     }
     reporting_artifact.lock().await.lane_selection = selection.decisions;
     let normalized_review_lanes = selection.lanes;
-    // Each attempt, including the replacement, gets this allowance. The finder
+    // Each attempt, including any replacement, gets this allowance. The finder
     // phase deadline still bounds all lanes, queueing, and coordinator work.
     let lane_attempt_timeout = lane_attempt_timeout(params.timeout_mins, params.lane_timeout_mins);
     let require_pr_summary = normalized_review_lanes

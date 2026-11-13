@@ -60,7 +60,7 @@ pub struct DaemonConfig {
     pub max_review_lanes: Option<usize>,
     pub max_turns: Option<u32>,
     pub timeout_mins: Option<u64>,
-    /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
+    /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     pub db_path: Option<PathBuf>,
     /// In-session provider retries within one agent session.
@@ -118,7 +118,7 @@ pub struct ReviewConfig {
     pub max_review_lanes: Option<usize>,
     pub max_turns: Option<u32>,
     pub timeout_mins: Option<u64>,
-    /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
+    /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     pub db_path: Option<PathBuf>,
     pub force: Option<bool>,

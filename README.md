@@ -416,7 +416,7 @@ The built-in `summary` lane produces a neutral structured description of what
 the PR changes. It does not make a review decision and is stored separately
 from findings. Buzz delivery enables this lane automatically.
 
-The host runs the selected lanes as inspection-only sessions, at most `max_review_lanes` at a time (including the mandatory persona lane and any summary lane). Each lane gets a bounded deadline per attempt and one replacement; a lane that still fails leaves the finder incomplete. The coordinator receives the completed lane results, merges candidates describing the same root cause, and submits `submit_finding` or `submit_no_findings`. Lanes return candidate JSON and do not call reporting tools; custom persona files keep their methodology and placeholders, but the appended lane execution contract overrides old instructions to submit findings or write reports.
+The host runs the selected lanes as inspection-only sessions, at most `max_review_lanes` at a time (including the mandatory persona lane and any summary lane). Each lane gets a bounded deadline per attempt and one replacement after a session error or empty result; a lane that hits its deadline, a provider failure, or its turn limit is not replaced. A lane that does not complete leaves the finder incomplete. The coordinator receives the completed lane results, merges candidates describing the same root cause, and submits `submit_finding` or `submit_no_findings`. Lanes return candidate JSON and do not call reporting tools; custom persona files keep their methodology and placeholders, but the appended lane execution contract overrides old instructions to submit findings or write reports.
 
 You can optionally make a specialist lane conditional on the change being relevant:
 
@@ -465,7 +465,7 @@ Uncertain comparisons, oversized inputs, missing credentials, and service failur
 
 Lane selection captures the complete diff with three context lines per hunk, up to 80 KiB, plus up to 8 KiB of changed paths. Its serialized Jev request is capped at 96 KiB; deduplication requests retain a 24 KiB cap. These are byte limits, not token counts: Jev separately enforces its 32k-token state-plus-longest-question limit and 64k-token total request limit. API context-limit errors run all configured lanes. Diff-size failures and Git failures have distinct diagnostics, also recorded in lane-selection artifacts. Requests have a ten-second timeout and each Jev phase has a thirty-second total timeout. Inputs are never truncated to force a decision. Reported usage is included in review totals, using the pinned model's [published price](https://docs.typesafe.ai/models) of $0.042 per million input tokens (output is free). Estimated request cost is checked against the remaining budget before sending. Usage from requests that fail without a usable response cannot be accounted for; Fiach does not retry those requests before falling back.
 
-`lane_timeout_mins` in `[review]` or `[daemon]` (CLI: `--lane-timeout-mins`, NixOS: `services.fiach.laneTimeoutMins`) sets a positive timeout in minutes for each lane attempt. Each lane can run once plus one replacement, each receiving this allowance. For example, `timeoutMins = 60; laneTimeoutMins = 20;` allows up to twenty minutes per attempt. The overall finder phase deadline still includes lane selection, queued lanes, both attempts, and coordinator work, so it can cut an attempt short. Unset, the per-attempt timeout remains one quarter of `timeout_mins`, capped at five minutes.
+`lane_timeout_mins` in `[review]` or `[daemon]` (CLI: `--lane-timeout-mins`, NixOS: `services.fiach.laneTimeoutMins`) sets a positive timeout in minutes for each lane attempt. A lane that reaches this deadline is not replaced; only a session error or empty result earns one replacement, which receives the same allowance. For example, `timeoutMins = 60; laneTimeoutMins = 20;` allows up to twenty minutes per attempt. The overall finder phase deadline still includes lane selection, queued lanes, any replacement attempt, and coordinator work, so it can cut an attempt short. Unset, the per-attempt timeout remains one quarter of `timeout_mins`, capped at five minutes.
 
 `dedupe_existing_comments = false` disables both Jev and coordinator discussion comparison. The fallback coordinator uses the finder provider/model. Verifier provider/model settings remain independent. `timeout_mins` applies separately to the initial coordinator/lane phase, verifier phase, and fallback duplicate-decision continuation. The sandbox hard limit allows those enabled phases plus five minutes for setup and the bounded Jev phases.
 
@@ -786,7 +786,7 @@ The following options are available under `services.fiach`:
 | `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no findings were found. |
 | `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
 | `timeoutMins` | integer | `30` | Timeout in minutes for each review session. |
-| `laneTimeoutMins` | positive integer or null | `null` | Timeout per lane attempt; the one replacement gets the same allowance. Null preserves the derived default (one quarter of the phase timeout, capped at five minutes). |
+| `laneTimeoutMins` | positive integer or null | `null` | Timeout per lane attempt. A lane that times out is not replaced; a replacement after a session error or empty result gets the same allowance. Null preserves the derived default (one quarter of the phase timeout, capped at five minutes). |
 | `maxRetries` | integer | `3` | In-session provider retries: how often one agent session re-prompts after a transient model error. Distinct from `maxReviewRetries`. |
 | `maxReviewRetries` | unsigned integer | `5` | Whole-review retries per commit after a failed review attempt, with backoff. Failures while the provider circuit is open do not count. |
 | `retryDelaySecs` | integer | `10` | Initial delay in seconds before an in-session provider retry; doubles after each retry. |
@@ -887,9 +887,9 @@ This lets NixOS/systemd deployments keep using bundled skills such as `rust-secu
 - `src/state.rs`: Typed, versioned, async redb state adapter.
 
 Review lanes have host-enforced recovery. Each selected lane runs once and
-receives at most one replacement after a deadline, turn limit, or empty result.
-A provider failure gets no replacement: the session already retried the
-provider, and a fresh session would hit the same outage. Each attempt is bounded by one quarter of the finder deadline,
+receives at most one replacement after a session error or empty result. A
+deadline, provider failure, or turn limit is not retried, since a fresh attempt
+would most likely fail the same way and only add wall time. Each attempt is bounded by one quarter of the finder deadline,
 capped at 300 seconds. Completed lanes remain available when another lane fails.
 A missing, cancelled, or exhausted lane makes the review incomplete and prevents
 disclosure; the coordinator does not run.

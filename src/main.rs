@@ -220,7 +220,7 @@ enum Commands {
         #[arg(long)]
         timeout_mins: Option<u64>,
 
-        /// Timeout in minutes per lane attempt (replacement gets the same limit; phase timeout still applies)
+        /// Timeout in minutes per lane attempt (timed-out lanes are not replaced; phase timeout still applies)
         #[arg(long)]
         lane_timeout_mins: Option<std::num::NonZeroU64>,
 
@@ -354,7 +354,7 @@ enum Commands {
         #[arg(long)]
         timeout_mins: Option<u64>,
 
-        /// Timeout in minutes per lane attempt (replacement gets the same limit; phase timeout still applies)
+        /// Timeout in minutes per lane attempt (timed-out lanes are not replaced; phase timeout still applies)
         #[arg(long)]
         lane_timeout_mins: Option<std::num::NonZeroU64>,
 

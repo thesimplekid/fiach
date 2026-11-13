@@ -597,7 +597,7 @@
             laneTimeoutMins = lib.mkOption {
               type = lib.types.nullOr lib.types.ints.positive;
               default = null;
-              description = "Timeout in minutes per lane attempt. The one replacement gets the same allowance. The overall timeoutMins phase limit still applies, including queueing and coordinator work. Null uses one quarter of timeoutMins, capped at five minutes.";
+              description = "Timeout in minutes per lane attempt. A lane that times out is not replaced; a replacement after a session error or empty result gets the same allowance. The overall timeoutMins phase limit still applies, including queueing and coordinator work. Null uses one quarter of timeoutMins, capped at five minutes.";
             };
 
             maxRetries = lib.mkOption {

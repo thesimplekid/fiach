@@ -143,7 +143,7 @@ pub struct DaemonParams {
     pub max_review_lanes: usize,
     pub max_turns: u32,
     pub timeout_mins: u64,
-    /// Timeout per lane attempt, including its one replacement; None preserves the derived default.
+    /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
     pub db_path: PathBuf,
     /// In-session provider retries: how often one agent session re-prompts
