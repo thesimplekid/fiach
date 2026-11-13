@@ -8,7 +8,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::reporting::{AffectedLocation, DisclosurePolicy, PriorFinding, ReportingArtifact};
+use crate::{
+    forge::{Forge, ReviewComment},
+    reporting::{
+        AffectedLocation, DisclosurePolicy, MaintainerReply, PriorFinding, ReportingArtifact,
+    },
+};
 
 /// Reviews remembered as applied; older ones can only be re-applied by a
 /// forced re-review of a commit far back in the PR's history.
@@ -19,6 +24,29 @@ const MAX_APPLIED_REVIEWS: usize = 200;
 pub enum EntryStatus {
     Open,
     Resolved,
+    /// Incorrect when reported; the recheck showed the failure never occurred.
+    Withdrawn,
+}
+
+/// Associations whose thread replies the recheck considers. Wider than the
+/// review trigger list on purpose: contributors cannot argue a finding away.
+const MAINTAINER_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
+const MAX_REPLIES_PER_FINDING: usize = 5;
+const MAX_REPLY_CHARS: usize = 2000;
+
+/// Hidden tag in each inline comment naming the ledger entry it reports.
+pub fn finding_marker(id: &str) -> String {
+    format!("<!-- fiach-finding:{id} -->")
+}
+
+/// Hidden tag in a reply announcing a resolution, so it is posted once.
+pub fn resolution_marker(id: &str) -> String {
+    format!("<!-- fiach-resolved:{id} -->")
+}
+
+/// Hidden tag in a reply announcing a withdrawal, so it is posted once.
+pub fn withdrawal_marker(id: &str) -> String {
+    format!("<!-- fiach-withdrawn:{id} -->")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +91,8 @@ pub struct PrLedger {
 pub struct LedgerChange {
     pub added: Vec<LedgerEntry>,
     pub resolved: Vec<LedgerEntry>,
+    /// Entries this review showed were incorrect when reported.
+    pub withdrawn: Vec<LedgerEntry>,
     /// Entries of every review kind still open after this review.
     pub open: Vec<LedgerEntry>,
 }
@@ -91,6 +121,8 @@ impl PrLedger {
                 affected_locations: entry.affected_locations.clone(),
                 body: entry.body.clone(),
                 first_reported_commit: entry.first_commit.clone(),
+                unchanged_since_report: false,
+                maintainer_replies: Vec::new(),
             })
             .collect()
     }
@@ -121,6 +153,17 @@ impl PrLedger {
                         && entry.status == EntryStatus::Open
                 }) {
                     entry.status = EntryStatus::Resolved;
+                    entry.resolved_commit = Some(commit.to_string());
+                    entry.resolution = Some(status.rationale.trim().to_string());
+                }
+            }
+            for (prior, status) in artifact.withdrawn_prior_findings() {
+                if let Some(entry) = self.entries.iter_mut().find(|entry| {
+                    entry.id == prior.id
+                        && entry.review_kind == review_kind
+                        && entry.status == EntryStatus::Open
+                }) {
+                    entry.status = EntryStatus::Withdrawn;
                     entry.resolved_commit = Some(commit.to_string());
                     entry.resolution = Some(status.rationale.trim().to_string());
                 }
@@ -174,7 +217,14 @@ impl PrLedger {
         LedgerChange {
             added: select(&|entry| this_review(entry) && entry.first_commit == commit),
             resolved: select(&|entry| {
-                this_review(entry) && entry.resolved_commit.as_deref() == Some(commit)
+                this_review(entry)
+                    && entry.status == EntryStatus::Resolved
+                    && entry.resolved_commit.as_deref() == Some(commit)
+            }),
+            withdrawn: select(&|entry| {
+                this_review(entry)
+                    && entry.status == EntryStatus::Withdrawn
+                    && entry.resolved_commit.as_deref() == Some(commit)
             }),
             open: select(&|entry| entry.status == EntryStatus::Open),
         }
@@ -219,6 +269,65 @@ pub fn load_open_findings(
             Vec::new()
         }
     }
+}
+
+/// Attaches maintainers' replies from each prior finding's review threads.
+/// Fiach's own replies are skipped, as is anything from accounts outside
+/// [`MAINTAINER_ASSOCIATIONS`].
+pub fn attach_maintainer_replies(priors: &mut [PriorFinding], comments: &[ReviewComment]) {
+    for prior in priors {
+        let marker = finding_marker(&prior.id);
+        let roots = comments
+            .iter()
+            .filter(|comment| comment.in_reply_to_id.is_none() && comment.body.contains(&marker))
+            .map(|comment| comment.id)
+            .collect::<Vec<_>>();
+        prior.maintainer_replies = comments
+            .iter()
+            .filter(|comment| {
+                comment
+                    .in_reply_to_id
+                    .is_some_and(|root| roots.contains(&root))
+            })
+            .filter(|comment| !comment.body.contains("<!-- fiach-"))
+            .filter_map(|comment| {
+                let association = comment.author_association.as_deref()?;
+                MAINTAINER_ASSOCIATIONS
+                    .contains(&association)
+                    .then(|| MaintainerReply {
+                        author: comment.author.clone().unwrap_or_default(),
+                        association: association.to_string(),
+                        body: comment.body.chars().take(MAX_REPLY_CHARS).collect(),
+                    })
+            })
+            .take(MAX_REPLIES_PER_FINDING)
+            .collect();
+    }
+}
+
+/// Open findings of a review kind for its next review, with maintainers'
+/// thread replies. A failed thread lookup only drops the replies.
+pub async fn prior_findings_for_review(
+    db_path: &Path,
+    forge: &dyn Forge,
+    repo: &str,
+    pr: u64,
+    review_kind: &str,
+) -> Vec<PriorFinding> {
+    let mut priors = load_open_findings(db_path, repo, pr, review_kind);
+    if priors.is_empty() {
+        return priors;
+    }
+    match forge.review_comments(repo, pr).await {
+        Ok(comments) => attach_maintainer_replies(&mut priors, &comments),
+        Err(error) => tracing::warn!(
+            repo = %repo,
+            pr,
+            error = %format!("{error:#}"),
+            "Could not load review threads; rechecking without maintainer replies"
+        ),
+    }
+    priors
 }
 
 #[cfg(test)]
@@ -311,6 +420,7 @@ mod tests {
                 .map(|prior| PriorFindingStatus {
                     prior_finding_id: prior.id.clone(),
                     resolved,
+                    withdrawn: false,
                     affected_locations: Vec::new(),
                     command_transcripts: vec![transcript()],
                     rationale: "A guard now rejects it.".to_string(),
@@ -323,6 +433,93 @@ mod tests {
             }]),
             ..ReportingArtifact::default()
         }
+    }
+
+    #[test]
+    fn withdrawn_findings_close_only_when_the_cited_code_was_unchanged() {
+        let mut ledger = PrLedger::default();
+        ledger.apply("security", "c1", &reviewed("Lost update"), &policy());
+        let withdraw = |ledger: &PrLedger, unchanged: bool| {
+            let mut artifact = recheck(ledger, false, "src/lib.rs");
+            for prior in &mut artifact.prior_findings {
+                prior.unchanged_since_report = unchanged;
+            }
+            for status in &mut artifact.prior_statuses {
+                status.withdrawn = true;
+                status.rationale = "The caller already holds the lock.".to_string();
+            }
+            artifact
+        };
+
+        // The cited code changed, so this could be a fix: it stays open.
+        let change = ledger.apply("security", "c2", &withdraw(&ledger, false), &policy());
+        assert!(change.withdrawn.is_empty());
+        assert_eq!(change.open.len(), 1);
+
+        let change = ledger.apply("security", "c3", &withdraw(&ledger, true), &policy());
+        assert!(change.resolved.is_empty());
+        assert_eq!(change.withdrawn.len(), 1);
+        assert_eq!(change.withdrawn[0].status, EntryStatus::Withdrawn);
+        assert_eq!(change.withdrawn[0].resolved_commit.as_deref(), Some("c3"));
+        assert_eq!(
+            change.withdrawn[0].resolution.as_deref(),
+            Some("The caller already holds the lock.")
+        );
+        assert!(change.open.is_empty());
+        assert!(ledger.open_findings("security").is_empty());
+    }
+
+    fn comment(id: u64, body: &str, reply_to: Option<u64>, association: &str) -> ReviewComment {
+        ReviewComment {
+            id,
+            body: body.to_string(),
+            in_reply_to_id: reply_to,
+            author: Some(format!("user{id}")),
+            author_association: Some(association.to_string()),
+        }
+    }
+
+    #[test]
+    fn only_maintainer_replies_in_a_findings_thread_reach_the_recheck() {
+        let mut ledger = PrLedger::default();
+        ledger.apply("security", "c1", &reviewed("Lost update"), &policy());
+        let mut priors = ledger.open_findings("security");
+        let comments = [
+            comment(
+                1,
+                &format!("Lost update\n\n{}", finding_marker("P-1")),
+                None,
+                "NONE",
+            ),
+            comment(2, "The caller holds the lock.", Some(1), "MEMBER"),
+            comment(3, "Not a bug, trust me.", Some(1), "CONTRIBUTOR"),
+            comment(
+                4,
+                &format!("Resolved. {}", resolution_marker("P-1")),
+                Some(1),
+                "OWNER",
+            ),
+            comment(5, "Unrelated thread.", Some(9), "OWNER"),
+            comment(
+                6,
+                &"x".repeat(MAX_REPLY_CHARS + 50),
+                Some(1),
+                "COLLABORATOR",
+            ),
+            comment(7, "No association.", Some(1), ""),
+        ];
+        attach_maintainer_replies(&mut priors, &comments);
+        let replies = &priors[0].maintainer_replies;
+        assert_eq!(replies.len(), 2);
+        assert_eq!(
+            replies[0],
+            MaintainerReply {
+                author: "user2".to_string(),
+                association: "MEMBER".to_string(),
+                body: "The caller holds the lock.".to_string(),
+            }
+        );
+        assert_eq!(replies[1].body.chars().count(), MAX_REPLY_CHARS);
     }
 
     #[test]

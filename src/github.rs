@@ -228,7 +228,8 @@ impl Forge for GhCli {
                         "--paginate".into(),
                         format!("repos/{repository}/pulls/{pr}/comments"),
                         "--jq".into(),
-                        ".[] | {id, body, in_reply_to_id}".into(),
+                        ".[] | {id, body, in_reply_to_id, author: .user.login, author_association}"
+                            .into(),
                     ],
                     None,
                 )
@@ -554,8 +555,8 @@ mod tests {
 
     #[test]
     fn paginated_review_comments_parse_line_by_line() {
-        let output = br#"{"id":1,"body":"root","in_reply_to_id":null}
-{"id":2,"body":"reply","in_reply_to_id":1}
+        let output = br#"{"id":1,"body":"root","in_reply_to_id":null,"author":"bot","author_association":"NONE"}
+{"id":2,"body":"reply","in_reply_to_id":1,"author":null,"author_association":null}
 
 "#;
         assert_eq!(
@@ -565,11 +566,15 @@ mod tests {
                     id: 1,
                     body: "root".into(),
                     in_reply_to_id: None,
+                    author: Some("bot".into()),
+                    author_association: Some("NONE".into()),
                 },
                 ReviewComment {
                     id: 2,
                     body: "reply".into(),
                     in_reply_to_id: Some(1),
+                    author: None,
+                    author_association: None,
                 },
             ]
         );

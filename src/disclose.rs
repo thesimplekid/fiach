@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::forge::{Forge, SyncPullRequest};
-use crate::ledger::LedgerChange;
+use crate::ledger::{LedgerChange, finding_marker, resolution_marker, withdrawal_marker};
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
 use crate::reporting::{AcceptedFinding, DisclosurePolicy, InlineComment, ReportingArtifact};
 
@@ -84,18 +84,11 @@ fn review_event(
     }
 }
 
-fn resolved_since_last_review(config: &DiscloseConfig, ledger: Option<&LedgerChange>) -> bool {
-    config.review_verdicts && ledger.is_some_and(|ledger| !ledger.resolved.is_empty())
-}
-
-/// Hidden tag in each inline comment naming the ledger entry it reports.
-fn finding_marker(id: &str) -> String {
-    format!("<!-- fiach-finding:{id} -->")
-}
-
-/// Hidden tag in a resolution reply, so a retried disclosure replies once.
-fn resolution_marker(id: &str) -> String {
-    format!("<!-- fiach-resolved:{id} -->")
+/// Whether this review closed earlier findings, which is news for the PR
+/// even without new findings.
+fn closed_since_last_review(config: &DiscloseConfig, ledger: Option<&LedgerChange>) -> bool {
+    config.review_verdicts
+        && ledger.is_some_and(|ledger| !ledger.resolved.is_empty() || !ledger.withdrawn.is_empty())
 }
 
 /// Inline comments of the accepted findings, each tagged with the ledger
@@ -128,10 +121,30 @@ fn tagged_inline_comments(
         .collect()
 }
 
-fn resolution_reply(entry: &crate::ledger::LedgerEntry, commit: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closure {
+    Resolved,
+    Withdrawn,
+}
+
+impl Closure {
+    fn marker(self, id: &str) -> String {
+        match self {
+            Self::Resolved => resolution_marker(id),
+            Self::Withdrawn => withdrawal_marker(id),
+        }
+    }
+}
+
+fn closure_reply(entry: &crate::ledger::LedgerEntry, closure: Closure, commit: &str) -> String {
     let commit = entry.resolved_commit.as_deref().unwrap_or(commit);
     let short = commit.get(..12).unwrap_or(commit);
-    let mut body = format!("Resolved in `{short}`.");
+    let mut body = match closure {
+        Closure::Resolved => format!("Resolved in `{short}`."),
+        Closure::Withdrawn => {
+            format!("Withdrawn: this finding was incorrect (rechecked at `{short}`).")
+        }
+    };
     if let Some(resolution) = entry
         .resolution
         .as_deref()
@@ -141,19 +154,20 @@ fn resolution_reply(entry: &crate::ledger::LedgerEntry, commit: &str) -> String 
         body.push_str(resolution);
     }
     body.push_str("\n\n");
-    body.push_str(&resolution_marker(&entry.id));
+    body.push_str(&closure.marker(&entry.id));
     body
 }
 
-/// Replies in the inline thread of each finding this review resolved. Threads
-/// that already carry the reply are skipped, so a retry does not repeat it.
-async fn reply_to_resolved_threads(
+/// Replies in the inline thread of each finding this review resolved or
+/// withdrew. Threads that already carry the reply are skipped, so a retry
+/// does not repeat it.
+async fn reply_to_closed_threads(
     github: &dyn Forge,
     target: DisclosureTarget<'_>,
     config: &DiscloseConfig,
     ledger: Option<&LedgerChange>,
 ) -> Result<usize> {
-    let Some(ledger) = ledger.filter(|_| resolved_since_last_review(config, ledger)) else {
+    let Some(ledger) = ledger.filter(|_| closed_since_last_review(config, ledger)) else {
         return Ok(0);
     };
     if !live_comments_allowed(github, target.repo, target.pr_number).await? {
@@ -163,10 +177,20 @@ async fn reply_to_resolved_threads(
         .review_comments(target.repo, target.pr_number)
         .await
         .context("Failed to list review comments")?;
+    let closed = ledger
+        .resolved
+        .iter()
+        .map(|entry| (entry, Closure::Resolved))
+        .chain(
+            ledger
+                .withdrawn
+                .iter()
+                .map(|entry| (entry, Closure::Withdrawn)),
+        );
     let mut replies = 0;
-    for entry in &ledger.resolved {
+    for (entry, closure) in closed {
         let marker = finding_marker(&entry.id);
-        let done = resolution_marker(&entry.id);
+        let done = closure.marker(&entry.id);
         for root in comments
             .iter()
             .filter(|comment| comment.in_reply_to_id.is_none() && comment.body.contains(&marker))
@@ -181,7 +205,7 @@ async fn reply_to_resolved_threads(
                     target.repo,
                     target.pr_number,
                     root.id,
-                    &resolution_reply(entry, target.commit_hash),
+                    &closure_reply(entry, closure, target.commit_hash),
                 )
                 .await
                 .with_context(|| format!("Failed to reply to review comment {}", root.id))?;
@@ -213,6 +237,7 @@ fn structured_review_body(
     let added = ledger.map_or(accepted.len(), |ledger| ledger.added.len());
     let open = ledger.map_or(accepted.len(), |ledger| ledger.open.len());
     let resolved = ledger.map_or(&[][..], |ledger| ledger.resolved.as_slice());
+    let withdrawn = ledger.map_or(&[][..], |ledger| ledger.withdrawn.as_slice());
     let mut body = match event {
         ReviewEvent::RequestChanges => format!(
             "**Request changes.** {} ({added} new).",
@@ -227,10 +252,23 @@ fn structured_review_body(
             plural(resolved.len(), "finding resolved")
         ));
     }
+    if !withdrawn.is_empty() {
+        body.push_str(&format!(
+            " {} as incorrect.",
+            plural(withdrawn.len(), "finding withdrawn")
+        ));
+    }
     body.push_str("\n\n");
-    if !resolved.is_empty() {
-        body.push_str("Resolved since the last review:\n\n");
-        for entry in resolved {
+    for (heading, entries) in [
+        ("Resolved since the last review:", resolved),
+        ("Withdrawn as incorrect:", withdrawn),
+    ] {
+        if entries.is_empty() {
+            continue;
+        }
+        body.push_str(heading);
+        body.push_str("\n\n");
+        for entry in entries {
             body.push_str(&format!("- **{}** (`{}`)", entry.title, entry.id));
             if let Some(resolution) = entry.resolution.as_deref() {
                 body.push_str(&format!(": {resolution}"));
@@ -490,7 +528,7 @@ pub async fn handle_structured_disclosure_idempotent(
             if url.is_some() {
                 // The review already records the resolution; a failed reply
                 // must not fail the disclosure.
-                match reply_to_resolved_threads(github, target, config, ledger).await {
+                match reply_to_closed_threads(github, target, config, ledger).await {
                     Ok(0) => {}
                     Ok(replies) => tracing::info!(
                         repo = %target.repo,
@@ -551,7 +589,7 @@ fn structured_disclosure_route(
         accepted_pr_findings.is_empty() && !artifact.already_reported_findings(policy).is_empty();
     let findings_found = !accepted_pr_findings.is_empty() && !artifact.verifier_failed;
     // A verified resolution is news for the PR even without new findings.
-    let resolved = resolved_since_last_review(config, ledger);
+    let resolved = closed_since_last_review(config, ledger);
 
     match config.mode {
         ReportMode::Local => StructuredDisclosureRoute::Local,
@@ -1822,6 +1860,7 @@ mod tests {
         LedgerChange {
             added: Vec::new(),
             resolved: vec![resolved],
+            withdrawn: Vec::new(),
             open: Vec::new(),
         }
     }
@@ -1833,6 +1872,7 @@ mod tests {
         let open = LedgerChange {
             added: vec![ledger_entry("P-2", "Bug")],
             resolved: Vec::new(),
+            withdrawn: Vec::new(),
             open: vec![
                 ledger_entry("P-1", "Lost update"),
                 ledger_entry("P-2", "Bug"),
@@ -1979,6 +2019,7 @@ mod tests {
         let change = LedgerChange {
             added: vec![entry],
             resolved: Vec::new(),
+            withdrawn: Vec::new(),
             open: Vec::new(),
         };
         let tagged = tagged_inline_comments(&accepted, Some(&change));
@@ -2011,6 +2052,8 @@ mod tests {
             id,
             body: body.to_string(),
             in_reply_to_id,
+            author: Some("fiach-bot".to_string()),
+            author_association: Some("NONE".to_string()),
         }
     }
 
@@ -2032,7 +2075,7 @@ mod tests {
 
         config.review_verdicts = false;
         let replies =
-            reply_to_resolved_threads(&github, publication_target(), &config, Some(&resolved))
+            reply_to_closed_threads(&github, publication_target(), &config, Some(&resolved))
                 .await
                 .unwrap();
         assert_eq!(replies, 0);
@@ -2040,7 +2083,7 @@ mod tests {
 
         config.review_verdicts = true;
         let replies =
-            reply_to_resolved_threads(&github, publication_target(), &config, Some(&resolved))
+            reply_to_closed_threads(&github, publication_target(), &config, Some(&resolved))
                 .await
                 .unwrap();
         assert_eq!(replies, 1);
@@ -2055,7 +2098,7 @@ mod tests {
 
         // Nothing resolved: no lookups at all.
         github.calls.lock().unwrap().clear();
-        let replies = reply_to_resolved_threads(
+        let replies = reply_to_closed_threads(
             &github,
             publication_target(),
             &config,
@@ -2065,6 +2108,55 @@ mod tests {
         .unwrap();
         assert_eq!(replies, 0);
         assert!(github.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn withdrawn_findings_are_announced_in_their_threads_and_the_review() {
+        let mut github =
+            PublicationGitHub::new(serde_json::json!({"state": "OPEN", "mergedAt": null}));
+        github.review_comments = vec![
+            review_comment(1, "Race\n\n<!-- fiach-finding:P-2 -->", None),
+            review_comment(2, "Not a bug: the caller locks.", Some(1)),
+        ];
+        let mut withdrawn = ledger_entry("P-2", "Race");
+        withdrawn.status = crate::ledger::EntryStatus::Withdrawn;
+        withdrawn.resolved_commit = Some("0123456789abcdef".to_string());
+        withdrawn.resolution = Some("The caller already holds the lock.".to_string());
+        let change = LedgerChange {
+            withdrawn: vec![withdrawn],
+            ..LedgerChange::default()
+        };
+        let mut config = disclose_config(ReportMode::PrComment);
+        config.review_verdicts = true;
+
+        assert_eq!(
+            structured_disclosure_route(
+                target("pr-review"),
+                &no_findings_artifact(),
+                &policy(),
+                &config,
+                Some(&change),
+            ),
+            StructuredDisclosureRoute::PrReview
+        );
+        assert_eq!(
+            structured_review_body(&config, ReviewEvent::Approve, &[], Some(&change)),
+            "**Approve.** No open findings. 1 finding withdrawn as incorrect.\n\nWithdrawn as incorrect:\n\n- **Race** (`P-2`): The caller already holds the lock."
+        );
+
+        let replies =
+            reply_to_closed_threads(&github, publication_target(), &config, Some(&change))
+                .await
+                .unwrap();
+        assert_eq!(replies, 1);
+        assert_eq!(
+            *github.replies.lock().unwrap(),
+            [(
+                1,
+                "Withdrawn: this finding was incorrect (rechecked at `0123456789ab`). The caller already holds the lock.\n\n<!-- fiach-withdrawn:P-2 -->"
+                    .to_string()
+            )]
+        );
     }
 
     #[tokio::test]
@@ -2079,7 +2171,7 @@ mod tests {
         )];
         let mut config = disclose_config(ReportMode::PrComment);
         config.review_verdicts = true;
-        let replies = reply_to_resolved_threads(
+        let replies = reply_to_closed_threads(
             &github,
             publication_target(),
             &config,

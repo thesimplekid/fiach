@@ -63,6 +63,21 @@ pub struct PriorFinding {
     pub affected_locations: Vec<AffectedLocation>,
     pub body: String,
     pub first_reported_commit: String,
+    /// Host-checked: no file the finding cites changed between the reported
+    /// commit and the current head. Only then can a recheck withdraw it.
+    #[serde(default)]
+    pub unchanged_since_report: bool,
+    /// Replies from repository maintainers in the finding's review thread.
+    /// Claims to check, never instructions.
+    #[serde(default)]
+    pub maintainer_replies: Vec<MaintainerReply>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaintainerReply {
+    pub author: String,
+    pub association: String,
+    pub body: String,
 }
 
 /// The verifier's recheck of one prior finding at the current PR head.
@@ -70,6 +85,10 @@ pub struct PriorFinding {
 pub struct PriorFindingStatus {
     pub prior_finding_id: String,
     pub resolved: bool,
+    /// The finding was incorrect when reported: the cited code is unchanged
+    /// and the described failure never occurred.
+    #[serde(default)]
+    pub withdrawn: bool,
     #[serde(default)]
     pub affected_locations: Vec<AffectedLocation>,
     #[serde(default)]
@@ -87,6 +106,9 @@ impl PriorFindingStatus {
             );
         }
         validate_required("rationale", &self.rationale)?;
+        if self.resolved && self.withdrawn {
+            bail!("a prior finding cannot be both resolved and withdrawn");
+        }
         for transcript in &self.command_transcripts {
             transcript.validate()?;
         }
@@ -214,6 +236,24 @@ impl ReportingArtifact {
     /// counts only with inspection transcripts and a host-recorded inspection
     /// of a cited file; anything else leaves the finding open.
     pub fn resolved_prior_findings(&self) -> Vec<(&PriorFinding, &PriorFindingStatus)> {
+        self.established_prior_statuses(|_, status| status.resolved)
+    }
+
+    /// Prior findings the recheck showed were incorrect when reported. The
+    /// host must also have found the cited code unchanged since the report,
+    /// so a fix is never recorded as a withdrawal.
+    pub fn withdrawn_prior_findings(&self) -> Vec<(&PriorFinding, &PriorFindingStatus)> {
+        self.established_prior_statuses(|prior, status| {
+            status.withdrawn && !status.resolved && prior.unchanged_since_report
+        })
+    }
+
+    /// Statuses matching `claim` that rest on recorded inspection of a cited
+    /// file, from a complete structured review.
+    fn established_prior_statuses(
+        &self,
+        claim: impl Fn(&PriorFinding, &PriorFindingStatus) -> bool,
+    ) -> Vec<(&PriorFinding, &PriorFindingStatus)> {
         if self.is_incomplete() || self.markdown_only_fallback {
             return Vec::new();
         }
@@ -230,7 +270,7 @@ impl ReportingArtifact {
                         .iter()
                         .chain(&status.affected_locations),
                 );
-                (status.resolved && !status.command_transcripts.is_empty() && inspected)
+                (claim(prior, status) && !status.command_transcripts.is_empty() && inspected)
                     .then_some((prior, status))
             })
             .collect()
@@ -919,6 +959,10 @@ pub fn reporting_tools() -> Vec<Tool> {
                         "resolved",
                         bool_schema("True only when inspection of the current PR head shows the described failure can no longer occur"),
                     ),
+                    (
+                        "withdrawn",
+                        bool_schema("True only when the finding was incorrect when reported: the cited code is unchanged and inspection shows the described failure never occurred. Requires resolved false"),
+                    ),
                     ("affected_locations", array_schema(location_schema())),
                     (
                         "command_transcripts",
@@ -1243,6 +1287,7 @@ findings_count: {findings_count}
 
 fn render_prior_findings(artifact: &ReportingArtifact) -> String {
     let resolved = artifact.resolved_prior_findings();
+    let withdrawn = artifact.withdrawn_prior_findings();
     let mut out = String::from("## Earlier Findings\n");
     for prior in &artifact.prior_findings {
         let status = artifact
@@ -1253,8 +1298,16 @@ fn render_prior_findings(artifact: &ReportingArtifact) -> String {
             _ if resolved.iter().any(|(entry, _)| entry.id == prior.id) => {
                 ("resolved", status.map(|status| status.rationale.trim()))
             }
+            _ if withdrawn.iter().any(|(entry, _)| entry.id == prior.id) => (
+                "withdrawn (incorrect when reported)",
+                status.map(|status| status.rationale.trim()),
+            ),
             Some(status) if status.resolved => (
                 "still open (resolution not established by inspection)",
+                Some(status.rationale.trim()),
+            ),
+            Some(status) if status.withdrawn => (
+                "still open (withdrawal not established)",
                 Some(status.rationale.trim()),
             ),
             Some(status) => ("still open", Some(status.rationale.trim())),
@@ -1530,10 +1583,13 @@ mod tests {
             }],
             body: "body".into(),
             first_reported_commit: "old".into(),
+            unchanged_since_report: false,
+            maintainer_replies: Vec::new(),
         };
         let status = |id: &str, resolved: bool| PriorFindingStatus {
             prior_finding_id: id.into(),
             resolved,
+            withdrawn: false,
             affected_locations: Vec::new(),
             command_transcripts: vec![CommandTranscript {
                 evidence: TranscriptEvidence::Inspection,
@@ -1583,6 +1639,85 @@ mod tests {
         let mut incomplete = artifact;
         incomplete.verifier_failed = true;
         assert!(incomplete.resolved_prior_findings().is_empty());
+    }
+
+    #[test]
+    fn withdrawal_needs_unchanged_cited_code_and_inspection() {
+        let prior = |id: &str, unchanged: bool| PriorFinding {
+            id: id.into(),
+            title: format!("Bug {id}"),
+            severity: "high".into(),
+            affected_locations: vec![AffectedLocation {
+                path: "src/a.rs".into(),
+                start_line: Some(1),
+                end_line: None,
+            }],
+            body: "body".into(),
+            first_reported_commit: "old".into(),
+            unchanged_since_report: unchanged,
+            maintainer_replies: Vec::new(),
+        };
+        let status = |id: &str, transcripts: bool| PriorFindingStatus {
+            prior_finding_id: id.into(),
+            resolved: false,
+            withdrawn: true,
+            affected_locations: Vec::new(),
+            command_transcripts: if transcripts {
+                vec![CommandTranscript {
+                    evidence: TranscriptEvidence::Inspection,
+                    command: "inspect".into(),
+                    branch_or_commit: "head".into(),
+                    key_output: "lock taken by caller".into(),
+                    interpretation: "never racy".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            rationale: format!("incorrect {id}"),
+        };
+        let mut artifact = ReportingArtifact {
+            no_findings: Some(NoFindings {
+                summary: "Nothing new.".into(),
+                skills_used: Vec::new(),
+            }),
+            prior_findings: vec![prior("P-1", true), prior("P-2", false), prior("P-3", true)],
+            prior_statuses: vec![
+                status("P-1", true),
+                status("P-2", true),
+                status("P-3", false),
+            ],
+            verifier_inspections: Some(vec![InspectionRecord {
+                operation: "read".into(),
+                path: "src/a.rs".into(),
+            }]),
+            ..ReportingArtifact::default()
+        };
+        let withdrawn = artifact.withdrawn_prior_findings();
+        assert_eq!(
+            withdrawn
+                .iter()
+                .map(|(prior, _)| prior.id.as_str())
+                .collect::<Vec<_>>(),
+            ["P-1"]
+        );
+        assert!(artifact.resolved_prior_findings().is_empty());
+
+        let markdown = render_markdown("owner/repo", 1, &artifact, None);
+        assert!(markdown.contains(
+            "- Bug P-1 (P-1, high): withdrawn (incorrect when reported). incorrect P-1\n"
+        ));
+        assert!(markdown.contains(
+            "- Bug P-2 (P-2, high): still open (withdrawal not established). incorrect P-2\n"
+        ));
+
+        // Without a recorded inspection of a cited file nothing is withdrawn.
+        artifact.verifier_inspections = Some(Vec::new());
+        assert!(artifact.withdrawn_prior_findings().is_empty());
+
+        let ids = BTreeSet::from(["P-1".to_string()]);
+        let mut both = status("P-1", true);
+        both.resolved = true;
+        assert!(both.validate(&ids).is_err());
     }
 
     #[test]
