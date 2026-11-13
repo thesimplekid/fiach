@@ -688,7 +688,7 @@ const PERSONA_LANE_FOCUS: &str = "Read `.fiach-persona-lane.md` with inspect and
 const LANE_TASK: &str = r#"Review lane: {lane}
 Review PR #{pr_number} in {repo}. Focus: {focus}
 Read `.pr_diff.txt` with inspect; use its files and search operations to explore and its diff operation for the pinned incremental scope starting at {diff_base}. Read domain skills with inspect(operation: "read", path: <skill path>). There is no shell, repository script, reporting tool, or delegation.
-{skill_hint}
+{skill_hint}{repo_guidance}
 {contract}"#;
 
 const LANE_CANDIDATE_CONTRACT: &str = r#"Return only JSON: {"status":"candidates","candidates":[...]} or {"status":"no_findings","candidates":[],"summary":"...","skills_used":[...]}.
@@ -711,6 +711,8 @@ struct LaneTaskContext<'a> {
     pr_number: u64,
     diff_base: &'a str,
     skill_hint: &'a str,
+    /// Prompt note pointing at the repository guidance file, or empty.
+    repo_guidance: &'a str,
 }
 
 /// The host-built task for each selected lane.
@@ -731,6 +733,8 @@ fn lane_tasks(
             } else {
                 context.skill_hint
             };
+            // A neutral summary does not apply review rules.
+            let repo_guidance = if summary { "" } else { context.repo_guidance };
             let contract = if summary {
                 LANE_SUMMARY_CONTRACT
             } else {
@@ -742,6 +746,7 @@ fn lane_tasks(
                 .replace("{repo}", context.repo)
                 .replace("{diff_base}", context.diff_base)
                 .replace("{skill_hint}", skill_hint)
+                .replace("{repo_guidance}", repo_guidance)
                 .replace("{contract}", contract)
                 .replace("{focus}", &review_lane_focus_text(&lane, &custom_prompts));
             lanes::LaneTask { lane, instructions }
@@ -1257,6 +1262,34 @@ pub async fn run_review(
         persona_prompt + PERSONA_LANE_CONTRACT,
     )
     .context("Failed to write persona lane instructions")?;
+
+    // The repository's own rules and review skills, read from the base commit
+    // so the PR cannot rewrite them.
+    let repo_guidance =
+        match crate::repo_guidance::collect(&workspace.path, &workspace.base_commit).await {
+            Ok(guidance) => guidance,
+            Err(error) => {
+                tracing::warn!(
+                    repo = %params.repo,
+                    pr = params.pr_number,
+                    error = %format!("{error:#}"),
+                    "Could not load repository review guidance"
+                );
+                crate::repo_guidance::RepoGuidance::default()
+            }
+        };
+    if !repo_guidance.is_empty() {
+        tracing::info!(
+            repo = %params.repo,
+            pr = params.pr_number,
+            contents = %repo_guidance.contents(),
+            omitted = ?repo_guidance.omitted,
+            "Loaded repository review guidance"
+        );
+    }
+    let repo_guidance_note = repo_guidance
+        .write(&workspace.path)
+        .context("Failed to write repository review guidance")?;
     // Get the list of commits in this PR to check for stacked diffs
     let mut diff_base = workspace.base_commit.clone();
     let mut prev_review_context = String::new();
@@ -1330,6 +1363,7 @@ pub async fn run_review(
         );
         prev_review_context.push_str(&prior_findings_note(&prior_findings));
     }
+    prev_review_context.push_str(&repo_guidance_note);
     reporting_artifact.lock().await.prior_findings = prior_findings;
 
     let mut read_roots = vec![
@@ -1390,6 +1424,7 @@ pub async fn run_review(
                 pr_number: params.pr_number,
                 diff_base: &diff_base,
                 skill_hint: &skill_hint,
+                repo_guidance: &repo_guidance_note,
             },
         ),
     );
@@ -1734,6 +1769,7 @@ pub async fn run_review(
                 pr_number: params.pr_number,
                 pr_context: &workspace.pr_context,
                 diff_base: &diff_base,
+                repo_guidance: &repo_guidance_note,
                 provider_name: params
                     .verifier_provider
                     .as_deref()
@@ -2681,6 +2717,8 @@ struct VerificationParams<'a> {
     pr_number: u64,
     pr_context: &'a reporting::PrContext,
     diff_base: &'a str,
+    /// Prompt note pointing at the repository guidance file, or empty.
+    repo_guidance: &'a str,
     provider_name: &'a str,
     model: &'a str,
     max_retries: u32,
@@ -2746,6 +2784,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                 .replace("{prior_findings}", &prior_findings),
         );
     }
+    verifier_prompt.push_str(params.repo_guidance);
 
     let agent = AgentLoop::new(
         "review-verifier",
@@ -3435,6 +3474,7 @@ Reviewed the PR and found no vulnerabilities.
             pr_number: 1,
             pr_context: &context,
             diff_base: "base",
+            repo_guidance: "",
             provider_name: "invalid-provider",
             model: "invalid-model",
             max_retries: 0,
@@ -3557,6 +3597,7 @@ Reviewed the PR and found no vulnerabilities.
             pr_number: 7,
             diff_base: "reviewed-base",
             skill_hint: "Load the `cashu` skill.",
+            repo_guidance: "\n\nRepository guidance: read `.fiach-repo-guidance.md`.",
         }
     }
 
@@ -3585,6 +3626,7 @@ Reviewed the PR and found no vulnerabilities.
                 "{focus}",
                 "{diff_base}",
                 "{skill_hint}",
+                "{repo_guidance}",
                 "{contract}",
             ] {
                 assert!(!task.instructions.contains(placeholder), "{placeholder}");
@@ -3595,6 +3637,10 @@ Reviewed the PR and found no vulnerabilities.
         assert!(tasks[1].instructions.contains("Load the `cashu` skill."));
         assert!(tasks[1].instructions.contains("\"status\":\"candidates\""));
         assert!(!tasks[2].instructions.contains("cashu"));
+        // Review lanes apply the repository's rules; the neutral summary does not.
+        assert!(tasks[0].instructions.contains(".fiach-repo-guidance.md"));
+        assert!(tasks[1].instructions.contains(".fiach-repo-guidance.md"));
+        assert!(!tasks[2].instructions.contains(".fiach-repo-guidance.md"));
         assert_eq!(effective_review_lanes(&selected), selected);
     }
 
