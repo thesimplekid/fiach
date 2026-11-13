@@ -591,25 +591,11 @@ impl RepoGuidance {
     /// than written through.
     pub fn write(&self, checkout: &Path) -> Result<String> {
         let path = checkout.join(GUIDANCE_FILE);
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path)
-                .with_context(|| format!("Failed to replace {}", path.display()))?,
-            Ok(_) => std::fs::remove_file(&path)
-                .with_context(|| format!("Failed to replace {}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
-            }
-        }
         if self.is_empty() {
+            crate::workspace::remove_checkout_entry(&path)?;
             return Ok(String::new());
         }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, self.render().as_bytes()))
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        crate::workspace::write_checkout_file(&path, self.render().as_bytes(), false)?;
         Ok(GUIDANCE_NOTE
             .replace("{file}", GUIDANCE_FILE)
             .replace("{contents}", &self.contents()))

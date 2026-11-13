@@ -1308,9 +1308,10 @@ pub async fn run_review(
         .replace("{report_path}", &report_path)
         .replace("{skill_hint}", &skill_hint);
 
-    fs::write(
-        workspace.path.join(".fiach-persona-lane.md"),
-        persona_prompt + PERSONA_LANE_CONTRACT,
+    crate::workspace::write_checkout_file(
+        &workspace.path.join(".fiach-persona-lane.md"),
+        (persona_prompt + PERSONA_LANE_CONTRACT).as_bytes(),
+        false,
     )
     .context("Failed to write persona lane instructions")?;
 

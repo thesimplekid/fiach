@@ -162,6 +162,39 @@ impl StagedReview {
     }
 }
 
+/// Writes a host-generated file into a PR checkout. The PR controls the
+/// checkout, so whatever sits at `path` (a planted symlink, file, or
+/// directory) is removed first and the file is created fresh; a plain write
+/// would follow a symlink and overwrite a file outside the checkout.
+pub fn write_checkout_file(path: &Path, contents: &[u8], executable: bool) -> Result<()> {
+    remove_checkout_entry(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(if executable { 0o755 } else { 0o644 });
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    options
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, contents))
+        .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+/// Removes whatever the PR placed at `path` without following symlinks.
+pub fn remove_checkout_entry(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to replace {}", path.display())),
+        Ok(_) => std::fs::remove_file(path)
+            .with_context(|| format!("Failed to replace {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Failed to inspect {}", path.display())),
+    }
+}
+
 fn create_workspace_directory(
     repo: &str,
     pr_number: u64,
@@ -271,9 +304,7 @@ pub async fn prepare(
                 "Pull request diff exceeded the materialization limit"
             );
         }
-        tokio::fs::write(&pr_diff_path, diff)
-            .await
-            .context("Failed to write .pr_diff.txt")?;
+        write_checkout_file(&pr_diff_path, &diff, false)?;
     } else {
         let stderr = String::from_utf8_lossy(&pr_diff_output.stderr);
         tracing::warn!(
@@ -281,9 +312,7 @@ pub async fn prepare(
             error = %stderr,
             "Failed to generate .pr_diff.txt; writing an empty diff artifact"
         );
-        tokio::fs::write(&pr_diff_path, b"")
-            .await
-            .context("Failed to write empty .pr_diff.txt")?;
+        write_checkout_file(&pr_diff_path, b"", false)?;
     }
 
     // 5. Create safe_diff.sh helper script to handle large diffs
@@ -326,23 +355,12 @@ else
 fi
 "#;
 
-    let safe_diff_path = workspace_dir.join("safe_diff.sh");
-    tokio::fs::write(&safe_diff_path, safe_diff_script)
-        .await
-        .context("Failed to write safe_diff.sh script")?;
-
-    // Make script executable
-    let chmod_output = Command::new("chmod")
-        .args(["+x", "safe_diff.sh"])
-        .current_dir(&workspace_dir)
-        .output_bounded("making safe_diff.sh executable")
-        .await
-        .context("Failed to make safe_diff.sh executable")?;
-
-    if !chmod_output.status.success() {
-        let stderr = String::from_utf8_lossy(&chmod_output.stderr);
-        bail!("chmod +x safe_diff.sh failed: {stderr}");
-    }
+    // Created executable directly: `chmod` would follow a planted symlink.
+    write_checkout_file(
+        &workspace_dir.join("safe_diff.sh"),
+        safe_diff_script.as_bytes(),
+        true,
+    )?;
 
     // 6. Get the commit hash
     let rev_parse_output = Command::new("git")
@@ -386,6 +404,32 @@ fi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_files_replace_planted_symlinks_instead_of_following_them() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        let checkout = root.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let script = checkout.join("safe_diff.sh");
+        std::os::unix::fs::symlink(&outside, &script).unwrap();
+        let planted_dir = checkout.join(".pr_diff.txt");
+        std::fs::create_dir(&planted_dir).unwrap();
+
+        write_checkout_file(&script, b"#!/bin/sh\n", true).unwrap();
+        write_checkout_file(&planted_dir, b"diff", false).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        let metadata = std::fs::symlink_metadata(&script).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), "#!/bin/sh\n");
+        assert_eq!(std::fs::read_to_string(&planted_dir).unwrap(), "diff");
+    }
 
     fn prepared(directory: TempDir) -> PreparedWorkspace {
         PreparedWorkspace {
