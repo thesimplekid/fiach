@@ -754,6 +754,7 @@ mod tests {
             retry_not_before: None,
             failure_class: None,
             needs_intervention: false,
+            answered_mention_ts: None,
         }
     }
 

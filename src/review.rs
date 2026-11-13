@@ -1894,6 +1894,7 @@ pub async fn run_review(
                 retry_not_before: None,
                 failure_class: None,
                 needs_intervention: false,
+                answered_mention_ts: None,
             },
             should_notify,
             report_path: report_file.to_path_buf(),

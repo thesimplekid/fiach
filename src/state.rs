@@ -210,6 +210,12 @@ pub struct ReviewRecord {
     /// `needs_intervention` once whole-review retries are exhausted.
     #[serde(default)]
     pub retry_not_before: Option<i64>,
+    /// Timestamp of the newest trigger mention a completed review has answered.
+    /// Non-completed records carry the previous value forward, so a mention
+    /// stays pending across failed attempts and new pushes until a review
+    /// completes. Read it through [`ReviewRecord::answered_mention_ts`].
+    #[serde(default)]
+    pub answered_mention_ts: Option<i64>,
     #[serde(default)]
     pub failure_class: Option<FailureClass>,
     /// Set when the daemon will not recover on its own: whole-review retries
@@ -256,6 +262,26 @@ impl ReviewRecord {
                 review_retry_delay_secs(self.retry_count) as i64 + retry_jitter(&key, 60) as i64,
             ))
         };
+    }
+}
+
+impl ReviewStatus {
+    /// Whether this status records a review that ran to completion.
+    pub fn is_completed(self) -> bool {
+        !matches!(
+            self,
+            Self::Queued | Self::InProgress | Self::Skipped | Self::Failed
+        )
+    }
+}
+
+impl ReviewRecord {
+    /// Newest trigger-mention timestamp a completed review has answered.
+    /// Completed records written before this was tracked fall back to their
+    /// completion time, matching the previous attempt-based behavior.
+    pub fn answered_mention_ts(&self) -> Option<i64> {
+        let fallback = self.status.is_completed().then_some(self.timestamp);
+        self.answered_mention_ts.or(fallback)
     }
 }
 
@@ -683,6 +709,18 @@ fn should_review_inner(input: ShouldReviewInput<'_>) -> Result<ReviewDecision> {
     })
 }
 
+/// Only a completed review answers a trigger mention. Any other record keeps
+/// the previous answered mention, so pending mentions survive failed attempts
+/// and new pushes; a completed record never moves it backwards.
+fn carry_answered_mention(metadata: &mut ReviewMetadata, previous: &ReviewMetadata) {
+    let previous = previous.answered_mention_ts();
+    metadata.answered_mention_ts = if metadata.status.is_completed() {
+        metadata.answered_mention_ts().max(previous)
+    } else {
+        previous
+    };
+}
+
 /// Records the completed review metadata in the database.
 pub fn mark_reviewed(db_path: &Path, repo: &str, pr: u64, metadata: &ReviewMetadata) -> Result<()> {
     with_retries(|| {
@@ -693,11 +731,14 @@ pub fn mark_reviewed(db_path: &Path, repo: &str, pr: u64, metadata: &ReviewMetad
             let mut pr_table = write_txn.open_table(PR_STATE)?;
             let pr_key = pr_state_key(repo, pr, &metadata.review_kind);
             let mut metadata = metadata.clone();
-            if metadata.buzz_thread.is_none() {
-                metadata.buzz_thread = pr_table
-                    .get(pr_key.as_str())?
-                    .and_then(|value| serde_json::from_str::<ReviewMetadata>(value.value()).ok())
-                    .and_then(|previous| previous.buzz_thread);
+            let previous = pr_table
+                .get(pr_key.as_str())?
+                .and_then(|value| serde_json::from_str::<ReviewMetadata>(value.value()).ok());
+            if let Some(previous) = previous {
+                if metadata.buzz_thread.is_none() {
+                    metadata.buzz_thread = previous.buzz_thread.clone();
+                }
+                carry_answered_mention(&mut metadata, &previous);
             }
             let json_str =
                 serde_json::to_string(&metadata).context("Failed to serialize ReviewMetadata")?;
@@ -790,11 +831,13 @@ pub fn lock_for_review(
                 retry_not_before: None,
                 failure_class: None,
                 needs_intervention: false,
+                answered_mention_ts: None,
             };
 
             if let Some(value) = pr_table.get(key.as_str())? {
                 let json_str = value.value();
                 if let Ok(previous) = serde_json::from_str::<ReviewMetadata>(json_str) {
+                    carry_answered_mention(&mut metadata, &previous);
                     metadata.buzz_thread = previous.buzz_thread.clone();
                     if previous.commit_hash == commit_hash
                         && (previous.status == "failed" || previous.status == "in_progress")
@@ -1364,6 +1407,7 @@ mod tests {
             retry_not_before: None,
             failure_class: None,
             needs_intervention: false,
+            answered_mention_ts: None,
         }
     }
 
