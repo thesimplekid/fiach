@@ -30,6 +30,11 @@ pub struct ReviewComment {
     pub body: String,
     #[serde(default)]
     pub in_reply_to_id: Option<u64>,
+    #[serde(default)]
+    pub author: Option<String>,
+    /// The forge's author association, such as OWNER or CONTRIBUTOR.
+    #[serde(default)]
+    pub author_association: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -2183,12 +2183,14 @@ async fn stage_sandbox_review(
         pr_context: workspace.pr_context.clone(),
         pr_details,
         existing_comments,
-        prior_findings: crate::ledger::load_open_findings(
+        prior_findings: crate::ledger::prior_findings_for_review(
             &review_params.db_path,
+            crate::forge::client(&review_params.repo)?.adapter(),
             &review_params.repo,
             review_params.pr_number,
             &review_params.review_kind,
-        ),
+        )
+        .await,
     };
     let input = sandbox_host_path(runtime_rootfs, SANDBOX_STAGED_REVIEW);
     if let Some(parent) = input.parent() {
