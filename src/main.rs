@@ -252,6 +252,11 @@ enum Commands {
         #[arg(long)]
         notify_on_empty: Option<bool>,
 
+        /// Approve or request changes based on open findings, and post a
+        /// follow-up review when earlier findings are resolved
+        #[arg(long)]
+        review_verdicts: Option<bool>,
+
         /// GitHub reaction to add when review starts (e.g. eyes, rocket)
         #[arg(long)]
         review_start_reaction: Option<String>,
@@ -397,6 +402,11 @@ enum Commands {
         /// Notify even if no findings are found
         #[arg(long)]
         notify_on_empty: Option<bool>,
+
+        /// Approve or request changes based on open findings, and post a
+        /// follow-up review when earlier findings are resolved
+        #[arg(long)]
+        review_verdicts: Option<bool>,
 
         /// GitHub reaction to add when review starts (e.g. eyes, rocket)
         #[arg(long)]
@@ -590,6 +600,7 @@ async fn main() -> Result<()> {
             report_mode,
             sync_repo,
             notify_on_empty,
+            review_verdicts,
             review_start_reaction,
             no_findings_reaction,
             verify_findings,
@@ -689,6 +700,9 @@ async fn main() -> Result<()> {
                         notify_on_empty: notify_on_empty
                             .or(rev_cfg.notify_on_empty)
                             .unwrap_or(false),
+                        review_verdicts: review_verdicts
+                            .or(rev_cfg.review_verdicts)
+                            .unwrap_or(false),
                         reactions: disclose::ReactionConfig::with_defaults(
                             review_start_reaction
                                 .clone()
@@ -763,6 +777,7 @@ async fn main() -> Result<()> {
             report_mode,
             sync_repo,
             notify_on_empty,
+            review_verdicts,
             review_start_reaction,
             no_findings_reaction,
             verify_findings,
@@ -947,6 +962,9 @@ async fn main() -> Result<()> {
                     sync_repo: sync_repo.or(daemon_cfg.sync_repo),
                     notify_on_empty: notify_on_empty
                         .or(daemon_cfg.notify_on_empty)
+                        .unwrap_or(false),
+                    review_verdicts: review_verdicts
+                        .or(daemon_cfg.review_verdicts)
                         .unwrap_or(false),
                     reactions: disclose::ReactionConfig::with_defaults(
                         review_start_reaction.or(daemon_cfg.review_start_reaction),

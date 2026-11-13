@@ -13,6 +13,7 @@ const BUZZ_QUESTION_STATE: TableDefinition<&str, &str> =
 const BUZZ_QUESTION_CURSOR: TableDefinition<&str, i64> =
     TableDefinition::new("buzz_question_cursor");
 const DISCLOSURE_STATE: TableDefinition<&str, &str> = TableDefinition::new("disclosure_state");
+const FINDING_LEDGER: TableDefinition<&str, &str> = TableDefinition::new("finding_ledger");
 const SCHEMA_VERSION: TableDefinition<&str, u64> = TableDefinition::new("schema_version");
 const CURRENT_SCHEMA_VERSION: u64 = 3;
 const BUZZ_QUESTION_CURSOR_KEY: &str = "review_questions";
@@ -361,6 +362,54 @@ fn commit_state_key(repo: &str, commit_hash: &str, review_kind: &str) -> String 
     } else {
         format!("{repo}|{commit_hash}|{review_kind}")
     }
+}
+
+fn finding_ledger_key(repo: &str, pr: u64) -> String {
+    format!("{}:{repo}|{pr}", repo.len())
+}
+
+/// The serialized findings ledger for one PR.
+pub fn get_finding_ledger(db_path: &Path, repo: &str, pr: u64) -> Result<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    with_retries(|| {
+        let database = open_database(db_path).context("Failed to open state database")?;
+        let read = database.begin_read()?;
+        let table = match read.open_table(FINDING_LEDGER) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        Ok(table
+            .get(finding_ledger_key(repo, pr).as_str())?
+            .map(|value| value.value().to_string()))
+    })
+}
+
+/// Replaces one PR's findings ledger with `update`'s result inside a single
+/// write transaction.
+pub fn update_finding_ledger<T>(
+    db_path: &Path,
+    repo: &str,
+    pr: u64,
+    mut update: impl FnMut(Option<&str>) -> Result<(String, T)>,
+) -> Result<T> {
+    with_retries(|| {
+        let database = open_database(db_path).context("Failed to open state database")?;
+        let write = database.begin_write()?;
+        let result = {
+            let mut table = write.open_table(FINDING_LEDGER)?;
+            let key = finding_ledger_key(repo, pr);
+            let current = table
+                .get(key.as_str())?
+                .map(|value| value.value().to_string());
+            let (ledger, result) = update(current.as_deref())?;
+            table.insert(key.as_str(), ledger.as_str())?;
+            result
+        };
+        write.commit()?;
+        Ok(result)
+    })
 }
 
 pub(crate) fn disclosure_state_key(

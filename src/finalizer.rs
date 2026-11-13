@@ -76,6 +76,31 @@ impl ReviewFinalizer {
             commit_hash: &metadata.commit_hash,
             review_kind: &spec.review_kind,
         };
+        // Record this review in the findings ledger before disclosure so the
+        // review verdict reflects it. Recording a review again returns the
+        // recorded change, so a recovered finalization posts the same verdict.
+        let ledger_change = crate::ledger::record_review(
+            &spec.db_path,
+            &spec.repository,
+            spec.pr_number,
+            &spec.review_kind,
+            &metadata.commit_hash,
+            &outcome.artifact,
+            &outcome.policy,
+        )
+        .context("Failed to record review in the findings ledger")?;
+        if !ledger_change.added.is_empty() || !ledger_change.resolved.is_empty() {
+            tracing::info!(
+                repo = %spec.repository,
+                pr = spec.pr_number,
+                review_kind = %spec.review_kind,
+                added = ledger_change.added.len(),
+                resolved = ledger_change.resolved.len(),
+                open = ledger_change.open.len(),
+                "Updated findings ledger"
+            );
+        }
+
         let disclosure_scope = disclose::disclosure_scope(&spec.disclose);
         let report_url = match state::begin_disclosure(
             &spec.db_path,
@@ -101,6 +126,7 @@ impl ReviewFinalizer {
                     &outcome.artifact,
                     &outcome.policy,
                     &spec.disclose,
+                    Some(&ledger_change),
                     recovering,
                 )
                 .await?;
@@ -298,6 +324,7 @@ mod tests {
                 mode: disclose::ReportMode::Local,
                 sync_repo: None,
                 notify_on_empty: false,
+                review_verdicts: false,
                 reactions: disclose::ReactionConfig {
                     review_start: None,
                     no_findings: None,

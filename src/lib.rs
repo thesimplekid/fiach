@@ -13,6 +13,7 @@ pub mod inspection;
 pub mod issues;
 mod jev;
 mod lane_selection;
+pub mod ledger;
 pub mod persona;
 pub mod process;
 pub mod reporting;

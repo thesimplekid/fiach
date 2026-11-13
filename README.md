@@ -32,6 +32,7 @@ revision. Nothing is merged or closed.
 - **Worker Limit:** Run multiple PR reviews concurrently with an optional cap for resource-constrained hosts.
 - **Verifier Pass:** Re-check actionable findings against the complete PR diff before any disclosure mode runs.
 - **State Tracking:** Uses a lightweight, embedded Rust database (`redb`) to remember which commit hashes have already been reviewed, preventing redundant LLM calls.
+- **Findings Ledger:** Each PR keeps a ledger of the verified findings Fiach reported. When the PR changes, the verifier rechecks every finding still open at the new head and marks it resolved only when inspection establishes the fix. Reports list earlier findings and their status. With `review_verdicts = true` (or `--review-verdicts true`), PR reviews request changes while any finding is open and approve once none are, and a follow-up review is posted when earlier findings are resolved. A forge that refuses a verdict on its own PR gets a comment review instead.
 - **Workspace Isolation:** Clones the repository and checks out the PR branch into a temporary directory *before* giving control to the AI agent, saving valuable context window and turns.
 - **Per-Review Sandbox Logs:** Sandboxed reviews write `nspawn.log` next to their report artifacts for easier debugging.
 - **Interactive Web Server:** The daemon includes a built-in HTTP server to monitor its status, view review history, and manually trigger reviews on-demand without waiting for the next polling cycle.

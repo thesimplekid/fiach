@@ -646,10 +646,13 @@ struct ReviewComment {
 fn review_payload(value: &Value) -> Result<Value> {
     let payload: ReviewPayload =
         serde_json::from_value(value.clone()).context("Invalid review payload")?;
-    ensure!(
-        payload.event == "COMMENT",
-        "Only comment reviews are supported"
-    );
+    // Forgejo names the approval state APPROVED rather than APPROVE.
+    let event = match payload.event.as_str() {
+        "COMMENT" => "COMMENT",
+        "APPROVE" => "APPROVED",
+        "REQUEST_CHANGES" => "REQUEST_CHANGES",
+        other => bail!("Unsupported review event {other}"),
+    };
     let mut comments = Vec::new();
     for comment in payload.comments {
         ensure!(
@@ -659,7 +662,7 @@ fn review_payload(value: &Value) -> Result<Value> {
         comments.push(json!({"path": comment.path, "body": comment.body, "new_position": comment.line, "old_position": 0}));
     }
     Ok(
-        json!({"commit_id": payload.commit_id, "event": "COMMENT", "body": payload.body, "comments": comments}),
+        json!({"commit_id": payload.commit_id, "event": event, "body": payload.body, "comments": comments}),
     )
 }
 
@@ -1154,6 +1157,19 @@ mod tests {
         invalid["comments"][0]["side"] = json!("LEFT");
         assert!(client.publish_review(REPO, 1, &invalid).await.is_err());
         mock.done();
+    }
+
+    #[test]
+    fn review_events_use_forgejo_state_names() {
+        let payload = |event: &str| json!({"commit_id": "reviewed", "event": event, "body": "summary", "comments": []});
+        for (event, forgejo) in [
+            ("COMMENT", "COMMENT"),
+            ("APPROVE", "APPROVED"),
+            ("REQUEST_CHANGES", "REQUEST_CHANGES"),
+        ] {
+            assert_eq!(review_payload(&payload(event)).unwrap()["event"], forgejo);
+        }
+        assert!(review_payload(&payload("PENDING")).is_err());
     }
 
     #[tokio::test]

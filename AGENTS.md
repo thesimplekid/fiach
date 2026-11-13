@@ -19,6 +19,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 - `src/workspace.rs`: Uses forge adapters to clone repo/PR to a temp dir and records PR lifecycle/base/default-branch context.
 - `src/disclose.rs`: Report modes (`local`, `pr-comment`, `sync-pr`) and centralized forge review/sync disclosure.
 - `src/state.rs`: Uses `redb` to track reviewed commit hashes.
+- `src/ledger.rs`: Per-PR findings ledger shared by all review kinds. The verifier rechecks open findings with `submit_prior_finding_status`; the host resolves an entry only with inspection evidence, and `review_verdicts` turns open findings into request-changes/approve review events.
 - `src/broker.rs`: Per-job host model broker. Sandboxes get per-job keys and reach providers through it; real provider credentials never enter a sandbox. Also holds the host-wide provider `CircuitBreaker` that every job's broker feeds; while open, the scheduler pauses dispatch and the daemon probes the provider.
 - `flake.nix`: Package, dev shell, and NixOS module. The module can configure finder and verifier provider/model settings.
 - `.agents/skills/`: Domain skills (e.g., `cashu`).
