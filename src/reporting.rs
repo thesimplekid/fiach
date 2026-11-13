@@ -43,6 +43,58 @@ pub struct ReportingArtifact {
     /// cannot observe.
     #[serde(default)]
     pub verifier_inspections: Option<Vec<InspectionRecord>>,
+    /// Host-supplied findings from earlier reviews of this PR that were still
+    /// open when this review started; never supplied by reporting tools.
+    #[serde(default)]
+    pub prior_findings: Vec<PriorFinding>,
+    /// Verifier rechecks of `prior_findings`.
+    #[serde(default)]
+    pub prior_statuses: Vec<PriorFindingStatus>,
+}
+
+/// A finding an earlier review of this PR reported that the host still
+/// tracks as open.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PriorFinding {
+    pub id: String,
+    pub title: String,
+    pub severity: String,
+    #[serde(default)]
+    pub affected_locations: Vec<AffectedLocation>,
+    pub body: String,
+    pub first_reported_commit: String,
+}
+
+/// The verifier's recheck of one prior finding at the current PR head.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PriorFindingStatus {
+    pub prior_finding_id: String,
+    pub resolved: bool,
+    #[serde(default)]
+    pub affected_locations: Vec<AffectedLocation>,
+    #[serde(default)]
+    pub command_transcripts: Vec<CommandTranscript>,
+    pub rationale: String,
+}
+
+impl PriorFindingStatus {
+    pub fn validate(&self, prior_ids: &BTreeSet<String>) -> Result<()> {
+        validate_required("prior_finding_id", &self.prior_finding_id)?;
+        if !prior_ids.contains(&self.prior_finding_id) {
+            bail!(
+                "status references unknown prior_finding_id `{}`",
+                self.prior_finding_id
+            );
+        }
+        validate_required("rationale", &self.rationale)?;
+        for transcript in &self.command_transcripts {
+            transcript.validate()?;
+        }
+        for location in &self.affected_locations {
+            validate_required("affected_locations.path", &location.path)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,18 +176,64 @@ impl ReportingArtifact {
     /// Whether an inspection-only verifier read, searched, or diffed a file
     /// the finding cites. Verifiers with execution tools are not checked.
     pub fn verifier_inspected(&self, finding: &Finding, verdict: &Verdict) -> bool {
+        self.verifier_inspected_any(
+            finding
+                .affected_locations
+                .iter()
+                .chain(&verdict.affected_locations),
+        )
+    }
+
+    fn verifier_inspected_any<'a>(
+        &self,
+        locations: impl IntoIterator<Item = &'a AffectedLocation>,
+    ) -> bool {
         let Some(records) = &self.verifier_inspections else {
             return true;
         };
-        let cited = finding
-            .affected_locations
-            .iter()
-            .chain(&verdict.affected_locations)
+        let cited = locations
+            .into_iter()
             .map(|location| normalize_inspected_path(&location.path))
             .collect::<BTreeSet<_>>();
         records.iter().any(|record| {
             record.operation != "files" && cited.contains(normalize_inspected_path(&record.path))
         })
+    }
+
+    /// Whether every candidate has a verdict and every prior finding a recheck.
+    pub fn verification_settled(&self) -> bool {
+        self.verdicts.len() >= self.findings.len()
+            && self.prior_findings.iter().all(|prior| {
+                self.prior_statuses
+                    .iter()
+                    .any(|status| status.prior_finding_id == prior.id)
+            })
+    }
+
+    /// Prior findings the verifier showed resolved by inspection. A recheck
+    /// counts only with inspection transcripts and a host-recorded inspection
+    /// of a cited file; anything else leaves the finding open.
+    pub fn resolved_prior_findings(&self) -> Vec<(&PriorFinding, &PriorFindingStatus)> {
+        if self.is_incomplete() || self.markdown_only_fallback {
+            return Vec::new();
+        }
+        self.prior_findings
+            .iter()
+            .filter_map(|prior| {
+                let status = self
+                    .prior_statuses
+                    .iter()
+                    .find(|status| status.prior_finding_id == prior.id)?;
+                let inspected = self.verifier_inspected_any(
+                    prior
+                        .affected_locations
+                        .iter()
+                        .chain(&status.affected_locations),
+                );
+                (status.resolved && !status.command_transcripts.is_empty() && inspected)
+                    .then_some((prior, status))
+            })
+            .collect()
     }
 
     fn verdict_inspected(&self, verdict: &Verdict) -> bool {
@@ -808,6 +906,30 @@ pub fn reporting_tools() -> Vec<Tool> {
             ),
         ),
         Tool::new(
+            "submit_prior_finding_status".to_string(),
+            "Submit the verifier recheck of exactly one finding from an earlier review of this PR."
+                .to_string(),
+            object_schema(
+                vec![
+                    (
+                        "prior_finding_id",
+                        string_schema("Earlier finding id, for example P-1"),
+                    ),
+                    (
+                        "resolved",
+                        bool_schema("True only when inspection of the current PR head shows the described failure can no longer occur"),
+                    ),
+                    ("affected_locations", array_schema(location_schema())),
+                    (
+                        "command_transcripts",
+                        array_schema(command_transcript_schema()),
+                    ),
+                    ("rationale", string_schema("What changed, citing the code that now prevents the failure, or why the failure remains reachable")),
+                ],
+                vec!["prior_finding_id", "resolved", "rationale"],
+            ),
+        ),
+        Tool::new(
             "submit_duplicate_decision".to_string(),
             "Submit whether one verified finding was already reported in existing PR discussion."
                 .to_string(),
@@ -1001,6 +1123,10 @@ findings_count: {findings_count}
         ));
     }
 
+    if !artifact.prior_findings.is_empty() {
+        out.push_str(&render_prior_findings(artifact));
+    }
+
     if let Some(no_findings) = &artifact.no_findings
         && !artifact.is_incomplete()
     {
@@ -1115,6 +1241,38 @@ findings_count: {findings_count}
     out
 }
 
+fn render_prior_findings(artifact: &ReportingArtifact) -> String {
+    let resolved = artifact.resolved_prior_findings();
+    let mut out = String::from("## Earlier Findings\n");
+    for prior in &artifact.prior_findings {
+        let status = artifact
+            .prior_statuses
+            .iter()
+            .find(|status| status.prior_finding_id == prior.id);
+        let (label, rationale) = match status {
+            _ if resolved.iter().any(|(entry, _)| entry.id == prior.id) => {
+                ("resolved", status.map(|status| status.rationale.trim()))
+            }
+            Some(status) if status.resolved => (
+                "still open (resolution not established by inspection)",
+                Some(status.rationale.trim()),
+            ),
+            Some(status) => ("still open", Some(status.rationale.trim())),
+            None => ("still open (not rechecked)", None),
+        };
+        out.push_str(&format!(
+            "- {} ({}, {}): {label}.",
+            prior.title, prior.id, prior.severity
+        ));
+        if let Some(rationale) = rationale.filter(|rationale| !rationale.is_empty()) {
+            out.push_str(&format!(" {rationale}"));
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
 pub fn review_summary_body(accepted: &[AcceptedFinding]) -> String {
     if accepted.is_empty() {
         return "Verified review completed. No inline findings were anchorable.".to_string();
@@ -1170,6 +1328,14 @@ pub fn validate_artifact(artifact: &mut ReportingArtifact) -> Result<()> {
     }
     for decision in &mut artifact.duplicate_decisions {
         decision.validate(&ids)?;
+    }
+    let prior_ids = artifact
+        .prior_findings
+        .iter()
+        .map(|prior| prior.id.clone())
+        .collect();
+    for status in &artifact.prior_statuses {
+        status.validate(&prior_ids)?;
     }
     Ok(())
 }
@@ -1350,6 +1516,74 @@ fn severity_rank(severity: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_show_each_prior_finding_and_whether_its_fix_was_established() {
+        let prior = |id: &str, path: &str| PriorFinding {
+            id: id.into(),
+            title: format!("Bug {id}"),
+            severity: "high".into(),
+            affected_locations: vec![AffectedLocation {
+                path: path.into(),
+                start_line: Some(1),
+                end_line: None,
+            }],
+            body: "body".into(),
+            first_reported_commit: "old".into(),
+        };
+        let status = |id: &str, resolved: bool| PriorFindingStatus {
+            prior_finding_id: id.into(),
+            resolved,
+            affected_locations: Vec::new(),
+            command_transcripts: vec![CommandTranscript {
+                evidence: TranscriptEvidence::Inspection,
+                command: "inspect".into(),
+                branch_or_commit: "head".into(),
+                key_output: "code".into(),
+                interpretation: "checked".into(),
+            }],
+            rationale: format!("rationale {id}"),
+        };
+        let artifact = ReportingArtifact {
+            no_findings: Some(NoFindings {
+                summary: "Nothing new.".into(),
+                skills_used: Vec::new(),
+            }),
+            prior_findings: vec![
+                prior("P-1", "src/a.rs"),
+                prior("P-2", "src/b.rs"),
+                prior("P-3", "src/c.rs"),
+                prior("P-4", "src/d.rs"),
+            ],
+            prior_statuses: vec![
+                status("P-1", true),
+                status("P-2", true),
+                status("P-3", false),
+            ],
+            verifier_inspections: Some(vec![InspectionRecord {
+                operation: "read".into(),
+                path: "src/a.rs".into(),
+            }]),
+            ..ReportingArtifact::default()
+        };
+        assert!(!artifact.verification_settled());
+        let resolved = artifact.resolved_prior_findings();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0.id, "P-1");
+
+        let markdown = render_markdown("owner/repo", 1, &artifact, None);
+        assert!(markdown.contains("- Bug P-1 (P-1, high): resolved. rationale P-1\n"));
+        assert!(markdown.contains(
+            "- Bug P-2 (P-2, high): still open (resolution not established by inspection). rationale P-2\n"
+        ));
+        assert!(markdown.contains("- Bug P-3 (P-3, high): still open. rationale P-3\n"));
+        assert!(markdown.contains("- Bug P-4 (P-4, high): still open (not rechecked).\n"));
+        assert!(markdown.contains("## Review Result\nNothing new."));
+
+        let mut incomplete = artifact;
+        incomplete.verifier_failed = true;
+        assert!(incomplete.resolved_prior_findings().is_empty());
+    }
 
     #[test]
     fn lane_selection_is_separate_from_review_results_and_backward_compatible() {

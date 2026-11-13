@@ -666,6 +666,12 @@
               description = "Whether to create PRs or comments even if no findings were found.";
             };
 
+            reviewVerdicts = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Whether PR reviews approve or request changes from the findings still open on the PR, and post a follow-up review when earlier findings are verified as resolved.";
+            };
+
             reviewStartReaction = lib.mkOption {
               type = lib.types.str;
               default = "eyes";
@@ -1033,6 +1039,8 @@
                         output_price_per_m = cfg.outputPricePerM;
                       } // lib.optionalAttrs cfg.notifyOnEmpty {
                         notify_on_empty = cfg.notifyOnEmpty;
+                      } // lib.optionalAttrs cfg.reviewVerdicts {
+                        review_verdicts = cfg.reviewVerdicts;
                       } // {
                         review_start_reaction = cfg.reviewStartReaction;
                         no_findings_reaction = cfg.noFindingsReaction;

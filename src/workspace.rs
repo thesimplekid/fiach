@@ -144,6 +144,9 @@ pub struct StagedReview {
     /// `None` when deduplication will not run or discussion could not be
     /// fetched; deduplication is then skipped.
     pub existing_comments: Option<Vec<crate::reporting::ExistingPrComment>>,
+    /// Findings from earlier reviews of this PR that are still open.
+    #[serde(default)]
+    pub prior_findings: Vec<crate::reporting::PriorFinding>,
 }
 
 impl StagedReview {
@@ -486,6 +489,7 @@ mod tests {
                 body: "Body".to_string(),
             }),
             existing_comments: None,
+            prior_findings: Vec::new(),
         }
     }
 
