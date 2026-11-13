@@ -115,7 +115,7 @@ The review agent can execute shell commands. In sandbox mode, provider API keys 
 - accepts only the endpoints Goose and Jev use and only the job's finder, verifier, and Jev models;
 - replaces the per-job key with the real credential and forwards to a fixed HTTPS upstream (the host's own `*_HOST` overrides still apply) without following redirects;
 - enforces `maxCostUsd` across all routes from the usage in provider responses;
-- writes request metadata, without bodies, to `<run dir>.broker/requests.jsonl`;
+- writes request metadata to `<run dir>.broker/requests.jsonl`. Request bodies and successful response bodies are never logged. For an unsuccessful upstream response, the record also keeps the first 4 KiB of the body as `error_body` (the provider's reason, e.g. for an HTTP 400), with every provider credential, per-job key, and planted token replaced by a label. The excerpt can still contain request content the provider echoed back; it stays in the host-side log and is never sent to the sandbox or a forge;
 - quarantines the job when a request contains the per-job key, a real provider credential, or the planted GitHub token described below. A quarantined review fails and is never disclosed.
 
 Issue worker code and verify phases use the same broker with only their phase's model; regression checks get no model access.
