@@ -23,6 +23,15 @@ pub struct PullRequestSummary {
     pub title: String,
 }
 
+/// An inline review comment. Replies point at the thread's first comment.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub id: u64,
+    pub body: String,
+    #[serde(default)]
+    pub in_reply_to_id: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoveryRequest<'a> {
     pub repository: &'a str,
@@ -60,6 +69,20 @@ pub trait Forge: Send + Sync {
         pr: u64,
         body: &'a str,
     ) -> ForgeFuture<'a, String>;
+    /// Inline review comments of a PR. A forge that cannot reply in review
+    /// threads returns none.
+    fn review_comments<'a>(
+        &'a self,
+        repository: &'a str,
+        pr: u64,
+    ) -> ForgeFuture<'a, Vec<ReviewComment>>;
+    fn reply_to_review_comment<'a>(
+        &'a self,
+        repository: &'a str,
+        pr: u64,
+        comment: u64,
+        body: &'a str,
+    ) -> ForgeFuture<'a, ()>;
     fn clone_workspace<'a>(
         &'a self,
         repository: &'a str,

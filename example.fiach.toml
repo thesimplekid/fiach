@@ -22,7 +22,7 @@ out_dir = "reports" # Local directory to store reports
 report_mode = "sync-pr" # Options: local, pr-comment, sync-pr
 sync_repo = "thesimplekid/cdk-reviews" # GitHub owner/name or Forgejo HTTPS URL to sync to if report_mode = "sync-pr"
 notify_on_empty = false
-# review_verdicts = true # Approve or request changes from open findings; post a follow-up when earlier findings are resolved
+# review_verdicts = true # Approve or request changes from open findings; post a follow-up and thread replies when earlier findings are resolved
 # review_start_reaction = "eyes" # Default PR reaction when review starts
 # no_findings_reaction = "+1" # Default PR reaction when review completes with no findings
 verify_findings = true # Run a verifier pass before disclosure when findings are present

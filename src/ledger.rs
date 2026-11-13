@@ -36,6 +36,10 @@ pub struct LedgerEntry {
     pub resolved_commit: Option<String>,
     #[serde(default)]
     pub resolution: Option<String>,
+    /// The review artifact's finding ID, which links the entry to the inline
+    /// comments posted for it.
+    #[serde(default)]
+    pub source_finding_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +148,7 @@ impl PrLedger {
                     status: EntryStatus::Open,
                     resolved_commit: None,
                     resolution: None,
+                    source_finding_id: Some(finding.finding_id),
                 });
             }
             self.applied.push(AppliedReview {

@@ -786,6 +786,29 @@ impl Forge for Forgejo {
         })
     }
 
+    fn review_comments<'a>(
+        &'a self,
+        repo: &'a str,
+        _pr: u64,
+    ) -> ForgeFuture<'a, Vec<crate::forge::ReviewComment>> {
+        // The Forgejo API cannot reply in a review thread, so there are no
+        // threads to answer.
+        Box::pin(async move {
+            self.check_repository(repo)?;
+            Ok(Vec::new())
+        })
+    }
+
+    fn reply_to_review_comment<'a>(
+        &'a self,
+        _repo: &'a str,
+        _pr: u64,
+        _comment: u64,
+        _body: &'a str,
+    ) -> ForgeFuture<'a, ()> {
+        Box::pin(async move { bail!("Forgejo does not support review thread replies") })
+    }
+
     fn clone_workspace<'a>(
         &'a self,
         repo: &'a str,

@@ -253,7 +253,8 @@ enum Commands {
         notify_on_empty: Option<bool>,
 
         /// Approve or request changes based on open findings, and post a
-        /// follow-up review when earlier findings are resolved
+        /// follow-up review and thread replies when earlier findings are
+        /// resolved
         #[arg(long)]
         review_verdicts: Option<bool>,
 
@@ -404,7 +405,8 @@ enum Commands {
         notify_on_empty: Option<bool>,
 
         /// Approve or request changes based on open findings, and post a
-        /// follow-up review when earlier findings are resolved
+        /// follow-up review and thread replies when earlier findings are
+        /// resolved
         #[arg(long)]
         review_verdicts: Option<bool>,
 
