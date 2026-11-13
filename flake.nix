@@ -669,7 +669,7 @@
             reviewVerdicts = lib.mkOption {
               type = lib.types.bool;
               default = false;
-              description = "Whether PR reviews approve or request changes from the findings still open on the PR, and post a follow-up review when earlier findings are verified as resolved.";
+              description = "Whether PR reviews approve or request changes from the findings still open on the PR, and post a follow-up review and inline thread replies when earlier findings are verified as resolved.";
             };
 
             reviewStartReaction = lib.mkOption {

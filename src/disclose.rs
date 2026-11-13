@@ -88,6 +88,109 @@ fn resolved_since_last_review(config: &DiscloseConfig, ledger: Option<&LedgerCha
     config.review_verdicts && ledger.is_some_and(|ledger| !ledger.resolved.is_empty())
 }
 
+/// Hidden tag in each inline comment naming the ledger entry it reports.
+fn finding_marker(id: &str) -> String {
+    format!("<!-- fiach-finding:{id} -->")
+}
+
+/// Hidden tag in a resolution reply, so a retried disclosure replies once.
+fn resolution_marker(id: &str) -> String {
+    format!("<!-- fiach-resolved:{id} -->")
+}
+
+/// Inline comments of the accepted findings, each tagged with the ledger
+/// entry recorded for its finding so a later review can reply in its thread.
+fn tagged_inline_comments(
+    accepted: &[AcceptedFinding],
+    ledger: Option<&LedgerChange>,
+) -> Vec<InlineComment> {
+    accepted
+        .iter()
+        .flat_map(|finding| {
+            let marker = ledger
+                .and_then(|ledger| {
+                    ledger.added.iter().find(|entry| {
+                        entry.source_finding_id.as_deref() == Some(finding.finding_id.as_str())
+                    })
+                })
+                .map(|entry| finding_marker(&entry.id));
+            finding
+                .inline_comments
+                .iter()
+                .cloned()
+                .map(move |mut comment| {
+                    if let Some(marker) = &marker {
+                        comment.body = format!("{}\n\n{marker}", comment.body);
+                    }
+                    comment
+                })
+        })
+        .collect()
+}
+
+fn resolution_reply(entry: &crate::ledger::LedgerEntry, commit: &str) -> String {
+    let commit = entry.resolved_commit.as_deref().unwrap_or(commit);
+    let short = commit.get(..12).unwrap_or(commit);
+    let mut body = format!("Resolved in `{short}`.");
+    if let Some(resolution) = entry
+        .resolution
+        .as_deref()
+        .filter(|resolution| !resolution.is_empty())
+    {
+        body.push(' ');
+        body.push_str(resolution);
+    }
+    body.push_str("\n\n");
+    body.push_str(&resolution_marker(&entry.id));
+    body
+}
+
+/// Replies in the inline thread of each finding this review resolved. Threads
+/// that already carry the reply are skipped, so a retry does not repeat it.
+async fn reply_to_resolved_threads(
+    github: &dyn Forge,
+    target: DisclosureTarget<'_>,
+    config: &DiscloseConfig,
+    ledger: Option<&LedgerChange>,
+) -> Result<usize> {
+    let Some(ledger) = ledger.filter(|_| resolved_since_last_review(config, ledger)) else {
+        return Ok(0);
+    };
+    if !live_comments_allowed(github, target.repo, target.pr_number).await? {
+        return Ok(0);
+    }
+    let comments = github
+        .review_comments(target.repo, target.pr_number)
+        .await
+        .context("Failed to list review comments")?;
+    let mut replies = 0;
+    for entry in &ledger.resolved {
+        let marker = finding_marker(&entry.id);
+        let done = resolution_marker(&entry.id);
+        for root in comments
+            .iter()
+            .filter(|comment| comment.in_reply_to_id.is_none() && comment.body.contains(&marker))
+        {
+            if comments.iter().any(|comment| {
+                comment.in_reply_to_id == Some(root.id) && comment.body.contains(&done)
+            }) {
+                continue;
+            }
+            github
+                .reply_to_review_comment(
+                    target.repo,
+                    target.pr_number,
+                    root.id,
+                    &resolution_reply(entry, target.commit_hash),
+                )
+                .await
+                .with_context(|| format!("Failed to reply to review comment {}", root.id))?;
+            replies += 1;
+        }
+    }
+    Ok(replies)
+}
+
 fn plural(count: usize, word: &str) -> String {
     if count == 1 {
         format!("1 {word}")
@@ -363,18 +466,17 @@ pub async fn handle_structured_disclosure_idempotent(
         StructuredDisclosureRoute::Skip => Ok(None),
         StructuredDisclosureRoute::PrReview => {
             let accepted = artifact.publishable_findings(policy);
-            let comments = accepted
-                .iter()
-                .flat_map(|finding| finding.inline_comments.clone())
-                .collect::<Vec<_>>();
+            let comments = tagged_inline_comments(&accepted, ledger);
             let marker = disclosure_marker(target, config);
             let event = review_event(config, ledger, &accepted);
             let body = format!(
                 "{}\n\n{marker}",
                 structured_review_body(config, event, &accepted, ledger)
             );
-            post_pr_review(
-                crate::forge::client(target.repo)?.adapter(),
+            let client = crate::forge::client(target.repo)?;
+            let github = client.adapter();
+            let url = post_pr_review(
+                github,
                 target,
                 ReviewPost {
                     event,
@@ -384,7 +486,27 @@ pub async fn handle_structured_disclosure_idempotent(
                 },
                 recovering,
             )
-            .await
+            .await?;
+            if url.is_some() {
+                // The review already records the resolution; a failed reply
+                // must not fail the disclosure.
+                match reply_to_resolved_threads(github, target, config, ledger).await {
+                    Ok(0) => {}
+                    Ok(replies) => tracing::info!(
+                        repo = %target.repo,
+                        pr = target.pr_number,
+                        replies,
+                        "Replied in resolved finding threads"
+                    ),
+                    Err(error) => tracing::warn!(
+                        repo = %target.repo,
+                        pr = target.pr_number,
+                        error = %format!("{error:#}"),
+                        "Could not reply in resolved finding threads"
+                    ),
+                }
+            }
+            Ok(url)
         }
         StructuredDisclosureRoute::SyncPr => {
             let sync_repo = config
@@ -1303,7 +1425,9 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::forge::{DiscoveryRequest, ForgeFuture, PullRequestSummary, SyncPullRequest};
+    use crate::forge::{
+        DiscoveryRequest, ForgeFuture, PullRequestSummary, ReviewComment, SyncPullRequest,
+    };
 
     struct PublicationGitHub {
         lifecycle: serde_json::Value,
@@ -1314,6 +1438,8 @@ mod tests {
         refuse_verdicts: bool,
         calls: std::sync::Mutex<Vec<&'static str>>,
         payload: std::sync::Mutex<Option<serde_json::Value>>,
+        review_comments: Vec<ReviewComment>,
+        replies: std::sync::Mutex<Vec<(u64, String)>>,
     }
 
     impl PublicationGitHub {
@@ -1325,6 +1451,8 @@ mod tests {
                 refuse_verdicts: false,
                 calls: Default::default(),
                 payload: Default::default(),
+                review_comments: Vec::new(),
+                replies: Default::default(),
             }
         }
     }
@@ -1375,6 +1503,32 @@ mod tests {
         }
         fn post_comment<'a>(&'a self, _: &'a str, _: u64, _: &'a str) -> ForgeFuture<'a, String> {
             panic!("unexpected comment")
+        }
+        fn review_comments<'a>(
+            &'a self,
+            _: &'a str,
+            _: u64,
+        ) -> ForgeFuture<'a, Vec<ReviewComment>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("review_comments");
+                Ok(self.review_comments.clone())
+            })
+        }
+        fn reply_to_review_comment<'a>(
+            &'a self,
+            _: &'a str,
+            _: u64,
+            comment: u64,
+            body: &'a str,
+        ) -> ForgeFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("reply");
+                self.replies
+                    .lock()
+                    .unwrap()
+                    .push((comment, body.to_string()));
+                Ok(())
+            })
         }
         fn clone_workspace<'a>(&'a self, _: &'a str, _: u64, _: &'a Path) -> ForgeFuture<'a, ()> {
             panic!("unexpected clone")
@@ -1657,6 +1811,7 @@ mod tests {
             status: crate::ledger::EntryStatus::Open,
             resolved_commit: None,
             resolution: None,
+            source_finding_id: None,
         }
     }
 
@@ -1805,6 +1960,135 @@ mod tests {
             github.payload.lock().unwrap().as_ref().unwrap()["event"],
             "APPROVE"
         );
+    }
+
+    #[test]
+    fn inline_comments_carry_the_ledger_entry_recorded_for_their_finding() {
+        let accepted = artifact(true).publishable_findings(&policy());
+        assert!(!accepted.is_empty());
+        let untagged = tagged_inline_comments(&accepted, None);
+        assert!(!untagged.is_empty());
+        assert!(
+            untagged
+                .iter()
+                .all(|comment| !comment.body.contains("fiach-finding"))
+        );
+
+        let mut entry = ledger_entry("P-3", "Bug");
+        entry.source_finding_id = Some(accepted[0].finding_id.clone());
+        let change = LedgerChange {
+            added: vec![entry],
+            resolved: Vec::new(),
+            open: Vec::new(),
+        };
+        let tagged = tagged_inline_comments(&accepted, Some(&change));
+        assert_eq!(tagged.len(), untagged.len());
+        for (tagged, untagged) in tagged.iter().zip(&untagged) {
+            assert_eq!(
+                tagged.body,
+                format!("{}\n\n<!-- fiach-finding:P-3 -->", untagged.body)
+            );
+            assert_eq!((&tagged.path, tagged.line), (&untagged.path, untagged.line));
+        }
+
+        // An entry recorded for another finding does not tag these comments.
+        let mut other = change.clone();
+        other.added[0].source_finding_id = Some("F-other".to_string());
+        assert_eq!(
+            tagged_inline_comments(&accepted, Some(&other))
+                .iter()
+                .map(|comment| &comment.body)
+                .collect::<Vec<_>>(),
+            untagged
+                .iter()
+                .map(|comment| &comment.body)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn review_comment(id: u64, body: &str, in_reply_to_id: Option<u64>) -> ReviewComment {
+        ReviewComment {
+            id,
+            body: body.to_string(),
+            in_reply_to_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_findings_get_one_reply_in_each_of_their_threads() {
+        let mut github =
+            PublicationGitHub::new(serde_json::json!({"state": "OPEN", "mergedAt": null}));
+        github.review_comments = vec![
+            review_comment(1, "Lost update\n\n<!-- fiach-finding:P-1 -->", None),
+            review_comment(2, "Same bug elsewhere\n\n<!-- fiach-finding:P-1 -->", None),
+            review_comment(3, "Earlier reply <!-- fiach-resolved:P-1 -->", Some(2)),
+            review_comment(4, "Still open\n\n<!-- fiach-finding:P-2 -->", None),
+            review_comment(5, "Mentions <!-- fiach-finding:P-1 -->", Some(4)),
+            review_comment(6, "Untagged human comment", None),
+        ];
+        let mut resolved = resolved_change();
+        resolved.resolved[0].resolved_commit = Some("0123456789abcdef".to_string());
+        let mut config = disclose_config(ReportMode::PrComment);
+
+        config.review_verdicts = false;
+        let replies =
+            reply_to_resolved_threads(&github, publication_target(), &config, Some(&resolved))
+                .await
+                .unwrap();
+        assert_eq!(replies, 0);
+        assert!(github.calls.lock().unwrap().is_empty());
+
+        config.review_verdicts = true;
+        let replies =
+            reply_to_resolved_threads(&github, publication_target(), &config, Some(&resolved))
+                .await
+                .unwrap();
+        assert_eq!(replies, 1);
+        assert_eq!(
+            *github.replies.lock().unwrap(),
+            [(
+                1,
+                "Resolved in `0123456789ab`. A guard now rejects it.\n\n<!-- fiach-resolved:P-1 -->"
+                    .to_string()
+            )]
+        );
+
+        // Nothing resolved: no lookups at all.
+        github.calls.lock().unwrap().clear();
+        let replies = reply_to_resolved_threads(
+            &github,
+            publication_target(),
+            &config,
+            Some(&LedgerChange::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replies, 0);
+        assert!(github.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_prs_get_no_resolution_replies() {
+        let mut github = PublicationGitHub::new(
+            serde_json::json!({"state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z"}),
+        );
+        github.review_comments = vec![review_comment(
+            1,
+            "Lost update <!-- fiach-finding:P-1 -->",
+            None,
+        )];
+        let mut config = disclose_config(ReportMode::PrComment);
+        config.review_verdicts = true;
+        let replies = reply_to_resolved_threads(
+            &github,
+            publication_target(),
+            &config,
+            Some(&resolved_change()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replies, 0);
+        assert_eq!(*github.calls.lock().unwrap(), ["context"]);
     }
 
     #[test]

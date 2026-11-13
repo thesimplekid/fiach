@@ -6,7 +6,9 @@ use serde_json::Value;
 use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::{
-    forge::{DiscoveryRequest, Forge, ForgeFuture, PullRequestSummary, SyncPullRequest},
+    forge::{
+        DiscoveryRequest, Forge, ForgeFuture, PullRequestSummary, ReviewComment, SyncPullRequest,
+    },
     process::{CommandExt as _, LONG_COMMAND_TIMEOUT},
     reporting,
 };
@@ -211,6 +213,56 @@ impl Forge for GhCli {
         })
     }
 
+    fn review_comments<'a>(
+        &'a self,
+        repository: &'a str,
+        pr: u64,
+    ) -> ForgeFuture<'a, Vec<ReviewComment>> {
+        Box::pin(async move {
+            // One JSON object per line keeps paginated output parseable.
+            let output = self
+                .output(
+                    "gh",
+                    &[
+                        "api".into(),
+                        "--paginate".into(),
+                        format!("repos/{repository}/pulls/{pr}/comments"),
+                        "--jq".into(),
+                        ".[] | {id, body, in_reply_to_id}".into(),
+                    ],
+                    None,
+                )
+                .await?;
+            parse_review_comments(&output)
+        })
+    }
+
+    fn reply_to_review_comment<'a>(
+        &'a self,
+        repository: &'a str,
+        pr: u64,
+        comment: u64,
+        body: &'a str,
+    ) -> ForgeFuture<'a, ()> {
+        Box::pin(async move {
+            self.output_with_input(
+                "gh",
+                &[
+                    "api".into(),
+                    "--method".into(),
+                    "POST".into(),
+                    format!("repos/{repository}/pulls/{pr}/comments/{comment}/replies"),
+                    "--input".into(),
+                    "-".into(),
+                ],
+                None,
+                Some(&serde_json::to_vec(&serde_json::json!({"body": body}))?),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
     fn clone_workspace<'a>(
         &'a self,
         repository: &'a str,
@@ -259,6 +311,14 @@ impl Forge for GhCli {
             Ok(String::from_utf8_lossy(&output).trim().to_string())
         })
     }
+}
+
+fn parse_review_comments(output: &[u8]) -> Result<Vec<ReviewComment>> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).context("Failed to parse review comment"))
+        .collect()
 }
 
 fn split_repo_name(repo: &str) -> Result<(&str, &str)> {
@@ -491,6 +551,30 @@ impl GhCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paginated_review_comments_parse_line_by_line() {
+        let output = br#"{"id":1,"body":"root","in_reply_to_id":null}
+{"id":2,"body":"reply","in_reply_to_id":1}
+
+"#;
+        assert_eq!(
+            parse_review_comments(output).unwrap(),
+            vec![
+                ReviewComment {
+                    id: 1,
+                    body: "root".into(),
+                    in_reply_to_id: None,
+                },
+                ReviewComment {
+                    id: 2,
+                    body: "reply".into(),
+                    in_reply_to_id: Some(1),
+                },
+            ]
+        );
+        assert!(parse_review_comments(b"not json").is_err());
+    }
 
     #[test]
     fn parse_open_sync_prs_reads_base_branch() {
