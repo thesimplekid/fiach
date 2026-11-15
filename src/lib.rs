@@ -16,6 +16,7 @@ mod lane_selection;
 pub mod ledger;
 pub mod persona;
 pub mod process;
+pub mod repo_guidance;
 pub mod reporting;
 pub mod request_diagnostics;
 pub mod review;
