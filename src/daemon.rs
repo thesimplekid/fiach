@@ -804,28 +804,51 @@ fn latest_valid_mention(
 }
 
 /// Trusted mentions override the automatic backport exclusion. Freshness is
-/// checked separately against the last recorded review attempt.
+/// checked separately against the recorded review state.
 fn should_skip_backport(pr: &PullRequest, mention: Option<&ValidMention>) -> bool {
     mention.is_none()
         && (pr.head_ref_name.starts_with("backport-") || pr.title.starts_with("[Backport"))
 }
 
-/// A mention is a one-shot trigger: it only (re)starts a review when it is
-/// newer than the last recorded review attempt for this PR and review kind.
+/// Recorded review state a trigger mention is compared against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MentionState {
+    /// Time of the last recorded review attempt, successful or not.
+    last_attempt_ts: Option<i64>,
+    /// Newest mention a completed review has answered.
+    answered_mention_ts: Option<i64>,
+}
+
+impl MentionState {
+    fn from_record(record: Option<&crate::state::ReviewMetadata>) -> Self {
+        Self {
+            last_attempt_ts: record.map(|record| record.timestamp),
+            answered_mention_ts: record.and_then(crate::state::ReviewMetadata::answered_mention_ts),
+        }
+    }
+}
+
+/// A mention stays pending until a completed review answers it, and carries
+/// forward to new heads. At an unchanged head, only a mention newer than the
+/// last attempt restarts the review (and resets the retry budget); otherwise
+/// failed attempts keep their bounded retries.
 fn apply_mention_trigger(
     decision: crate::state::ReviewDecision,
     mention_ts: i64,
-    last_review_ts: Option<i64>,
+    state: MentionState,
 ) -> crate::state::ReviewDecision {
     use crate::state::ReviewDecision::{ReReview, RetryFailed, Skip};
 
-    let mention_is_fresh = last_review_ts.is_none_or(|last| mention_ts > last);
+    let newer_than_attempt = state.last_attempt_ts.is_none_or(|last| mention_ts > last);
+    let pending = state
+        .answered_mention_ts
+        .is_none_or(|answered| mention_ts > answered);
 
     match decision {
-        // Same commit already reviewed, but re-mentioned since: review again.
-        Skip | RetryFailed if mention_is_fresh => ReReview,
-        // New commit but nobody has re-mentioned since the last review.
-        ReReview if !mention_is_fresh => Skip,
+        // Same commit, re-mentioned since the last attempt: review again.
+        Skip | RetryFailed if newer_than_attempt => ReReview,
+        // New commit, but every mention has already been answered.
+        ReReview if !pending => Skip,
         other => other,
     }
 }
@@ -1115,6 +1138,7 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
                 retry_not_before: None,
                 failure_class: None,
                 needs_intervention: false,
+                answered_mention_ts: None,
             };
             let _ = crate::state::mark_reviewed(&params.db_path, repo, job.pr.number, &meta);
         }
@@ -1243,12 +1267,12 @@ async fn process_daemon_job(
                 // below still protects a live in-progress review.
                 Ok(crate::state::ReviewDecision::ReReview)
             } else if let Some(mention_ts) = mention_ts {
-                let last_review_ts =
+                let record =
                     crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
                         .ok()
-                        .flatten()
-                        .map(|meta| meta.timestamp);
-                let effective = apply_mention_trigger(decision, mention_ts, last_review_ts);
+                        .flatten();
+                let state = MentionState::from_record(record.as_ref());
+                let effective = apply_mention_trigger(decision, mention_ts, state);
                 if effective != decision {
                     tracing::info!(
                         repo = %repo,
@@ -1490,6 +1514,7 @@ async fn process_daemon_job(
                     retry_not_before: None,
                     failure_class: None,
                     needs_intervention: false,
+                    answered_mention_ts: None,
                 };
                 meta.schedule_failure(failure.class, fatal, params.max_review_retries);
                 let failure = failure.scheduled(&meta);
@@ -1521,9 +1546,13 @@ async fn process_daemon_job(
                 params.provider_circuit.record_success();
             }
 
-            let Some(outcome) = outcome else {
+            let Some(mut outcome) = outcome else {
                 return Ok(PrProcessStatus::Skipped);
             };
+            // A completed review answers the mention that triggered it.
+            // Persisting this through a failed finalization is harmless:
+            // state only keeps it for completed records.
+            outcome.completed.metadata.answered_mention_ts = mention_ts;
             let mut failed_finalization = outcome.completed.metadata.clone();
             if let Err(error) = ReviewFinalizer
                 .finalize(&finalization, outcome, cancel_token.clone())
@@ -3101,23 +3130,169 @@ mod tests {
     fn mention_trigger_is_one_shot() {
         use crate::state::ReviewDecision::*;
 
+        let completed_at = |ts| MentionState {
+            last_attempt_ts: Some(ts),
+            answered_mention_ts: Some(ts),
+        };
         // Never reviewed: any valid mention triggers.
-        assert_eq!(apply_mention_trigger(FirstReview, 100, None), FirstReview);
-        // Re-mentioned after a completed same-commit review: run again.
-        assert_eq!(apply_mention_trigger(Skip, 200, Some(100)), ReReview);
-        // Stale mention on an already-reviewed commit: stay skipped.
-        assert_eq!(apply_mention_trigger(Skip, 100, Some(200)), Skip);
-        // New commit but no fresh mention: do not auto re-review.
-        assert_eq!(apply_mention_trigger(ReReview, 100, Some(200)), Skip);
-        // New commit and fresh mention: review.
-        assert_eq!(apply_mention_trigger(ReReview, 300, Some(200)), ReReview);
-        // A fresh mention resets the whole-review attempt budget.
-        assert_eq!(apply_mention_trigger(RetryFailed, 300, Some(200)), ReReview);
-        // Failed attempts keep their retry budget without a new mention.
         assert_eq!(
-            apply_mention_trigger(RetryFailed, 100, Some(200)),
-            RetryFailed
+            apply_mention_trigger(FirstReview, 100, MentionState::default()),
+            FirstReview
         );
+        // Re-mentioned after a completed same-commit review: run again.
+        assert_eq!(
+            apply_mention_trigger(Skip, 200, completed_at(100)),
+            ReReview
+        );
+        // Stale mention on an already-reviewed commit: stay skipped.
+        assert_eq!(apply_mention_trigger(Skip, 100, completed_at(200)), Skip);
+        // New commit but no fresh mention: do not auto re-review.
+        assert_eq!(
+            apply_mention_trigger(ReReview, 100, completed_at(200)),
+            Skip
+        );
+        // New commit and fresh mention: review.
+        assert_eq!(
+            apply_mention_trigger(ReReview, 300, completed_at(200)),
+            ReReview
+        );
+    }
+
+    #[test]
+    fn failed_attempts_keep_mentions_pending() {
+        use crate::state::ReviewDecision::*;
+
+        // Mention at 150 answered by nothing yet; last attempt failed at 200.
+        let failed = MentionState {
+            last_attempt_ts: Some(200),
+            answered_mention_ts: Some(50),
+        };
+        // A mention newer than the failed attempt resets the retry budget.
+        assert_eq!(apply_mention_trigger(RetryFailed, 300, failed), ReReview);
+        assert_eq!(apply_mention_trigger(Skip, 300, failed), ReReview);
+        // Same head without a new mention: bounded retries still apply.
+        assert_eq!(apply_mention_trigger(RetryFailed, 150, failed), RetryFailed);
+        assert_eq!(apply_mention_trigger(Skip, 150, failed), Skip);
+        // New head: the unanswered mention carries forward.
+        assert_eq!(apply_mention_trigger(ReReview, 150, failed), ReReview);
+        // Never completed at all: still pending on a new head.
+        let never_completed = MentionState {
+            last_attempt_ts: Some(200),
+            answered_mention_ts: None,
+        };
+        assert_eq!(
+            apply_mention_trigger(ReReview, 150, never_completed),
+            ReReview
+        );
+    }
+
+    fn mention_record(
+        commit: &str,
+        status: crate::state::ReviewStatus,
+        timestamp: i64,
+        answered_mention_ts: Option<i64>,
+    ) -> crate::state::ReviewMetadata {
+        let mut record: crate::state::ReviewMetadata = serde_json::from_value(serde_json::json!({
+            "repository": "owner/repo", "pr_number": 42, "commit_hash": commit, "model": "test",
+            "timestamp": timestamp, "findings_count": 0, "status": status.as_str(),
+            "severity": "none", "pr_classification": "none", "review_retry_version": 1
+        }))
+        .unwrap();
+        record.answered_mention_ts = answered_mention_ts;
+        record
+    }
+
+    fn mention_decision(
+        db_path: &std::path::Path,
+        commit: &str,
+        mention_ts: i64,
+    ) -> crate::state::ReviewDecision {
+        let decision = crate::state::should_review_with_retry_limit(
+            db_path,
+            "owner/repo",
+            42,
+            commit,
+            crate::state::DEFAULT_REVIEW_KIND,
+            2_400,
+            0,
+        )
+        .unwrap();
+        let record = crate::state::get_pr_review(
+            db_path,
+            "owner/repo",
+            42,
+            crate::state::DEFAULT_REVIEW_KIND,
+        )
+        .unwrap();
+        apply_mention_trigger(
+            decision,
+            mention_ts,
+            MentionState::from_record(record.as_ref()),
+        )
+    }
+
+    #[test]
+    fn mention_survives_failure_until_a_review_completes() {
+        use crate::state::{ReviewDecision::*, ReviewStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("reviews.redb");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mention_ts = now - 1_000;
+
+        // A completed review at `a` answered an older mention.
+        let done = mention_record("a", ReviewStatus::None, now - 5_000, Some(now - 6_000));
+        crate::state::mark_reviewed(&db, "owner/repo", 42, &done).unwrap();
+        // A new mention, then a failed attempt at the same head.
+        let failed = mention_record("a", ReviewStatus::Failed, now - 900, None);
+        crate::state::mark_reviewed(&db, "owner/repo", 42, &failed).unwrap();
+        let stored =
+            crate::state::get_pr_review(&db, "owner/repo", 42, crate::state::DEFAULT_REVIEW_KIND)
+                .unwrap()
+                .unwrap();
+        // The failure carried the previously answered mention forward.
+        assert_eq!(stored.answered_mention_ts(), Some(now - 6_000));
+
+        // Same head with the retry budget exhausted (limit 0): skip, no loop.
+        assert_eq!(mention_decision(&db, "a", mention_ts), Skip);
+        // Same head, re-mentioned after the failure: retry.
+        assert_eq!(mention_decision(&db, "a", now - 100), ReReview);
+        // New push after the failure: the pending mention reviews the new head.
+        assert_eq!(mention_decision(&db, "b", mention_ts), ReReview);
+
+        // A claim on the new head must not consume the mention either.
+        assert!(
+            crate::state::lock_for_review(
+                &db,
+                "owner/repo",
+                42,
+                "b",
+                crate::state::DEFAULT_REVIEW_KIND,
+                2_400
+            )
+            .unwrap()
+        );
+        let claimed =
+            crate::state::get_pr_review(&db, "owner/repo", 42, crate::state::DEFAULT_REVIEW_KIND)
+                .unwrap()
+                .unwrap();
+        assert_eq!(claimed.answered_mention_ts(), Some(now - 6_000));
+
+        // The review at `b` completes and answers the mention.
+        let done = mention_record("b", ReviewStatus::None, now - 10, Some(mention_ts));
+        crate::state::mark_reviewed(&db, "owner/repo", 42, &done).unwrap();
+        // Another push without a new mention: skip.
+        assert_eq!(mention_decision(&db, "c", mention_ts), Skip);
+    }
+
+    #[test]
+    fn legacy_completed_records_answer_mentions_up_to_completion() {
+        use crate::state::ReviewStatus;
+
+        let completed = mention_record("a", ReviewStatus::Confirmed, 500, None);
+        assert_eq!(completed.answered_mention_ts(), Some(500));
+        let failed = mention_record("a", ReviewStatus::Failed, 500, None);
+        assert_eq!(failed.answered_mention_ts(), None);
     }
 
     #[test]
