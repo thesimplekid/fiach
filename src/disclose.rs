@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::forge::{Forge, SyncPullRequest};
+use crate::ledger::{LedgerChange, finding_marker, resolution_marker, withdrawal_marker};
 use crate::process::{CommandExt as _, LONG_COMMAND_TIMEOUT};
-use crate::reporting::{DisclosurePolicy, InlineComment, ReportingArtifact};
+use crate::reporting::{AcceptedFinding, DisclosurePolicy, InlineComment, ReportingArtifact};
 
 const PR_REACTION_TIMEOUT_SECS: u64 = 30;
 
@@ -50,7 +51,255 @@ pub struct DiscloseConfig {
     pub mode: ReportMode,
     pub sync_repo: Option<String>,
     pub notify_on_empty: bool,
+    /// Approve or request changes from the findings ledger, and post a
+    /// follow-up review when earlier findings are resolved.
+    pub review_verdicts: bool,
     pub reactions: ReactionConfig,
+}
+
+/// The event a structured PR review is submitted with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReviewEvent {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+/// Chooses the event from the findings ledger: any open finding requests
+/// changes, and none approves. Without a ledger only new findings count.
+fn review_event(
+    config: &DiscloseConfig,
+    ledger: Option<&LedgerChange>,
+    accepted: &[AcceptedFinding],
+) -> ReviewEvent {
+    if !config.review_verdicts {
+        return ReviewEvent::Comment;
+    }
+    match ledger {
+        Some(ledger) if !ledger.open.is_empty() => ReviewEvent::RequestChanges,
+        Some(_) => ReviewEvent::Approve,
+        None if !accepted.is_empty() => ReviewEvent::RequestChanges,
+        None => ReviewEvent::Comment,
+    }
+}
+
+/// Whether this review closed earlier findings, which is news for the PR
+/// even without new findings.
+fn closed_since_last_review(config: &DiscloseConfig, ledger: Option<&LedgerChange>) -> bool {
+    config.review_verdicts
+        && ledger.is_some_and(|ledger| !ledger.resolved.is_empty() || !ledger.withdrawn.is_empty())
+}
+
+/// Inline comments of the accepted findings, each tagged with the ledger
+/// entry recorded for its finding so a later review can reply in its thread.
+fn tagged_inline_comments(
+    accepted: &[AcceptedFinding],
+    ledger: Option<&LedgerChange>,
+) -> Vec<InlineComment> {
+    accepted
+        .iter()
+        .flat_map(|finding| {
+            let marker = ledger
+                .and_then(|ledger| {
+                    ledger.added.iter().find(|entry| {
+                        entry.source_finding_id.as_deref() == Some(finding.finding_id.as_str())
+                    })
+                })
+                .map(|entry| finding_marker(&entry.id));
+            finding
+                .inline_comments
+                .iter()
+                .cloned()
+                .map(move |mut comment| {
+                    if let Some(marker) = &marker {
+                        comment.body = format!("{}\n\n{marker}", comment.body);
+                    }
+                    comment
+                })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closure {
+    Resolved,
+    Withdrawn,
+}
+
+impl Closure {
+    fn marker(self, id: &str) -> String {
+        match self {
+            Self::Resolved => resolution_marker(id),
+            Self::Withdrawn => withdrawal_marker(id),
+        }
+    }
+}
+
+fn closure_reply(entry: &crate::ledger::LedgerEntry, closure: Closure, commit: &str) -> String {
+    let commit = entry.resolved_commit.as_deref().unwrap_or(commit);
+    let short = commit.get(..12).unwrap_or(commit);
+    let mut body = match closure {
+        Closure::Resolved => format!("Resolved in `{short}`."),
+        Closure::Withdrawn => {
+            format!("Withdrawn: this finding was incorrect (rechecked at `{short}`).")
+        }
+    };
+    if let Some(resolution) = entry
+        .resolution
+        .as_deref()
+        .filter(|resolution| !resolution.is_empty())
+    {
+        body.push(' ');
+        body.push_str(resolution);
+    }
+    body.push_str("\n\n");
+    body.push_str(&closure.marker(&entry.id));
+    body
+}
+
+/// Replies in the inline thread of each finding this review resolved or
+/// withdrew. Threads that already carry the reply are skipped, so a retry
+/// does not repeat it.
+async fn reply_to_closed_threads(
+    github: &dyn Forge,
+    target: DisclosureTarget<'_>,
+    config: &DiscloseConfig,
+    ledger: Option<&LedgerChange>,
+) -> Result<usize> {
+    let Some(ledger) = ledger.filter(|_| closed_since_last_review(config, ledger)) else {
+        return Ok(0);
+    };
+    if !live_comments_allowed(github, target.repo, target.pr_number).await? {
+        return Ok(0);
+    }
+    let comments = github
+        .review_comments(target.repo, target.pr_number)
+        .await
+        .context("Failed to list review comments")?;
+    let closed = ledger
+        .resolved
+        .iter()
+        .map(|entry| (entry, Closure::Resolved))
+        .chain(
+            ledger
+                .withdrawn
+                .iter()
+                .map(|entry| (entry, Closure::Withdrawn)),
+        );
+    let mut replies = 0;
+    for (entry, closure) in closed {
+        let marker = finding_marker(&entry.id);
+        let done = closure.marker(&entry.id);
+        for root in comments
+            .iter()
+            .filter(|comment| comment.in_reply_to_id.is_none() && comment.body.contains(&marker))
+        {
+            if comments.iter().any(|comment| {
+                comment.in_reply_to_id == Some(root.id) && comment.body.contains(&done)
+            }) {
+                continue;
+            }
+            github
+                .reply_to_review_comment(
+                    target.repo,
+                    target.pr_number,
+                    root.id,
+                    &closure_reply(entry, closure, target.commit_hash),
+                )
+                .await
+                .with_context(|| format!("Failed to reply to review comment {}", root.id))?;
+            replies += 1;
+        }
+    }
+    Ok(replies)
+}
+
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{count} {word}s")
+    }
+}
+
+/// The review summary, led by the verdict and ledger changes when verdicts
+/// are enabled.
+fn structured_review_body(
+    config: &DiscloseConfig,
+    event: ReviewEvent,
+    accepted: &[AcceptedFinding],
+    ledger: Option<&LedgerChange>,
+) -> String {
+    if !config.review_verdicts {
+        return crate::reporting::review_summary_body(accepted);
+    }
+    let added = ledger.map_or(accepted.len(), |ledger| ledger.added.len());
+    let open = ledger.map_or(accepted.len(), |ledger| ledger.open.len());
+    let resolved = ledger.map_or(&[][..], |ledger| ledger.resolved.as_slice());
+    let withdrawn = ledger.map_or(&[][..], |ledger| ledger.withdrawn.as_slice());
+    let mut body = match event {
+        ReviewEvent::RequestChanges => format!(
+            "**Request changes.** {} ({added} new).",
+            plural(open, "open finding")
+        ),
+        ReviewEvent::Approve => "**Approve.** No open findings.".to_string(),
+        ReviewEvent::Comment => format!("{}.", plural(open, "open finding")),
+    };
+    if !resolved.is_empty() {
+        body.push_str(&format!(
+            " {} since the last review.",
+            plural(resolved.len(), "finding resolved")
+        ));
+    }
+    if !withdrawn.is_empty() {
+        body.push_str(&format!(
+            " {} as incorrect.",
+            plural(withdrawn.len(), "finding withdrawn")
+        ));
+    }
+    body.push_str("\n\n");
+    for (heading, entries) in [
+        ("Resolved since the last review:", resolved),
+        ("Withdrawn as incorrect:", withdrawn),
+    ] {
+        if entries.is_empty() {
+            continue;
+        }
+        body.push_str(heading);
+        body.push_str("\n\n");
+        for entry in entries {
+            body.push_str(&format!("- **{}** (`{}`)", entry.title, entry.id));
+            if let Some(resolution) = entry.resolution.as_deref() {
+                body.push_str(&format!(": {resolution}"));
+            }
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    let still_open = ledger
+        .map(|ledger| {
+            ledger
+                .open
+                .iter()
+                .filter(|entry| !ledger.added.iter().any(|added| added.id == entry.id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !still_open.is_empty() {
+        body.push_str("Still open from earlier reviews:\n\n");
+        for entry in still_open {
+            body.push_str(&format!(
+                "- **{}** (`{}`, {})\n",
+                entry.title, entry.id, entry.severity
+            ));
+        }
+        body.push('\n');
+    }
+    if !accepted.is_empty() {
+        body.push_str(&crate::reporting::review_summary_body(accepted));
+    }
+    body.trim_end().to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -226,8 +475,16 @@ pub async fn handle_structured_disclosure(
     policy: &DisclosurePolicy,
     config: &DiscloseConfig,
 ) -> Result<Option<String>> {
-    handle_structured_disclosure_idempotent(report_path, target, artifact, policy, config, false)
-        .await
+    handle_structured_disclosure_idempotent(
+        report_path,
+        target,
+        artifact,
+        policy,
+        config,
+        None,
+        false,
+    )
+    .await
 }
 
 pub async fn handle_structured_disclosure_idempotent(
@@ -236,9 +493,10 @@ pub async fn handle_structured_disclosure_idempotent(
     artifact: &ReportingArtifact,
     policy: &DisclosurePolicy,
     config: &DiscloseConfig,
+    ledger: Option<&LedgerChange>,
     recovering: bool,
 ) -> Result<Option<String>> {
-    match structured_disclosure_route(target, artifact, policy, config) {
+    match structured_disclosure_route(target, artifact, policy, config, ledger) {
         StructuredDisclosureRoute::Local => {
             tracing::info!("ReportMode is Local. Report saved to {:?}", report_path);
             Ok(Some(report_path.to_string_lossy().to_string()))
@@ -246,24 +504,47 @@ pub async fn handle_structured_disclosure_idempotent(
         StructuredDisclosureRoute::Skip => Ok(None),
         StructuredDisclosureRoute::PrReview => {
             let accepted = artifact.publishable_findings(policy);
-            let comments = accepted
-                .iter()
-                .flat_map(|finding| finding.inline_comments.clone())
-                .collect::<Vec<_>>();
+            let comments = tagged_inline_comments(&accepted, ledger);
             let marker = disclosure_marker(target, config);
+            let event = review_event(config, ledger, &accepted);
             let body = format!(
                 "{}\n\n{marker}",
-                crate::reporting::review_summary_body(&accepted)
+                structured_review_body(config, event, &accepted, ledger)
             );
-            post_pr_review(
-                crate::forge::client(target.repo)?.adapter(),
+            let client = crate::forge::client(target.repo)?;
+            let github = client.adapter();
+            let url = post_pr_review(
+                github,
                 target,
-                &body,
-                comments,
-                &marker,
+                ReviewPost {
+                    event,
+                    body: &body,
+                    comments,
+                    marker: &marker,
+                },
                 recovering,
             )
-            .await
+            .await?;
+            if url.is_some() {
+                // The review already records the resolution; a failed reply
+                // must not fail the disclosure.
+                match reply_to_closed_threads(github, target, config, ledger).await {
+                    Ok(0) => {}
+                    Ok(replies) => tracing::info!(
+                        repo = %target.repo,
+                        pr = target.pr_number,
+                        replies,
+                        "Replied in resolved finding threads"
+                    ),
+                    Err(error) => tracing::warn!(
+                        repo = %target.repo,
+                        pr = target.pr_number,
+                        error = %format!("{error:#}"),
+                        "Could not reply in resolved finding threads"
+                    ),
+                }
+            }
+            Ok(url)
         }
         StructuredDisclosureRoute::SyncPr => {
             let sync_repo = config
@@ -297,6 +578,7 @@ fn structured_disclosure_route(
     artifact: &ReportingArtifact,
     policy: &DisclosurePolicy,
     config: &DiscloseConfig,
+    ledger: Option<&LedgerChange>,
 ) -> StructuredDisclosureRoute {
     if artifact.is_incomplete() && config.mode != ReportMode::Local {
         tracing::info!("Review incomplete; skipping disclosure");
@@ -306,17 +588,19 @@ fn structured_disclosure_route(
     let duplicate_only =
         accepted_pr_findings.is_empty() && !artifact.already_reported_findings(policy).is_empty();
     let findings_found = !accepted_pr_findings.is_empty() && !artifact.verifier_failed;
+    // A verified resolution is news for the PR even without new findings.
+    let resolved = closed_since_last_review(config, ledger);
 
     match config.mode {
         ReportMode::Local => StructuredDisclosureRoute::Local,
         ReportMode::PrComment => {
-            if duplicate_only {
+            if duplicate_only && !resolved {
                 tracing::info!(
                     "All verified PR findings were already reported; skipping PR review"
                 );
                 return StructuredDisclosureRoute::Skip;
             }
-            if !findings_found && !config.notify_on_empty {
+            if !findings_found && !config.notify_on_empty && !resolved {
                 tracing::info!("No verified findings approved for disclosure; skipping PR review");
                 return StructuredDisclosureRoute::Skip;
             }
@@ -345,7 +629,7 @@ fn structured_disclosure_route(
                 return StructuredDisclosureRoute::Skip;
             }
 
-            if duplicate_only {
+            if duplicate_only && !resolved {
                 tracing::info!(
                     "All verified PR findings were already reported; skipping hybrid PR disclosure"
                 );
@@ -371,7 +655,7 @@ fn structured_disclosure_route(
 
             if is_security_review_kind(target.review_kind) && non_pr_findings > 0 {
                 StructuredDisclosureRoute::SyncPr
-            } else if config.notify_on_empty && policy.pr_context.comments_allowed() {
+            } else if (config.notify_on_empty || resolved) && policy.pr_context.comments_allowed() {
                 StructuredDisclosureRoute::PrReview
             } else {
                 StructuredDisclosureRoute::Skip
@@ -473,19 +757,27 @@ struct ReviewCommentPayload {
 #[derive(Serialize)]
 struct ReviewPayload {
     commit_id: String,
-    event: &'static str,
+    event: ReviewEvent,
     body: String,
     comments: Vec<ReviewCommentPayload>,
 }
 
+struct ReviewPost<'a> {
+    event: ReviewEvent,
+    body: &'a str,
+    comments: Vec<InlineComment>,
+    marker: &'a str,
+}
+
 fn review_payload(
     target: DisclosureTarget<'_>,
+    event: ReviewEvent,
     body: &str,
     comments: Vec<InlineComment>,
 ) -> ReviewPayload {
     ReviewPayload {
         commit_id: target.commit_hash.to_string(),
-        event: "COMMENT",
+        event,
         body: body.to_string(),
         comments: comments
             .into_iter()
@@ -499,12 +791,15 @@ fn review_payload(
     }
 }
 
+fn verdict_refused(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("422") || message.contains("own pull request")
+}
+
 async fn post_pr_review(
     github: &dyn Forge,
     target: DisclosureTarget<'_>,
-    body: &str,
-    comments: Vec<InlineComment>,
-    marker: &str,
+    review: ReviewPost<'_>,
     recovering: bool,
 ) -> Result<Option<String>> {
     let repo = target.repo;
@@ -512,24 +807,46 @@ async fn post_pr_review(
     tracing::info!(
         repo = %repo,
         pr = pr_number,
-        comments = comments.len(),
+        comments = review.comments.len(),
+        event = ?review.event,
         "Posting structured PR review"
     );
 
-    if let Some(url) = find_existing_disclosure(github, repo, pr_number, marker, recovering).await?
+    if let Some(url) =
+        find_existing_disclosure(github, repo, pr_number, review.marker, recovering).await?
     {
         tracing::info!(repo = %repo, pr = pr_number, url = %url, "Reusing existing structured PR review");
         return Ok(Some(url));
     }
 
-    let payload = review_payload(target, body, comments);
-
     if !live_comments_allowed(github, repo, pr_number).await? {
         return Ok(None);
     }
-    let value = github
+    let payload = review_payload(target, review.event, review.body, review.comments.clone());
+    let value = match github
         .publish_review(repo, pr_number, &serde_json::to_value(payload)?)
-        .await?;
+        .await
+    {
+        Ok(value) => value,
+        // Forges refuse a verdict on the reviewer's own PR; keep the findings.
+        // Only a definite refusal falls back, so a review that may have been
+        // created is never posted twice.
+        Err(error) if review.event != ReviewEvent::Comment && verdict_refused(&error) => {
+            tracing::warn!(
+                repo = %repo,
+                pr = pr_number,
+                event = ?review.event,
+                error = %error,
+                "Review verdict refused; posting the review as a comment"
+            );
+            let payload =
+                review_payload(target, ReviewEvent::Comment, review.body, review.comments);
+            github
+                .publish_review(repo, pr_number, &serde_json::to_value(payload)?)
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
     let url = value
         .get("html_url")
         .and_then(|value| value.as_str())
@@ -1146,14 +1463,21 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::forge::{DiscoveryRequest, ForgeFuture, PullRequestSummary, SyncPullRequest};
+    use crate::forge::{
+        DiscoveryRequest, ForgeFuture, PullRequestSummary, ReviewComment, SyncPullRequest,
+    };
 
     struct PublicationGitHub {
         lifecycle: serde_json::Value,
         fail_context: bool,
         existing: bool,
+        /// Refuses verdict events the way a forge refuses them on the
+        /// reviewer's own PR.
+        refuse_verdicts: bool,
         calls: std::sync::Mutex<Vec<&'static str>>,
         payload: std::sync::Mutex<Option<serde_json::Value>>,
+        review_comments: Vec<ReviewComment>,
+        replies: std::sync::Mutex<Vec<(u64, String)>>,
     }
 
     impl PublicationGitHub {
@@ -1162,8 +1486,11 @@ mod tests {
                 lifecycle,
                 fail_context: false,
                 existing: false,
+                refuse_verdicts: false,
                 calls: Default::default(),
                 payload: Default::default(),
+                review_comments: Vec::new(),
+                replies: Default::default(),
             }
         }
     }
@@ -1196,6 +1523,9 @@ mod tests {
         ) -> ForgeFuture<'a, serde_json::Value> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("publish");
+                if self.refuse_verdicts && payload["event"] != "COMMENT" {
+                    bail!("Can not approve your own pull request (HTTP 422)");
+                }
                 *self.payload.lock().unwrap() = Some(payload.clone());
                 Ok(serde_json::json!({"html_url": "published"}))
             })
@@ -1211,6 +1541,32 @@ mod tests {
         }
         fn post_comment<'a>(&'a self, _: &'a str, _: u64, _: &'a str) -> ForgeFuture<'a, String> {
             panic!("unexpected comment")
+        }
+        fn review_comments<'a>(
+            &'a self,
+            _: &'a str,
+            _: u64,
+        ) -> ForgeFuture<'a, Vec<ReviewComment>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("review_comments");
+                Ok(self.review_comments.clone())
+            })
+        }
+        fn reply_to_review_comment<'a>(
+            &'a self,
+            _: &'a str,
+            _: u64,
+            comment: u64,
+            body: &'a str,
+        ) -> ForgeFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("reply");
+                self.replies
+                    .lock()
+                    .unwrap()
+                    .push((comment, body.to_string()));
+                Ok(())
+            })
         }
         fn clone_workspace<'a>(&'a self, _: &'a str, _: u64, _: &'a Path) -> ForgeFuture<'a, ()> {
             panic!("unexpected clone")
@@ -1236,16 +1592,9 @@ mod tests {
         );
         for recovering in [false, true] {
             github.calls.lock().unwrap().clear();
-            let url = post_pr_review(
-                &github,
-                publication_target(),
-                "summary",
-                vec![],
-                "marker",
-                recovering,
-            )
-            .await
-            .unwrap();
+            let url = post_pr_review(&github, publication_target(), comment_post(), recovering)
+                .await
+                .unwrap();
             assert_eq!(url.as_deref(), Some("published"));
             assert_eq!(
                 *github.calls.lock().unwrap(),
@@ -1268,17 +1617,10 @@ mod tests {
         ] {
             let github = PublicationGitHub::new(lifecycle);
             assert!(
-                post_pr_review(
-                    &github,
-                    publication_target(),
-                    "summary",
-                    vec![],
-                    "marker",
-                    false
-                )
-                .await
-                .unwrap()
-                .is_none()
+                post_pr_review(&github, publication_target(), comment_post(), false)
+                    .await
+                    .unwrap()
+                    .is_none()
             );
             assert!(
                 post_pr_comment(&github, report.path(), "owner/repo", 42, "marker", false)
@@ -1308,16 +1650,9 @@ mod tests {
             github.fail_context = github.lifecycle["state"] == "OPEN"
                 && github.lifecycle.get("mergedAt") == Some(&serde_json::Value::Null);
             assert!(
-                post_pr_review(
-                    &github,
-                    publication_target(),
-                    "summary",
-                    vec![],
-                    "marker",
-                    true
-                )
-                .await
-                .is_err()
+                post_pr_review(&github, publication_target(), comment_post(), true)
+                    .await
+                    .is_err()
             );
             assert!(
                 post_pr_comment(&github, report.path(), "owner/repo", 42, "marker", true)
@@ -1329,17 +1664,10 @@ mod tests {
             github.existing = true;
             github.calls.lock().unwrap().clear();
             assert_eq!(
-                post_pr_review(
-                    &github,
-                    publication_target(),
-                    "summary",
-                    vec![],
-                    "marker",
-                    true
-                )
-                .await
-                .unwrap()
-                .as_deref(),
+                post_pr_review(&github, publication_target(), comment_post(), true)
+                    .await
+                    .unwrap()
+                    .as_deref(),
                 Some("existing")
             );
             assert_eq!(*github.calls.lock().unwrap(), ["discussion"]);
@@ -1362,7 +1690,13 @@ mod tests {
                 body: "Finding".to_string(),
             }],
         ] {
-            let value = serde_json::to_value(review_payload(target, "Summary", comments)).unwrap();
+            let value = serde_json::to_value(review_payload(
+                target,
+                ReviewEvent::Comment,
+                "Summary",
+                comments,
+            ))
+            .unwrap();
             assert_eq!(value["commit_id"], "reviewed-sha");
             assert_eq!(value["event"], "COMMENT");
             if !value["comments"].as_array().unwrap().is_empty() {
@@ -1400,11 +1734,21 @@ mod tests {
         }
     }
 
+    fn comment_post() -> ReviewPost<'static> {
+        ReviewPost {
+            event: ReviewEvent::Comment,
+            body: "summary",
+            comments: vec![],
+            marker: "marker",
+        }
+    }
+
     fn disclose_config(mode: ReportMode) -> DiscloseConfig {
         DiscloseConfig {
             mode,
             sync_repo: Some("owner/security-sync".to_string()),
             notify_on_empty: false,
+            review_verdicts: false,
             reactions: ReactionConfig::default(),
         }
     }
@@ -1493,6 +1837,361 @@ mod tests {
         artifact
     }
 
+    fn ledger_entry(id: &str, title: &str) -> crate::ledger::LedgerEntry {
+        crate::ledger::LedgerEntry {
+            id: id.to_string(),
+            review_kind: "pr-review".to_string(),
+            title: title.to_string(),
+            severity: "high".to_string(),
+            affected_locations: Vec::new(),
+            body: "body".to_string(),
+            first_commit: "c1".to_string(),
+            status: crate::ledger::EntryStatus::Open,
+            resolved_commit: None,
+            resolution: None,
+            source_finding_id: None,
+        }
+    }
+
+    fn resolved_change() -> LedgerChange {
+        let mut resolved = ledger_entry("P-1", "Lost update");
+        resolved.status = crate::ledger::EntryStatus::Resolved;
+        resolved.resolution = Some("A guard now rejects it.".to_string());
+        LedgerChange {
+            added: Vec::new(),
+            resolved: vec![resolved],
+            withdrawn: Vec::new(),
+            open: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn verdicts_follow_the_ledger_only_when_enabled() {
+        let mut config = disclose_config(ReportMode::PrComment);
+        let accepted = artifact(true).publishable_findings(&policy());
+        let open = LedgerChange {
+            added: vec![ledger_entry("P-2", "Bug")],
+            resolved: Vec::new(),
+            withdrawn: Vec::new(),
+            open: vec![
+                ledger_entry("P-1", "Lost update"),
+                ledger_entry("P-2", "Bug"),
+            ],
+        };
+        assert_eq!(
+            review_event(&config, Some(&open), &accepted),
+            ReviewEvent::Comment
+        );
+        config.review_verdicts = true;
+        assert_eq!(
+            review_event(&config, Some(&open), &accepted),
+            ReviewEvent::RequestChanges
+        );
+        assert_eq!(
+            review_event(&config, Some(&resolved_change()), &[]),
+            ReviewEvent::Approve
+        );
+        // Without a ledger, only new findings can decide the verdict.
+        assert_eq!(
+            review_event(&config, None, &accepted),
+            ReviewEvent::RequestChanges
+        );
+        assert_eq!(review_event(&config, None, &[]), ReviewEvent::Comment);
+
+        let body =
+            structured_review_body(&config, ReviewEvent::RequestChanges, &accepted, Some(&open));
+        assert!(body.starts_with("**Request changes.** 2 open findings (1 new)."));
+        assert!(
+            body.contains("Still open from earlier reviews:\n\n- **Lost update** (`P-1`, high)")
+        );
+        assert!(!body.contains("(`P-2`, high)"));
+        assert!(body.contains("Verified findings approved for disclosure"));
+
+        let body =
+            structured_review_body(&config, ReviewEvent::Approve, &[], Some(&resolved_change()));
+        assert_eq!(
+            body,
+            "**Approve.** No open findings. 1 finding resolved since the last review.\n\nResolved since the last review:\n\n- **Lost update** (`P-1`): A guard now rejects it."
+        );
+
+        config.review_verdicts = false;
+        assert_eq!(
+            structured_review_body(&config, ReviewEvent::Comment, &accepted, Some(&open)),
+            crate::reporting::review_summary_body(&accepted)
+        );
+    }
+
+    #[test]
+    fn resolved_findings_post_a_follow_up_only_with_review_verdicts() {
+        let resolved = resolved_change();
+        for mode in [ReportMode::PrComment, ReportMode::Hybrid] {
+            let mut config = disclose_config(mode);
+            for artifact in [no_findings_artifact(), duplicate_artifact()] {
+                config.review_verdicts = false;
+                assert_eq!(
+                    structured_disclosure_route(
+                        target("pr-review"),
+                        &artifact,
+                        &policy(),
+                        &config,
+                        Some(&resolved),
+                    ),
+                    StructuredDisclosureRoute::Skip
+                );
+                config.review_verdicts = true;
+                assert_eq!(
+                    structured_disclosure_route(
+                        target("pr-review"),
+                        &artifact,
+                        &policy(),
+                        &config,
+                        Some(&resolved),
+                    ),
+                    StructuredDisclosureRoute::PrReview
+                );
+                // Nothing changed: no new findings and nothing resolved.
+                assert_eq!(
+                    structured_disclosure_route(
+                        target("pr-review"),
+                        &artifact,
+                        &policy(),
+                        &config,
+                        Some(&LedgerChange::default()),
+                    ),
+                    StructuredDisclosureRoute::Skip
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_verdict_is_posted_as_a_comment_review() {
+        let mut github =
+            PublicationGitHub::new(serde_json::json!({"state": "OPEN", "mergedAt": null}));
+        github.refuse_verdicts = true;
+        let review = ReviewPost {
+            event: ReviewEvent::RequestChanges,
+            ..comment_post()
+        };
+        let url = post_pr_review(&github, publication_target(), review, false)
+            .await
+            .unwrap();
+        assert_eq!(url.as_deref(), Some("published"));
+        assert_eq!(
+            *github.calls.lock().unwrap(),
+            ["discussion", "context", "publish", "publish"]
+        );
+        assert_eq!(
+            github.payload.lock().unwrap().as_ref().unwrap()["event"],
+            "COMMENT"
+        );
+
+        github.refuse_verdicts = false;
+        github.calls.lock().unwrap().clear();
+        let review = ReviewPost {
+            event: ReviewEvent::Approve,
+            ..comment_post()
+        };
+        post_pr_review(&github, publication_target(), review, false)
+            .await
+            .unwrap();
+        assert_eq!(github.calls.lock().unwrap().len(), 3);
+        assert_eq!(
+            github.payload.lock().unwrap().as_ref().unwrap()["event"],
+            "APPROVE"
+        );
+    }
+
+    #[test]
+    fn inline_comments_carry_the_ledger_entry_recorded_for_their_finding() {
+        let accepted = artifact(true).publishable_findings(&policy());
+        assert!(!accepted.is_empty());
+        let untagged = tagged_inline_comments(&accepted, None);
+        assert!(!untagged.is_empty());
+        assert!(
+            untagged
+                .iter()
+                .all(|comment| !comment.body.contains("fiach-finding"))
+        );
+
+        let mut entry = ledger_entry("P-3", "Bug");
+        entry.source_finding_id = Some(accepted[0].finding_id.clone());
+        let change = LedgerChange {
+            added: vec![entry],
+            resolved: Vec::new(),
+            withdrawn: Vec::new(),
+            open: Vec::new(),
+        };
+        let tagged = tagged_inline_comments(&accepted, Some(&change));
+        assert_eq!(tagged.len(), untagged.len());
+        for (tagged, untagged) in tagged.iter().zip(&untagged) {
+            assert_eq!(
+                tagged.body,
+                format!("{}\n\n<!-- fiach-finding:P-3 -->", untagged.body)
+            );
+            assert_eq!((&tagged.path, tagged.line), (&untagged.path, untagged.line));
+        }
+
+        // An entry recorded for another finding does not tag these comments.
+        let mut other = change.clone();
+        other.added[0].source_finding_id = Some("F-other".to_string());
+        assert_eq!(
+            tagged_inline_comments(&accepted, Some(&other))
+                .iter()
+                .map(|comment| &comment.body)
+                .collect::<Vec<_>>(),
+            untagged
+                .iter()
+                .map(|comment| &comment.body)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn review_comment(id: u64, body: &str, in_reply_to_id: Option<u64>) -> ReviewComment {
+        ReviewComment {
+            id,
+            body: body.to_string(),
+            in_reply_to_id,
+            author: Some("fiach-bot".to_string()),
+            author_association: Some("NONE".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_findings_get_one_reply_in_each_of_their_threads() {
+        let mut github =
+            PublicationGitHub::new(serde_json::json!({"state": "OPEN", "mergedAt": null}));
+        github.review_comments = vec![
+            review_comment(1, "Lost update\n\n<!-- fiach-finding:P-1 -->", None),
+            review_comment(2, "Same bug elsewhere\n\n<!-- fiach-finding:P-1 -->", None),
+            review_comment(3, "Earlier reply <!-- fiach-resolved:P-1 -->", Some(2)),
+            review_comment(4, "Still open\n\n<!-- fiach-finding:P-2 -->", None),
+            review_comment(5, "Mentions <!-- fiach-finding:P-1 -->", Some(4)),
+            review_comment(6, "Untagged human comment", None),
+        ];
+        let mut resolved = resolved_change();
+        resolved.resolved[0].resolved_commit = Some("0123456789abcdef".to_string());
+        let mut config = disclose_config(ReportMode::PrComment);
+
+        config.review_verdicts = false;
+        let replies =
+            reply_to_closed_threads(&github, publication_target(), &config, Some(&resolved))
+                .await
+                .unwrap();
+        assert_eq!(replies, 0);
+        assert!(github.calls.lock().unwrap().is_empty());
+
+        config.review_verdicts = true;
+        let replies =
+            reply_to_closed_threads(&github, publication_target(), &config, Some(&resolved))
+                .await
+                .unwrap();
+        assert_eq!(replies, 1);
+        assert_eq!(
+            *github.replies.lock().unwrap(),
+            [(
+                1,
+                "Resolved in `0123456789ab`. A guard now rejects it.\n\n<!-- fiach-resolved:P-1 -->"
+                    .to_string()
+            )]
+        );
+
+        // Nothing resolved: no lookups at all.
+        github.calls.lock().unwrap().clear();
+        let replies = reply_to_closed_threads(
+            &github,
+            publication_target(),
+            &config,
+            Some(&LedgerChange::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replies, 0);
+        assert!(github.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn withdrawn_findings_are_announced_in_their_threads_and_the_review() {
+        let mut github =
+            PublicationGitHub::new(serde_json::json!({"state": "OPEN", "mergedAt": null}));
+        github.review_comments = vec![
+            review_comment(1, "Race\n\n<!-- fiach-finding:P-2 -->", None),
+            review_comment(2, "Not a bug: the caller locks.", Some(1)),
+        ];
+        let mut withdrawn = ledger_entry("P-2", "Race");
+        withdrawn.status = crate::ledger::EntryStatus::Withdrawn;
+        withdrawn.resolved_commit = Some("0123456789abcdef".to_string());
+        withdrawn.resolution = Some("The caller already holds the lock.".to_string());
+        let change = LedgerChange {
+            withdrawn: vec![withdrawn],
+            ..LedgerChange::default()
+        };
+        let mut config = disclose_config(ReportMode::PrComment);
+        config.review_verdicts = true;
+
+        assert_eq!(
+            structured_disclosure_route(
+                target("pr-review"),
+                &no_findings_artifact(),
+                &policy(),
+                &config,
+                Some(&change),
+            ),
+            StructuredDisclosureRoute::PrReview
+        );
+        assert_eq!(
+            structured_review_body(&config, ReviewEvent::Approve, &[], Some(&change)),
+            "**Approve.** No open findings. 1 finding withdrawn as incorrect.\n\nWithdrawn as incorrect:\n\n- **Race** (`P-2`): The caller already holds the lock."
+        );
+
+        let replies =
+            reply_to_closed_threads(&github, publication_target(), &config, Some(&change))
+                .await
+                .unwrap();
+        assert_eq!(replies, 1);
+        assert_eq!(
+            *github.replies.lock().unwrap(),
+            [(
+                1,
+                "Withdrawn: this finding was incorrect (rechecked at `0123456789ab`). The caller already holds the lock.\n\n<!-- fiach-withdrawn:P-2 -->"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_prs_get_no_resolution_replies() {
+        let mut github = PublicationGitHub::new(
+            serde_json::json!({"state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z"}),
+        );
+        github.review_comments = vec![review_comment(
+            1,
+            "Lost update <!-- fiach-finding:P-1 -->",
+            None,
+        )];
+        let mut config = disclose_config(ReportMode::PrComment);
+        config.review_verdicts = true;
+        let replies = reply_to_closed_threads(
+            &github,
+            publication_target(),
+            &config,
+            Some(&resolved_change()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replies, 0);
+        assert_eq!(*github.calls.lock().unwrap(), ["context"]);
+    }
+
+    #[test]
+    fn only_definite_refusals_fall_back_to_comment_reviews() {
+        assert!(verdict_refused(&anyhow::anyhow!(
+            "gh: Can not request changes on your own pull request (HTTP 422)"
+        )));
+        assert!(!verdict_refused(&anyhow::anyhow!("operation timed out")));
+        assert!(!verdict_refused(&anyhow::anyhow!("HTTP 502 Bad Gateway")));
+    }
+
     #[test]
     fn incomplete_review_skips_disclosure_even_when_notify_on_empty() {
         for mode in [
@@ -1505,13 +2204,25 @@ mod tests {
             let mut artifact = artifact(true);
             artifact.budget_exhausted = Some(crate::reporting::ReviewPhase::Finder);
             assert_eq!(
-                structured_disclosure_route(target("security"), &artifact, &policy(), &config),
+                structured_disclosure_route(
+                    target("security"),
+                    &artifact,
+                    &policy(),
+                    &config,
+                    None
+                ),
                 StructuredDisclosureRoute::Skip
             );
             artifact.budget_exhausted = None;
             artifact.verifier_failed = true;
             assert_eq!(
-                structured_disclosure_route(target("security"), &artifact, &policy(), &config),
+                structured_disclosure_route(
+                    target("security"),
+                    &artifact,
+                    &policy(),
+                    &config,
+                    None
+                ),
                 StructuredDisclosureRoute::Skip
             );
         }
@@ -1524,6 +2235,7 @@ mod tests {
             &artifact(true),
             &policy(),
             &disclose_config(ReportMode::Hybrid),
+            None,
         );
 
         assert_eq!(route, StructuredDisclosureRoute::PrReview);
@@ -1536,6 +2248,7 @@ mod tests {
             &artifact(false),
             &policy(),
             &disclose_config(ReportMode::Hybrid),
+            None,
         );
 
         assert_eq!(route, StructuredDisclosureRoute::SyncPr);
@@ -1548,6 +2261,7 @@ mod tests {
             &artifact(false),
             &policy(),
             &disclose_config(ReportMode::Hybrid),
+            None,
         );
 
         assert_eq!(route, StructuredDisclosureRoute::Skip);
@@ -1563,6 +2277,7 @@ mod tests {
             &duplicate_artifact(),
             &policy(),
             &config,
+            None,
         );
 
         assert_eq!(route, StructuredDisclosureRoute::Skip);
@@ -1624,6 +2339,7 @@ mod tests {
             &artifact,
             &policy(),
             &disclose_config(ReportMode::PrComment),
+            None,
         );
 
         assert_eq!(route, StructuredDisclosureRoute::PrReview);
@@ -1645,6 +2361,7 @@ mod tests {
                 &introduced,
                 &policy,
                 &disclose_config(ReportMode::Local),
+                None,
             ),
             StructuredDisclosureRoute::Local
         );
@@ -1654,6 +2371,7 @@ mod tests {
                 &introduced,
                 &policy,
                 &disclose_config(ReportMode::PrComment),
+                None,
             ),
             StructuredDisclosureRoute::PrReview
         );
@@ -1663,6 +2381,7 @@ mod tests {
                 &introduced,
                 &policy,
                 &disclose_config(ReportMode::SyncPr),
+                None,
             ),
             StructuredDisclosureRoute::SyncPr
         );
@@ -1672,6 +2391,7 @@ mod tests {
                 &non_introduced,
                 &policy,
                 &disclose_config(ReportMode::PrComment),
+                None,
             ),
             StructuredDisclosureRoute::Skip
         );
@@ -1681,6 +2401,7 @@ mod tests {
                 &empty,
                 &policy,
                 &disclose_config(ReportMode::SyncPr),
+                None,
             ),
             StructuredDisclosureRoute::Skip
         );
