@@ -12,12 +12,16 @@ use std::{
 };
 
 use futures::future::join_all;
-use goose_providers::{base::Provider, conversation::message::Message, model::ModelConfig};
+use goose_providers::{
+    base::Provider,
+    conversation::message::{Message, MessageErrorKind},
+    model::ModelConfig,
+};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    agent_loop::{AgentLoop, LoopConfig, LoopRetry, ReplyEnd, UsageLog},
+    agent_loop::{AgentLoop, LoopConfig, LoopRetry, ReplyEnd, ReplyShape, UsageLog},
     classify_lane_load_text,
 };
 use crate::{
@@ -29,12 +33,22 @@ const LANE_SYSTEM: &str = r#"You are one inspection-only review lane in a PR rev
 
 /// Lane output passed to the coordinator; longer output is truncated.
 const MAX_RESULT_CHARS: usize = 65_536;
-/// Lane output preserved in incomplete-finder artifacts.
+/// Lane output, or a failed lane's last model reply, preserved in
+/// incomplete-finder artifacts.
 const MAX_NOTES_CHARS: usize = 16_384;
 /// Each lane gets its first attempt and at most one replacement.
 const ATTEMPTS: u32 = 2;
 /// A lane failure caused by the model provider; it gets no replacement.
 const PROVIDER_FAILURE: &str = "provider_failure";
+
+/// Why an attempt produced no usable result, with what the model last did.
+struct LaneFailure {
+    reason: &'static str,
+    error_kind: Option<MessageErrorKind>,
+    shape: ReplyShape,
+    /// Untrusted model output, kept for the incomplete-finder artifact.
+    transcript: String,
+}
 
 pub(super) struct LaneTask {
     pub lane: String,
@@ -174,7 +188,7 @@ impl Lanes {
                 snapshot.reason = None;
             });
             tracing::info!(lane, session_id = %session_id, recovery_attempt = attempt, "Review lane started");
-            let reason = match self.attempt(&session_id, task, cancel).await {
+            let failure = match self.attempt(&session_id, task, cancel).await {
                 Ok(output) => {
                     let findings = classify_lane_load_text(&output);
                     tracing::info!(
@@ -190,13 +204,40 @@ impl Lanes {
                     });
                     return Some(output.chars().take(MAX_RESULT_CHARS).collect());
                 }
-                Err(reason) => reason,
+                Err(failure) => failure,
             };
+            let LaneFailure {
+                reason,
+                error_kind,
+                shape,
+                transcript,
+            } = failure;
             let replace = attempt + 1 < ATTEMPTS && replaceable(reason);
-            // Only fixed labels are logged; lane output and provider errors may
-            // contain checkout content or attacker-controlled text.
-            tracing::warn!(lane, session_id = %session_id, recovery_attempt = attempt, reason, replace, "Review lane failed");
+            // Only fixed labels and counts are logged; lane output and provider
+            // errors may contain checkout content or attacker-controlled text.
+            // The model's last reply goes to the lane's artifact notes instead.
+            tracing::warn!(
+                lane,
+                session_id = %session_id,
+                recovery_attempt = attempt,
+                reason,
+                replace,
+                error_kind = ?error_kind,
+                assistant_messages = shape.assistant_messages,
+                tool_calls = shape.tool_calls,
+                malformed_tool_calls = shape.malformed_tool_calls,
+                tool_errors = shape.tool_errors,
+                last_text_chars = shape.last_text_chars,
+                last_thinking_chars = shape.last_thinking_chars,
+                last_redacted_thinking = shape.last_redacted_thinking,
+                last_tool_calls = shape.last_tool_calls,
+                last_errors = shape.last_errors,
+                "Review lane failed"
+            );
             self.update(lane, |snapshot| {
+                if !transcript.is_empty() {
+                    snapshot.raw_notes = Some(transcript);
+                }
                 snapshot.status = LaneStatus::Incomplete;
                 snapshot.reason = Some(
                     if attempt + 1 < ATTEMPTS || reason == PROVIDER_FAILURE || cancel.is_cancelled()
@@ -219,7 +260,7 @@ impl Lanes {
         session_id: &str,
         task: &LaneTask,
         cancel: &CancellationToken,
-    ) -> Result<String, &'static str> {
+    ) -> Result<String, LaneFailure> {
         let agent = AgentLoop::new(
             session_id,
             LoopConfig {
@@ -243,27 +284,37 @@ impl Lanes {
         )
         .await;
         attempt_cancel.cancel();
+        let fail = |reason, error_kind| {
+            Err(LaneFailure {
+                reason,
+                error_kind,
+                shape: agent.reply_shape(),
+                transcript: agent.last_reply_transcript(MAX_NOTES_CHARS),
+            })
+        };
         if cancel.is_cancelled() {
-            return Err("phase_stopped");
+            return fail("phase_stopped", None);
         }
         match reply {
-            Err(_) => Err("lane_deadline"),
-            Ok(Err(_)) => Err("session_error"),
+            Err(_) => fail("lane_deadline", None),
+            Ok(Err(_)) => fail("session_error", None),
             Ok(Ok(ReplyEnd::ProviderError(error))) => {
                 let failure = match LoopRetry::new("lane", 0, 0).provider_error(&error) {
                     Ok(failure) | Err(failure) => failure,
                 };
-                let mut stored = lock(&self.provider_failure);
-                if stored.is_none() || super::is_fatal_provider_error(&failure) {
-                    *stored = Some(failure);
+                {
+                    let mut stored = lock(&self.provider_failure);
+                    if stored.is_none() || super::is_fatal_provider_error(&failure) {
+                        *stored = Some(failure);
+                    }
                 }
-                Err(PROVIDER_FAILURE)
+                fail(PROVIDER_FAILURE, Some(error.kind))
             }
-            Ok(Ok(ReplyEnd::TurnLimit)) => Err("turn_limit"),
+            Ok(Ok(ReplyEnd::TurnLimit)) => fail("turn_limit", None),
             Ok(Ok(ReplyEnd::Finished)) => {
                 let output = agent.final_text();
                 if output.trim().is_empty() {
-                    Err("empty_result")
+                    fail("empty_result", None)
                 } else {
                     Ok(output)
                 }
@@ -399,6 +450,11 @@ mod tests {
         assert_eq!(persona.recovery_attempt, 1);
         assert_eq!(persona.task_id.as_deref(), Some("lane-persona-2"));
         assert_eq!(persona.reason.as_deref(), Some("recovery_exhausted"));
+        // The artifact keeps what the model last said.
+        assert_eq!(
+            persona.raw_notes.as_deref(),
+            Some("[thinking]\nconsidering")
+        );
         assert_eq!(status(&lanes, "security").status, LaneStatus::Completed);
         assert_eq!(provider.calls.lock().unwrap().len(), 3);
     }

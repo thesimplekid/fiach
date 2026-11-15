@@ -172,6 +172,30 @@ impl AgentLoop {
             .join("\n")
     }
 
+    /// Content-free counts describing how the session ended; safe to log.
+    pub fn reply_shape(&self) -> ReplyShape {
+        ReplyShape::of(lock(&self.conversation).messages())
+    }
+
+    /// The model's last reply rendered for an artifact, keeping at most the
+    /// last `max_chars` characters. It is untrusted model output: write it to
+    /// artifacts, never to logs.
+    pub fn last_reply_transcript(&self, max_chars: usize) -> String {
+        let conversation = lock(&self.conversation);
+        let rendered = last_reply(conversation.messages())
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .map(render_content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let total = rendered.chars().count();
+        if total <= max_chars {
+            return rendered;
+        }
+        let tail: String = rendered.chars().skip(total - max_chars).collect();
+        format!("[truncated {} chars]\n{tail}", total - max_chars)
+    }
+
     /// Sends `message` and runs the loop until the model ends its turn, the turn
     /// limit is reached, the provider fails, or `cancel` fires. `on_message`
     /// sees each message as it is produced.
@@ -590,6 +614,112 @@ impl HostTools for McpTools {
             .unwrap_or_else(|error| {
                 CallToolResult::error(vec![ContentBlock::text(format!("Tool failed: {error}"))])
             })
+    }
+}
+
+/// How a session ended, as counts only, so it can be logged without exposing
+/// model output or checkout content. It tells a model that answered with only
+/// reasoning apart from one whose tool calls the provider could not parse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReplyShape {
+    /// Assistant messages in the session.
+    pub assistant_messages: usize,
+    /// Tool calls the model made in the session.
+    pub tool_calls: usize,
+    /// Tool calls the provider adapter could not parse.
+    pub malformed_tool_calls: usize,
+    /// Tool results that reported an error.
+    pub tool_errors: usize,
+    /// Content of the model's last reply (see [`last_reply`]).
+    pub last_text_chars: usize,
+    pub last_thinking_chars: usize,
+    pub last_redacted_thinking: usize,
+    pub last_tool_calls: usize,
+    pub last_errors: usize,
+}
+
+impl ReplyShape {
+    fn of(messages: &[Message]) -> Self {
+        let mut shape = Self::default();
+        for message in messages {
+            if message.role == rmcp::model::Role::Assistant {
+                shape.assistant_messages += 1;
+            }
+            for content in &message.content {
+                match content {
+                    MessageContent::ToolRequest(request) => {
+                        shape.tool_calls += 1;
+                        if request.tool_call.is_err() {
+                            shape.malformed_tool_calls += 1;
+                        }
+                    }
+                    MessageContent::ToolResponse(response) => {
+                        let failed = response
+                            .tool_result
+                            .as_ref()
+                            .map_or(true, |result| result.is_error == Some(true));
+                        if failed {
+                            shape.tool_errors += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for content in last_reply(messages)
+            .iter()
+            .flat_map(|message| message.content.iter())
+        {
+            match content {
+                MessageContent::Text(text) => shape.last_text_chars += text.text.chars().count(),
+                MessageContent::Thinking(thinking) => {
+                    shape.last_thinking_chars += thinking.thinking.chars().count();
+                }
+                MessageContent::RedactedThinking(_) => shape.last_redacted_thinking += 1,
+                MessageContent::ToolRequest(_) => shape.last_tool_calls += 1,
+                MessageContent::Error(_) => shape.last_errors += 1,
+                _ => {}
+            }
+        }
+        shape
+    }
+}
+
+/// The trailing assistant messages, or the last assistant message when the
+/// session ended on a tool result or user message.
+fn last_reply(messages: &[Message]) -> &[Message] {
+    let is_assistant = |message: &Message| message.role == rmcp::model::Role::Assistant;
+    let start = messages
+        .iter()
+        .rposition(|message| !is_assistant(message))
+        .map_or(0, |index| index + 1);
+    if start < messages.len() {
+        return &messages[start..];
+    }
+    match messages.iter().rposition(is_assistant) {
+        Some(index) => &messages[index..=index],
+        None => &[],
+    }
+}
+
+fn render_content(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => format!("[text]\n{}", text.text),
+        MessageContent::Thinking(thinking) => format!("[thinking]\n{}", thinking.thinking),
+        MessageContent::RedactedThinking(_) => "[redacted thinking]".into(),
+        MessageContent::ToolRequest(request) => match &request.tool_call {
+            Ok(call) => format!(
+                "[tool call {}] {}",
+                call.name,
+                call.arguments
+                    .as_ref()
+                    .and_then(|arguments| serde_json::to_string(arguments).ok())
+                    .unwrap_or_default()
+            ),
+            Err(error) => format!("[malformed tool call] {}", error.message),
+        },
+        MessageContent::Error(error) => format!("[error {:?}] {}", error.kind, error.message),
+        other => other.to_string(),
     }
 }
 
@@ -1043,6 +1173,66 @@ mod tests {
             .unwrap();
         assert_eq!(end, ReplyEnd::TurnLimit);
         assert_eq!(lock(&provider.calls).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reply_shape_counts_what_the_model_left_without_its_content() {
+        let malformed = Message::assistant().with_tool_request(
+            "call-1",
+            Err(ErrorData::invalid_params("unparsable arguments", None)),
+        );
+        let provider = Scripted::new(vec![
+            Ok(malformed),
+            Ok(Message::assistant().with_thinking("still considering", "signature")),
+        ]);
+        let agent = agent(provider, Arc::new(Echo(Mutex::new(Vec::new()))), 10);
+
+        let end = agent
+            .reply(
+                Message::user().with_text("go"),
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(end, ReplyEnd::Finished);
+        assert_eq!(agent.final_text(), "");
+        assert_eq!(
+            agent.reply_shape(),
+            ReplyShape {
+                assistant_messages: 2,
+                tool_calls: 1,
+                malformed_tool_calls: 1,
+                tool_errors: 1,
+                last_thinking_chars: "still considering".len(),
+                ..ReplyShape::default()
+            }
+        );
+        assert_eq!(
+            agent.last_reply_transcript(1000),
+            "[thinking]\nstill considering"
+        );
+        assert_eq!(
+            agent.last_reply_transcript(11),
+            "[truncated 17 chars]\nconsidering"
+        );
+    }
+
+    #[test]
+    fn last_reply_falls_back_to_the_last_assistant_message() {
+        let messages = [
+            Message::user().with_text("go"),
+            tool_call("call-1", "echo"),
+            Message::user().with_text("tool result"),
+        ];
+        let reply = last_reply(&messages);
+        assert_eq!(reply.len(), 1);
+        assert_eq!(
+            render_content(&reply[0].content[0]),
+            r#"[tool call echo] {"text":"hi"}"#
+        );
+        assert!(last_reply(&messages[..1]).is_empty());
     }
 
     #[tokio::test]

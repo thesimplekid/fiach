@@ -44,6 +44,11 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 /// Non-streaming responses are buffered up to this size to read usage.
 const MAX_USAGE_SCAN_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes of an unsuccessful upstream response kept in the broker log.
+const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
+/// Extra bytes read past the kept excerpt, so a secret that straddles its end
+/// is still recognized and redacted rather than leaving a prefix behind.
+const ERROR_BODY_REDACTION_MARGIN: usize = 1024;
 /// Goose's pinned Anthropic API version.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -429,6 +434,25 @@ impl Shared {
             .is_some()
     }
 
+    /// The start of an upstream error body with every credential and planted
+    /// token replaced by its label. Provider errors can echo the request,
+    /// including a key the provider rejected.
+    fn redacted_excerpt(&self, body: &[u8]) -> String {
+        let mut text = String::from_utf8_lossy(body).into_owned();
+        for canary in &self.canaries {
+            let value = canary.value.expose();
+            if !value.is_empty() {
+                text = text.replace(value, &format!("[redacted {}]", canary.label));
+            }
+        }
+        let mut end = text.len().min(MAX_ERROR_BODY_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text
+    }
+
     /// Returns the label of the first canary found in the request.
     fn find_canary(&self, uri: &Uri, body: &[u8]) -> Option<&str> {
         let body = String::from_utf8_lossy(body);
@@ -544,6 +568,10 @@ struct LogRecord<'a> {
     output_tokens: u64,
     cost_usd: f64,
     duration_ms: u128,
+    /// The start of an unsuccessful upstream response body, such as the
+    /// provider's reason for rejecting a request. Host-side log only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_body: Option<String>,
 }
 
 fn unix_ms() -> u128 {
@@ -1236,12 +1264,18 @@ async fn forward(
         scan: UsageScan::new(sse),
         record: Some(record),
         status: status.as_u16(),
+        error_body: (!status.is_success()).then(Vec::new),
     };
     let body = Body::from_stream(futures::stream::unfold(stream, |mut stream| async move {
         stream.record.as_ref()?;
         match stream.response.chunk().await {
             Ok(Some(chunk)) => {
                 stream.scan.feed(&chunk);
+                if let Some(excerpt) = &mut stream.error_body {
+                    let room = (MAX_ERROR_BODY_BYTES + ERROR_BODY_REDACTION_MARGIN)
+                        .saturating_sub(excerpt.len());
+                    excerpt.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
                 Some((Ok::<Bytes, std::io::Error>(chunk), stream))
             }
             Ok(None) => {
@@ -1287,10 +1321,11 @@ impl PendingRecord {
             reason = message,
             "Model broker refused request"
         );
-        self.write(status.as_u16(), message, 0, 0, 0, 0.0);
+        self.write(status.as_u16(), message, 0, 0, 0, 0.0, None);
         deny(status, message)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
         status: u16,
@@ -1299,6 +1334,7 @@ impl PendingRecord {
         input_tokens: u64,
         output_tokens: u64,
         cost_usd: f64,
+        error_body: Option<String>,
     ) {
         self.route.shared.log(&LogRecord {
             unix_ms: unix_ms(),
@@ -1314,6 +1350,7 @@ impl PendingRecord {
             output_tokens,
             cost_usd,
             duration_ms: self.started.elapsed().as_millis(),
+            error_body,
         });
     }
 }
@@ -1325,6 +1362,8 @@ struct ResponseStream {
     scan: UsageScan,
     record: Option<PendingRecord>,
     status: u16,
+    /// Collected only for unsuccessful responses.
+    error_body: Option<Vec<u8>>,
 }
 
 impl ResponseStream {
@@ -1337,7 +1376,31 @@ impl ResponseStream {
         }
         let (input, output) = self.scan.finish();
         let cost = record.route.shared.charge(record.pricing(), input, output);
-        record.write(self.status, outcome, self.scan.bytes, input, output, cost);
+        let error_body = self
+            .error_body
+            .take()
+            .map(|excerpt| record.route.shared.redacted_excerpt(&excerpt));
+        if let Some(excerpt) = &error_body {
+            // The body is provider text that may echo request content, so it
+            // goes only to the job's host-side broker log.
+            tracing::warn!(
+                provider = %record.route.provider,
+                path = %record.path,
+                model = ?record.model,
+                status = self.status,
+                error_body_bytes = excerpt.len(),
+                "Model provider returned an unsuccessful response; see the broker log"
+            );
+        }
+        record.write(
+            self.status,
+            outcome,
+            self.scan.bytes,
+            input,
+            output,
+            cost,
+            error_body,
+        );
     }
 }
 
@@ -2521,10 +2584,78 @@ mod tests {
         assert_eq!(records[0]["outcome"], "ok");
         assert_eq!(records[0]["model"], case.model);
         assert_eq!(records[0]["input_tokens"], 1000);
+        assert!(records[0].get("error_body").is_none());
         assert_eq!(records[1]["outcome"], "model not allowed for this job");
         assert_eq!(records[1]["status"], 403);
         assert!(!log.contains("secret prompt"));
         assert!(!log.contains("real-openrouter-key"));
+    }
+
+    #[tokio::test]
+    async fn logs_the_start_of_unsuccessful_response_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("broker.jsonl");
+        let (upstream, _mock) = mock_upstream(|_| {
+            // A provider echoing the rejected key and request content; the
+            // second copy of the key straddles the end of the kept excerpt.
+            let prefix = r#"{"error":{"message":"Invalid request: tool schema rejected","key":"real-openrouter-key","note":"ghp_canaryvalue0123456789","pad":""#;
+            // Redacting the first key lengthens the text, so place the second
+            // one to start 4 bytes before the end of the redacted excerpt.
+            let growth = "[redacted openrouter credential]".len() - "real-openrouter-key".len();
+            let pad = MAX_ERROR_BODY_BYTES - prefix.len() - 4 - growth;
+            let reason = format!(
+                "{prefix}{}real-openrouter-key{}\"}}}}",
+                "x".repeat(pad),
+                "y".repeat(2 * MAX_ERROR_BODY_BYTES)
+            );
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(reason))
+                .unwrap()
+        })
+        .await;
+        let broker = Broker::start(BrokerConfig {
+            routes: vec![route(Provider::OpenRouter, &upstream, "openai/gpt-5")],
+            listen: Listen::Tcp("127.0.0.1:0".parse().unwrap()),
+            max_request_bytes: 64 * 1024,
+            max_cost_usd: None,
+            log_path: Some(log_path.clone()),
+            breaker: None,
+            canaries: vec![Canary {
+                label: "gh hosts token".into(),
+                value: Credential::new("ghp_canaryvalue0123456789"),
+            }],
+        })
+        .await
+        .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}/api/v1/chat/completions", base(&broker)))
+            .bearer_auth(key(&broker))
+            .json(&serde_json::json!({ "model": "openai/gpt-5", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        // The sandbox still receives the whole body.
+        let body = response.bytes().await.unwrap();
+        assert!(body.len() > 2 * MAX_ERROR_BODY_BYTES);
+        broker.shutdown().await;
+
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let record: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(record["status"], 400);
+        let excerpt = record["error_body"].as_str().unwrap();
+        assert!(excerpt.contains("Invalid request: tool schema rejected"));
+        assert!(excerpt.contains(r#""key":"[redacted openrouter credential]""#));
+        assert!(excerpt.contains(r#""note":"[redacted gh hosts token]""#));
+        assert_eq!(excerpt.len(), MAX_ERROR_BODY_BYTES);
+        // No credential, whole or cut off at the excerpt's end, reaches the log.
+        assert!(excerpt.ends_with("[red"));
+        let key = "real-openrouter-key";
+        assert!(!(1..key.len()).any(|n| excerpt.ends_with(&key[..n])));
+        assert!(!log.contains(key));
+        assert!(!log.contains("ghp_canary"));
     }
 
     #[tokio::test]
