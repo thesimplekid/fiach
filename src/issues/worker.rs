@@ -168,7 +168,7 @@ pub(super) async fn fix_at(
     let (checkout, mut base, mut branch) = prepare(&project.repo, scratch).await?;
     if let Some(revision) = revision {
         ensure!(
-            revision.branch == format!("fiach/issue-{}", issue.number),
+            super::is_issue_branch(&revision.branch, issue.number),
             "Revision branch is not the recorded issue branch"
         );
         git(

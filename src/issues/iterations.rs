@@ -248,7 +248,7 @@ pub(super) async fn process(
         return Ok(false);
     };
     ensure!(
-        state.issue == issue && state.branch == format!("fiach/issue-{issue}"),
+        state.issue == issue && super::is_issue_branch(&state.branch, issue),
         "Invalid recorded PR identity"
     );
     let pr = pull_request(&project.repo, state.pr).await?;

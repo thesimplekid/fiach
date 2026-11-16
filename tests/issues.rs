@@ -91,6 +91,7 @@ elif path.startswith(root + '/issues/'):
     n = int(tail[0]); issue = next((i for i in s['items'] if i['number'] == n), {'number':n, 'updated_at':'pr'})
     if len(tail) == 1: result = issue
     elif tail[1] == 'timeline': result = s.get('timeline', {}).get(str(n), [])
+    elif tail[1] == 'events': result = s.get('events', {}).get(str(n), [])
     elif tail[1] == 'comments':
         comments = s['comments'].setdefault(str(n), [])
         if method == 'POST':
@@ -121,24 +122,26 @@ elif path == root + '/pulls':
             sys.exit(1)
         assert body['draft'] is True
         assert 'Fixes' not in body['body'] and 'Closes' not in body['body']
-        result = dict(body, html_url='https://github.com/owner/repo/pull/9', state='open')
+        result = dict(body, html_url='https://github.com/owner/repo/pull/%d' % (9 + len(s.get('prs', []))), state='open')
         s.setdefault('prs', []).append(result)
         if s.get('lose_pr_response'):
             s['lose_pr_response'] = False
             json.dump(s,open(p,'w'))
             sys.exit(1)
-    else: result = s.get('prs', [])
+    else:
+        head = parse_qs(urlsplit(endpoint).query).get('head', [':'])[0].split(':', 1)[1]
+        result = [pr for pr in s.get('prs', []) if not head or pr.get('head') == head]
 elif path.startswith(root + '/pulls/'):
     tail = path[len(root + '/pulls/'):].split('/')
     n = int(tail[0])
     if len(tail) > 1:
         assert tail[1] in ['reviews', 'comments']
         result = s.get('pr_' + tail[1], [])
-    elif n == 9 and s.get('prs'):
+    elif 0 <= n - 9 < len(s.get('prs', [])):
         import subprocess
-        pr = s['prs'][0]
+        pr = s['prs'][n - 9]
         sha = lambda ref: subprocess.check_output(['git','rev-parse',ref],cwd=s['remote'],text=True).strip()
-        result = {'number':9, 'title':pr['title'], 'state':pr['state'], 'merged':s.get('iteration_merged',False),
+        result = {'number':n, 'title':pr['title'], 'state':pr['state'], 'merged':s.get('iteration_merged',False),
             'user':{'login':'fiach-bot'},
             'head':{'sha':sha(pr['head']), 'ref':pr['head'], 'repo':{'full_name':s.get('head_repo','owner/repo')}},
             'base':{'sha':sha(pr['base']), 'ref':pr['base'], 'repo':{'full_name':'owner/repo'}}}
@@ -2311,6 +2314,86 @@ async fn mixed_batch_answers_remain_bound_to_their_candidates_and_match_individu
         );
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn reapplied_ready_label_replaces_a_closed_fix_pr_once() {
+    let (dir, server, _) = setup("bug", "different", false, true).await;
+    enable_worker(dir.path(), false).await;
+    let config_path = dir.path().join("fiach.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap().replace(
+        "[issues]",
+        "[issues]\ntrigger_mention = \"fiach-bot\"\nallowed_mention_users = [\"maintainer\"]",
+    );
+    std::fs::write(config_path, config).unwrap();
+    let update = |change: &dyn Fn(&mut Value)| {
+        let mut state = fixture(dir.path());
+        change(&mut state);
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    };
+    update(&|state| {
+        state["comments"]["1"] = json!([{
+            "id": 99, "user": {"login": "maintainer"},
+            "body": "@fiach-bot please fix", "author_association": "NONE"
+        }]);
+    });
+    assert_ok(&run(dir.path()).await);
+    let phases_path = dir.path().join("fixture.json.phases");
+    let phases = std::fs::read_to_string(&phases_path).unwrap();
+    assert_eq!(fixture(dir.path())["prs"][0]["head"], "fiach/issue-1");
+
+    // A closed PR is reported with retry instructions, but not replaced unprompted.
+    update(&|state| state["prs"][0]["state"] = json!("closed"));
+    update(&|state| state["items"][0]["body"] = json!("Edited: still returns zero."));
+    assert_ok(&run(dir.path()).await);
+    let state = fixture(dir.path());
+    assert_eq!(state["prs"].as_array().unwrap().len(), 1);
+    assert!(state["comments"]["1"].as_array().unwrap().iter().any(|c| {
+        c["body"]
+            .as_str()
+            .unwrap()
+            .contains("re-apply the `ready-for-agent` label")
+    }));
+
+    // Label events from strangers or from Fiach itself are not trusted requests.
+    let label = |id: u64, actor: &str| json!({"id": id, "event": "labeled", "label": {"name": "ready-for-agent"}, "actor": {"login": actor}});
+    update(&|state| {
+        state["events"]["1"] = json!([label(500, "stranger"), label(501, "fiach-bot")])
+    });
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(fixture(dir.path())["prs"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read_to_string(&phases_path).unwrap(), phases);
+
+    update(&|state| {
+        state["events"]["1"] = json!([
+            label(500, "stranger"),
+            label(501, "fiach-bot"),
+            label(502, "Maintainer")
+        ])
+    });
+    assert_ok(&run(dir.path()).await);
+    let state = fixture(dir.path());
+    assert_eq!(state["prs"].as_array().unwrap().len(), 2);
+    assert_eq!(state["prs"][1]["head"], "fiach/issue-1-r2");
+    assert_eq!(state["prs"][1]["state"], "open");
+    assert_eq!(
+        std::fs::read_to_string(&phases_path).unwrap(),
+        phases.repeat(2)
+    );
+
+    // The same label event never authorizes a second retry.
+    update(&|state| state["prs"][1]["state"] = json!("closed"));
+    assert_ok(&run(dir.path()).await);
+    assert_eq!(fixture(dir.path())["prs"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::read_to_string(&phases_path).unwrap(),
+        phases.repeat(2)
+    );
+    server.abort();
 }
 
 #[tokio::test]
