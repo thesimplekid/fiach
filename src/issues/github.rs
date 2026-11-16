@@ -184,6 +184,43 @@ impl Github {
         ))
     }
 
+    /// The latest trusted mention and the latest `ready` label applied by an
+    /// allowlisted user. Labels count only when a mention allowlist is configured.
+    pub async fn issue_request(
+        &self,
+        project: &Project,
+        number: u64,
+        config: &super::config::IssueConfig,
+    ) -> Result<super::Request> {
+        let mention = self.issue_trigger(&project.repo, number, config).await?;
+        let label = if config.allowed_mention_users.is_empty() {
+            None
+        } else {
+            let events = pages(
+                &format!("repos/{}/issues/{number}/events", project.repo),
+                2000,
+            )
+            .await?;
+            latest_label_trigger(
+                &events,
+                &project.labels.ready,
+                &config.allowed_mention_users,
+                &self.login,
+            )
+        };
+        Ok(super::Request { mention, label })
+    }
+
+    pub async fn pr_open(&self, repo: &str, url: &str) -> Result<bool> {
+        let number = url
+            .strip_prefix(&format!("https://github.com/{repo}/pull/"))
+            .context("Unexpected generated PR URL")?
+            .parse::<u64>()
+            .context("Invalid generated PR number")?;
+        let pr = api(&format!("repos/{repo}/pulls/{number}"), "GET", None).await?;
+        Ok(pr["state"] == "open")
+    }
+
     /// GitHub returns the existing reaction when this user already added it, so
     /// retrying after a lost response or interrupted local save is safe.
     pub async fn acknowledge_issue_trigger(&self, repo: &str, comment: u64) -> Result<()> {
@@ -773,9 +810,58 @@ fn latest_issue_trigger(comments: &[Value], mention: &str, allowed: &[String]) -
         .max()
 }
 
+/// Authorization uses the event actor recorded by GitHub. Fiach's own label
+/// changes never count, since it applies the `ready` label during triage.
+fn latest_label_trigger(
+    events: &[Value],
+    ready: &str,
+    allowed: &[String],
+    own_login: &str,
+) -> Option<u64> {
+    events
+        .iter()
+        .filter(|event| {
+            event["event"] == "labeled"
+                && event["label"]["name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(ready))
+                && event["actor"]["login"].as_str().is_some_and(|login| {
+                    !login.eq_ignore_ascii_case(own_login)
+                        && allowed.iter().any(|user| user.eq_ignore_ascii_case(login))
+                })
+        })
+        .filter_map(|event| event["id"].as_u64())
+        .max()
+}
+
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+
+    #[test]
+    fn label_trigger_requires_allowlisted_actor_and_ready_label() {
+        let allowed = vec!["maintainer".to_owned(), "fiach-bot".to_owned()];
+        let event = |id: u64, kind: &str, label: &str, actor: &str| serde_json::json!({"id": id, "event": kind, "label": {"name": label}, "actor": {"login": actor}});
+        let events = vec![
+            event(1, "labeled", "Ready-For-Agent", "MAINTAINER"),
+            event(2, "labeled", "ready-for-agent", "outsider"),
+            event(3, "labeled", "ready-for-agent", "fiach-bot"),
+            event(4, "labeled", "bug", "maintainer"),
+            event(5, "unlabeled", "ready-for-agent", "maintainer"),
+        ];
+        assert_eq!(
+            latest_label_trigger(&events, "ready-for-agent", &allowed, "fiach-bot"),
+            Some(1)
+        );
+        assert_eq!(
+            latest_label_trigger(&events[1..], "ready-for-agent", &allowed, "fiach-bot"),
+            None
+        );
+        assert_eq!(
+            latest_label_trigger(&events, "ready-for-agent", &[], "fiach-bot"),
+            None
+        );
+    }
 
     #[test]
     fn issue_trigger_uses_author_metadata_and_exact_mentions() {

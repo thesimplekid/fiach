@@ -65,6 +65,19 @@ publication eligibility, or existing-PR checks. Removing the mention or revoking
 blocks further processing and pending publication. Without these settings, the
 existing automatic polling behavior is preserved.
 
+An allowlisted user can also request an attempt by applying the
+`ready-for-agent` label (`issues.repos.labels.ready`). The host reads the
+issue's label events and checks the event actor, so only a new `labeled` event
+by an allowlisted user counts; labels applied by Fiach itself or by other users
+do not. Each label event, like each mention, permits one coding attempt. To ask
+again, remove and re-apply the label. Label requests require the mention
+allowlist above.
+
+A new trusted request (mention or label) also replaces a Fiach PR that has been
+closed or merged: the closed PR is kept in the issue's history and the new fix
+is published on a fresh branch (`fiach/issue-N-r2`, `-r3`, ...). An open Fiach
+PR is never replaced; request revisions with a PR fix command on it instead.
+
 The initial pass considers all open issues; subsequent passes reevaluate changed
 issue bodies/discussions, changed configuration, and changes to the issue/PR
 inventory. `max_items` limits changed issues processed per pass, not evidence:
@@ -112,7 +125,8 @@ Trusted requests can start an investigation without those triage conditions;
 patch acceptance still requires explicit, permitted area paths.
 Readiness is independent of permissions: disabled global or area automation does
 not imply an unresolved maintainer choice. `ready-for-agent` means sufficient
-context and established direction; it does not authorize execution. The stored
+context and established direction; it authorizes execution only when an
+allowlisted user applies it (see trusted requests above). The stored
 `auto_fix_eligible` judgment additionally requires confirmed area applicability,
 area permissions, resolved coverage, and a supported worker policy. Launch and
 publication also require global `auto_fix`, `publish`, and a configured worker.

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Decision, Item, Route,
+    Decision, Item, Request, Route,
     config::{IssueConfig, Project},
     coverage::ComparisonRecord,
     github::{self, Github, git},
@@ -38,14 +38,32 @@ struct Record {
     #[serde(default)]
     last_attempted_mention: Option<u64>,
     #[serde(default)]
+    last_attempted_label: Option<u64>,
+    /// Closed Fiach PRs replaced by later trusted retries, oldest first.
+    #[serde(default)]
+    previous_prs: Vec<String>,
+    #[serde(default)]
     last_acknowledged_mention: Option<u64>,
     pr: Option<String>,
     pending: Option<Publication>,
 }
 impl Record {
-    fn blocks_attempt(&self, attempt_key: &str, trigger: Option<u64>) -> bool {
+    /// Whether the request carries a mention or label that no attempt has used yet.
+    fn fresh_request(&self, request: Request) -> bool {
+        let newer = |id: Option<u64>, last: Option<u64>| {
+            id.is_some_and(|id| last.is_none_or(|last| id > last))
+        };
+        newer(request.mention, self.last_attempted_mention)
+            || newer(request.label, self.last_attempted_label)
+    }
+    fn blocks_attempt(&self, attempt_key: &str, request: Request) -> bool {
         self.attempted.as_deref() == Some(attempt_key)
-            || trigger.is_some_and(|id| self.last_attempted_mention.is_some_and(|last| id <= last))
+            || (request.is_some() && !self.fresh_request(request))
+    }
+    fn consume(&mut self, attempt_key: String, request: Request) {
+        self.attempted = Some(attempt_key);
+        self.last_attempted_mention = request.mention.or(self.last_attempted_mention);
+        self.last_attempted_label = request.label.or(self.last_attempted_label);
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -399,8 +417,9 @@ async fn process(
         runtime.reviews,
     )
     .await?;
-    let trigger = github.issue_trigger(&project.repo, number, config).await?;
-    if config.trigger_mention.is_some() && trigger.is_none() {
+    let request = github.issue_request(project, number, config).await?;
+    let trigger = request.mention;
+    if config.trigger_mention.is_some() && !request.is_some() {
         return Ok(iteration_worked);
     }
     let mut record = store.get(&key)?;
@@ -427,7 +446,7 @@ async fn process(
             );
             let fresh = github.issue(&project.repo, number).await?;
             ensure!(
-                github.issue_trigger(&project.repo, number, config).await? == trigger,
+                github.issue_request(project, number, config).await? == request,
                 "Issue mention authorization changed; withholding publication"
             );
             ensure!(
@@ -530,6 +549,11 @@ async fn process(
         crate::jev::MODEL,
         "trusted-request-dispatch-v2",
     ))?;
+    // Fold label requests in separately so issues without one keep their cached fingerprint.
+    let fingerprint = match request.label {
+        Some(id) => digest(&(fingerprint, "ready-label", id))?,
+        None => fingerprint,
+    };
     if record.fingerprint == fingerprint {
         return Ok(iteration_worked);
     }
@@ -560,7 +584,7 @@ async fn process(
     };
     let mut decision = match result {
         Ok(decision) => decision,
-        Err(error) if trigger.is_some() => {
+        Err(error) if request.is_some() => {
             tracing::warn!(repo = %project.repo, issue = number, %error, "Triage failed; handing trusted request to investigation worker");
             Decision {
                 fix_kind: super::FixKind::Investigation,
@@ -599,30 +623,50 @@ async fn process(
     // Persist model judgments before any side effect. The fingerprint is committed only after marking succeeds.
     record.decision = Some(decision.clone());
     store.put(&key, &record)?;
+    // A new trusted request replaces a closed Fiach PR. An open PR is revised
+    // through PR fix commands instead, never replaced.
     if config.publish
         && config.auto_fix
-        && (trigger.is_some() || decision.ready_for_execution())
+        && config.worker.is_some()
+        && record.pending.is_none()
+        && record.fresh_request(request)
+        && let Some(url) = record.pr.clone()
+        && !github.pr_open(&project.repo, &url).await?
+    {
+        tracing::info!(repo = %project.repo, issue = number, previous_pr = %url, "Trusted request replaces closed Fiach PR");
+        record.previous_prs.push(url);
+        record.pr = None;
+        store.put(&key, &record)?;
+    }
+    if config.publish
+        && config.auto_fix
+        && (request.is_some() || decision.ready_for_execution())
         && record.pr.is_none()
         && record.pending.is_none()
     {
-        let attempt_key = match trigger {
-            Some(id) => digest(&("mention", id))?,
-            None => digest(&(content_key(&issue)?, super::triage::CACHE_VERSION))?,
+        let attempt_key = match request {
+            Request {
+                mention: Some(id),
+                label: None,
+            } => digest(&("mention", id))?,
+            Request { label: Some(_), .. } => digest(&("request", request))?,
+            Request { mention: None, .. } => {
+                digest(&(content_key(&issue)?, super::triage::CACHE_VERSION))?
+            }
         };
-        if record.blocks_attempt(&attempt_key, trigger) {
-            reroute(
-                project,
-                &mut decision,
-                Route::NeedsReview,
-                "A fix was already attempted for this issue content. A maintainer must inspect the previous run before another attempt.",
+        if record.blocks_attempt(&attempt_key, request) {
+            let explanation = format!(
+                "A fix was already attempted for this issue content. A maintainer must inspect the previous run before another attempt.{}",
+                retry_hint(config, project)
             );
+            reroute(project, &mut decision, Route::NeedsReview, &explanation);
+            decision.guidance = Some(explanation);
         } else if let Some(worker_config) = &config.worker {
             ensure!(
-                github.issue_trigger(&project.repo, number, config).await? == trigger,
+                github.issue_request(project, number, config).await? == request,
                 "Issue mention authorization changed; withholding execution"
             );
-            record.attempted = Some(attempt_key);
-            record.last_attempted_mention = trigger.or(record.last_attempted_mention);
+            record.consume(attempt_key, request);
             store.put(&key, &record)?;
             let fix_kind = decision.fix_kind;
             match worker::fix(
@@ -630,7 +674,7 @@ async fn process(
                 &issue,
                 project,
                 &decision,
-                trigger.is_some(),
+                request.is_some(),
                 &config.scratch_dir,
                 cancel,
             )
@@ -650,7 +694,7 @@ async fn process(
                 Ok(fix) => {
                     let fresh = github.issue(&project.repo, number).await?;
                     ensure!(
-                        github.issue_trigger(&project.repo, number, config).await? == trigger,
+                        github.issue_request(project, number, config).await? == request,
                         "Issue mention authorization changed; withholding publication"
                     );
                     ensure!(
@@ -696,7 +740,7 @@ async fn process(
                             base.split_whitespace().next() == Some(&fix.base),
                             "Default branch changed; withholding stale fix"
                         );
-                        let branch = format!("fiach/issue-{number}");
+                        let branch = super::issue_branch(number, record.previous_prs.len());
                         if let Some((url, _)) = github.branch_pr(&project.repo, &branch).await? {
                             record.pr = Some(url);
                         } else {
@@ -799,7 +843,7 @@ async fn process(
             }
         }
     }
-    if trigger.is_some() && record.pr.is_none() && record.pending.is_none() {
+    if request.is_some() && record.pr.is_none() && record.pending.is_none() {
         let mut blockers = Vec::new();
         if !config.auto_fix {
             blockers.push("automatic fixes are disabled (enable issues.auto_fix)");
@@ -812,7 +856,7 @@ async fn process(
                 .labels
                 .push(project.labels.execution_blocked.clone());
             decision.guidance = Some(format!(
-                "Execution blocked: {}. A host operator must update and reload the configuration. Fiach will reconsider this request on the next poll after that change; unchanged polls do not retry or repeat this comment. A new trusted request also triggers reconsideration, but does not bypass these requirements. The {} label describes task readiness, not execution authorization.",
+                "Execution blocked: {}. A host operator must update and reload the configuration. Fiach will reconsider this request on the next poll after that change; unchanged polls do not retry or repeat this comment. A new trusted request also triggers reconsideration, but does not bypass these requirements. The {} label authorizes execution only when an allowlisted user applies it.",
                 blockers.join("; "),
                 project.labels.ready
             ));
@@ -828,11 +872,18 @@ async fn process(
             "Pending fix publication is paused because automatic fixes or the worker are disabled.",
         );
     }
-    if record.pr.is_some() {
-        let open = github
-            .branch_pr(&project.repo, &format!("fiach/issue-{number}"))
-            .await?
-            .is_some_and(|(_, open)| open);
+    if let Some(url) = &record.pr {
+        let open = github.pr_open(&project.repo, url).await?;
+        let explanation = if open && config.iterations.is_some() {
+            "A Fiach draft PR already exists for this issue. An allowlisted user can request a verified revision with an @bot fix comment on that PR, using the configured bot username.".to_owned()
+        } else if open {
+            "A Fiach draft PR already exists for this issue. Further changes require maintainer review.".to_owned()
+        } else {
+            format!(
+                "The previous Fiach PR is no longer open. A maintainer must decide how to proceed.{}",
+                retry_hint(config, project)
+            )
+        };
         reroute(
             project,
             &mut decision,
@@ -841,14 +892,11 @@ async fn process(
             } else {
                 Route::NeedsReview
             },
-            if open && config.iterations.is_some() {
-                "A Fiach draft PR already exists for this issue. An allowlisted user can request a verified revision with an @bot fix comment on that PR, using the configured bot username."
-            } else if open {
-                "A Fiach draft PR already exists for this issue. Further changes require maintainer review."
-            } else {
-                "The previous Fiach PR is no longer open. A maintainer must decide how to proceed."
-            },
+            &explanation,
         );
+        if !open {
+            decision.guidance = Some(explanation);
+        }
     }
     let mut candidates = decision.matches.clone();
     candidates.extend(&decision.related);
@@ -870,7 +918,7 @@ async fn process(
     if config.publish {
         let fresh = github.issue(&project.repo, number).await?;
         ensure!(
-            github.issue_trigger(&project.repo, number, config).await? == trigger,
+            github.issue_request(project, number, config).await? == request,
             "Issue mention authorization changed; withholding marking"
         );
         ensure!(
@@ -913,13 +961,14 @@ fn track_publication(
     let Some(command) = &pending.validation_command else {
         return Ok(());
     };
-    if store.iteration(key)?.is_none() {
-        let prefix = format!("https://github.com/{}/pull/", project.repo);
-        let number = url
-            .strip_prefix(&prefix)
-            .context("Unexpected generated PR URL")?
-            .parse::<u64>()
-            .context("Invalid generated PR number")?;
+    let prefix = format!("https://github.com/{}/pull/", project.repo);
+    let number = url
+        .strip_prefix(&prefix)
+        .context("Unexpected generated PR URL")?
+        .parse::<u64>()
+        .context("Invalid generated PR number")?;
+    // A retry PR replaces the iteration state of the closed PR it supersedes.
+    if store.iteration(key)?.is_none_or(|state| state.pr != number) {
         let state = iterations::State::new(
             number,
             issue,
@@ -932,6 +981,16 @@ fn track_publication(
         store.save_iteration(key, &state)?;
     }
     Ok(())
+}
+
+fn retry_hint(config: &IssueConfig, project: &Project) -> String {
+    if config.trigger_mention.is_none() {
+        return String::new();
+    }
+    format!(
+        " To request a new attempt, an allowlisted user can re-apply the `{}` label or post a new mention of the bot.",
+        project.labels.ready
+    )
 }
 
 fn reroute(project: &Project, decision: &mut Decision, route: Route, explanation: &str) {
@@ -1045,11 +1104,53 @@ mod tests {
             last_attempted_mention: Some(100),
             ..Default::default()
         };
-        assert!(record.blocks_attempt("failed-attempt", None));
-        assert!(record.blocks_attempt("changed-content", Some(100)));
-        assert!(record.blocks_attempt("older-command", Some(99)));
-        assert!(!record.blocks_attempt("new-command", Some(101)));
-        assert!(!record.blocks_attempt("changed-content", None));
+        let mention = |id| Request {
+            mention: Some(id),
+            label: None,
+        };
+        let none = Request::default();
+        assert!(record.blocks_attempt("failed-attempt", none));
+        assert!(record.blocks_attempt("changed-content", mention(100)));
+        assert!(record.blocks_attempt("older-command", mention(99)));
+        assert!(!record.blocks_attempt("new-command", mention(101)));
+        assert!(!record.blocks_attempt("changed-content", none));
+    }
+
+    #[test]
+    fn reapplied_ready_label_authorizes_exactly_one_retry() {
+        let mut record = super::Record {
+            attempted: Some("old".into()),
+            last_attempted_mention: Some(100),
+            pr: Some("https://github.com/o/r/pull/5".into()),
+            ..Default::default()
+        };
+        // An old mention alone cannot replay; a new label event can.
+        let stale = Request {
+            mention: Some(100),
+            label: None,
+        };
+        assert!(!record.fresh_request(stale));
+        let relabeled = Request {
+            mention: Some(100),
+            label: Some(7),
+        };
+        assert!(record.fresh_request(relabeled));
+        assert!(!record.blocks_attempt("label-key", relabeled));
+        record.consume("label-key".into(), relabeled);
+        assert_eq!(record.last_attempted_label, Some(7));
+        assert_eq!(record.last_attempted_mention, Some(100));
+        assert!(!record.fresh_request(relabeled));
+        assert!(record.blocks_attempt("other-key", relabeled));
+        // Re-applying the label again creates a newer event.
+        assert!(record.fresh_request(Request {
+            mention: Some(100),
+            label: Some(8),
+        }));
+        // Records written before label requests existed still deserialize.
+        let legacy: super::Record =
+            serde_json::from_value(serde_json::json!({"fingerprint": "f", "decision": null, "attempted": null, "pr": null, "pending": null}))
+                .unwrap();
+        assert!(legacy.previous_prs.is_empty() && legacy.last_attempted_label.is_none());
     }
 
     #[test]
