@@ -15,7 +15,7 @@ use crate::state::{FailureClass, ReviewRecord};
 const TERMINAL_JOB_LIMIT: usize = 1_000;
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReviewTarget {
     pub repository: String,
     pub pr_number: u64,
@@ -25,6 +25,8 @@ pub struct ReviewTarget {
 
 #[derive(Debug, Clone)]
 pub struct ReviewRequest<T> {
+    /// Latest eligibility decision at submission; absent for non-poll work.
+    pub poll_eligible: Option<bool>,
     /// Eligible fresh work is queued ahead of failed whole-review retries.
     pub is_retry: bool,
     pub target: ReviewTarget,
@@ -43,7 +45,7 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    fn terminal(self) -> bool {
+    pub(crate) fn terminal(self) -> bool {
         matches!(
             self,
             Self::Completed | Self::Failed | Self::Skipped | Self::Cancelled
@@ -56,6 +58,10 @@ pub struct JobSnapshot {
     pub job_id: String,
     pub status: JobStatus,
     pub target: ReviewTarget,
+    #[serde(default)]
+    pub poll_eligible: Option<bool>,
+    #[serde(default)]
+    pub claimed_target: Option<ReviewTarget>,
     pub queued_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
@@ -284,8 +290,32 @@ impl std::fmt::Display for SubmitError {
     }
 }
 
+#[derive(Default, Clone)]
+pub(crate) struct PollBacklog {
+    pub refreshed_at: Option<i64>,
+    pub deferred: HashMap<ReviewTarget, bool>,
+    pub candidates: HashMap<ReviewTarget, bool>,
+    pub observed: HashSet<ReviewTarget>,
+}
+
+type JobTable = Arc<Mutex<HashMap<String, JobSnapshot>>>;
+
+tokio::task_local! {
+    static CURRENT_JOB: (JobTable, String);
+}
+
+/// A manual scheduler request can resolve to several concrete review targets.
+pub(crate) async fn record_claim(target: Option<ReviewTarget>) {
+    if let Ok((jobs, id)) = CURRENT_JOB.try_with(Clone::clone)
+        && let Some(job) = jobs.lock().await.get_mut(&id)
+    {
+        job.claimed_target = target;
+    }
+}
+
 #[derive(Clone)]
 pub struct SchedulerHandle<T> {
+    pub(crate) poll: Arc<Mutex<PollBacklog>>,
     sender: mpsc::Sender<Submission<T>>,
     jobs: Arc<Mutex<HashMap<String, JobSnapshot>>>,
     capacity: QueueCapacity,
@@ -321,6 +351,14 @@ impl<T: Send + 'static> SchedulerHandle<T> {
 
     pub async fn get(&self, job_id: &str) -> Option<JobSnapshot> {
         self.jobs.lock().await.get(job_id).cloned()
+    }
+
+    pub(crate) async fn backlog(&self) -> (PollBacklog, Vec<JobSnapshot>) {
+        let poll = self.poll.lock().await;
+        (
+            poll.clone(),
+            self.jobs.lock().await.values().cloned().collect(),
+        )
     }
 
     pub async fn processing_health(&self) -> ProcessingHealth {
@@ -390,8 +428,10 @@ pub fn start_gated<T: Send + 'static>(
     };
     let jobs = Arc::new(Mutex::new(HashMap::new()));
     let health = Arc::new(Mutex::new(HealthHistory::default()));
+    let poll = Arc::new(Mutex::new(PollBacklog::default()));
     tokio::spawn(run_scheduler(
         Dispatch {
+            poll: poll.clone(),
             max_workers: worker_limit,
             capacity: capacity.clone(),
             paused,
@@ -403,6 +443,7 @@ pub fn start_gated<T: Send + 'static>(
         handler,
     ));
     SchedulerHandle {
+        poll,
         sender,
         jobs,
         capacity,
@@ -412,6 +453,7 @@ pub fn start_gated<T: Send + 'static>(
 
 /// When queued jobs may start.
 struct Dispatch {
+    poll: Arc<Mutex<PollBacklog>>,
     max_workers: usize,
     capacity: QueueCapacity,
     /// Holds queued jobs while it reads `true`.
@@ -427,6 +469,7 @@ async fn run_scheduler<T: Send + 'static>(
     handler: Handler<T>,
 ) {
     let Dispatch {
+        poll,
         max_workers,
         capacity,
         mut paused,
@@ -449,7 +492,18 @@ async fn run_scheduler<T: Send + 'static>(
             let target = queued.request.target;
             let future = handler(queued.request.payload, cancel.child_token());
             active.insert(id.clone());
-            running.spawn(async move { (id, target, future.await) });
+            let polled = queued.request.poll_eligible.is_some();
+            let poll = poll.clone();
+            let tracked = CURRENT_JOB.scope((jobs.clone(), id.clone()), future);
+            running.spawn(async move {
+                // A newer discovery can retire an already-admitted poll while it waits.
+                let result = if polled && !poll.lock().await.candidates.contains_key(&target) {
+                    Ok(ExecutionStatus::Skipped)
+                } else {
+                    tracked.await
+                };
+                (id, target, result)
+            });
         }
 
         if cancel.is_cancelled() {
@@ -523,6 +577,8 @@ async fn run_scheduler<T: Send + 'static>(
                     job_id: id.clone(),
                     status: JobStatus::Queued,
                     target: submission.request.target.clone(),
+                    poll_eligible: submission.request.poll_eligible,
+                    claimed_target: None,
                     queued_at: now(),
                     started_at: None,
                     finished_at: None,
@@ -596,6 +652,7 @@ mod tests {
 
     fn request(pr: u64) -> ReviewRequest<u64> {
         ReviewRequest {
+            poll_eligible: None,
             is_retry: false,
             target: ReviewTarget {
                 repository: "owner/repo".to_string(),
@@ -646,6 +703,53 @@ mod tests {
                 ..SchedulerStats::default()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn refreshed_discovery_retires_a_queued_head_before_execution() {
+        let cancel = CancellationToken::new();
+        let (gate, paused) = watch::channel(true);
+        let mut first = request(1);
+        first.poll_eligible = Some(true);
+        let mut pushed = first.clone();
+        pushed.target.commit_hash = "new-head".into();
+        pushed.payload = 2;
+        let concrete = pushed.target.clone();
+        let handler = Arc::new(move |payload, _: CancellationToken| {
+            let concrete = concrete.clone();
+            Box::pin(async move {
+                assert_eq!(payload, 2);
+                record_claim(Some(concrete)).await;
+                Ok(ExecutionStatus::Completed)
+            }) as BoxJobFuture
+        });
+        let scheduler = start_gated(1, cancel.clone(), handler, Some(paused));
+        scheduler
+            .poll
+            .lock()
+            .await
+            .candidates
+            .insert(first.target.clone(), true);
+        let old = scheduler.submit(first).await.unwrap();
+        scheduler.poll.lock().await.candidates = HashMap::from([(pushed.target.clone(), true)]);
+        let new = scheduler.submit(pushed).await.unwrap();
+        gate.send(false).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while scheduler.stats().await.completed == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            scheduler.get(&old.job_id).await.unwrap().status,
+            JobStatus::Skipped
+        );
+        assert_eq!(
+            scheduler.get(&new.job_id).await.unwrap().claimed_target,
+            Some(new.target)
+        );
+        cancel.cancel();
     }
 
     #[tokio::test]

@@ -101,13 +101,9 @@ impl GeneratedReviewQueue {
             }
             complete = false;
             let request = ReviewRequest {
+                poll_eligible: None,
                 is_retry: false,
-                target: ReviewTarget {
-                    repository: repo.into(),
-                    pr_number: pr.number,
-                    commit_hash: pr.head_ref_oid.clone(),
-                    review_kind: job.review_kind.clone(),
-                },
+                target: job.target(repo),
                 payload: DaemonWork::Generated {
                     repo: repo.into(),
                     job,
@@ -187,6 +183,52 @@ pub struct ReviewJob {
     review_kind: String,
 }
 
+impl ReviewJob {
+    fn target(&self, repository: &str) -> ReviewTarget {
+        ReviewTarget {
+            repository: repository.into(),
+            pr_number: self.pr.number,
+            commit_hash: self.pr.head_ref_oid.clone(),
+            review_kind: self.review_kind.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct DiscoveryBatch {
+    observed: HashSet<ReviewTarget>,
+    requests: Vec<ReviewRequest<DaemonWork>>,
+}
+
+impl DiscoveryBatch {
+    fn add(
+        &mut self,
+        repo: &str,
+        job: ReviewJob,
+        eligibility: Result<crate::state::ReviewDecision, PrProcessStatus>,
+    ) {
+        let target = job.target(repo);
+        self.observed.insert(target.clone());
+        if matches!(
+            eligibility,
+            Err(PrProcessStatus::Skipped) | Ok(crate::state::ReviewDecision::Skip)
+        ) {
+            return;
+        }
+        // A transient check error still gets a worker-side check.
+        self.requests.push(ReviewRequest {
+            poll_eligible: Some(eligibility.is_ok()),
+            is_retry: matches!(eligibility, Ok(crate::state::ReviewDecision::RetryFailed)),
+            target,
+            payload: DaemonWork::Poll {
+                repo: repo.into(),
+                job,
+                honor_mention_trigger: true,
+            },
+        });
+    }
+}
+
 #[derive(Default)]
 struct PendingPollReviews {
     requests: VecDeque<ReviewRequest<DaemonWork>>,
@@ -223,11 +265,13 @@ impl PendingPollReviews {
         cancel: &CancellationToken,
     ) -> Result<(), SubmitError> {
         while let Some(request) = self.requests.front() {
+            let mut poll = scheduler.poll.lock().await;
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(SubmitError::Closed),
                 result = scheduler.submit(request.clone()) => { result?; }
             }
+            poll.deferred.remove(&request.target);
             self.requests.pop_front();
         }
         Ok(())
@@ -237,10 +281,24 @@ impl PendingPollReviews {
         &mut self,
         scheduler: &SchedulerHandle<DaemonWork>,
         cancel: &CancellationToken,
-        mut discoveries: tokio::sync::watch::Receiver<Vec<ReviewRequest<DaemonWork>>>,
+        mut discoveries: tokio::sync::watch::Receiver<DiscoveryBatch>,
     ) -> Result<(), SubmitError> {
-        self.refresh(discoveries.borrow_and_update().clone());
+        let mut refresh = discoveries.has_changed().unwrap_or(false);
         loop {
+            if refresh {
+                let batch = discoveries.borrow_and_update().clone();
+                self.refresh(batch.requests);
+                let mut poll = scheduler.poll.lock().await;
+                poll.observed = batch.observed;
+                poll.refreshed_at = Some(OffsetDateTime::now_utc().unix_timestamp());
+                poll.deferred = self
+                    .requests
+                    .iter()
+                    .map(|r| (r.target.clone(), r.poll_eligible == Some(true)))
+                    .collect();
+                poll.candidates = poll.deferred.clone();
+                refresh = false;
+            }
             match self.submit(scheduler, cancel).await {
                 Ok(()) | Err(SubmitError::Full) => {}
                 Err(SubmitError::Closed) => return Err(SubmitError::Closed),
@@ -252,7 +310,7 @@ impl PendingPollReviews {
                     if result.is_err() {
                         return Ok(());
                     }
-                    self.refresh(discoveries.borrow_and_update().clone());
+                    refresh = true;
                 }
                 _ = scheduler.capacity_changed(), if !self.requests.is_empty() => {}
             }
@@ -277,6 +335,7 @@ pub fn manual_request(
         )
         .unwrap_or_else(|| crate::state::DEFAULT_REVIEW_KIND.to_string());
     ReviewRequest {
+        poll_eligible: None,
         is_retry: false,
         target: ReviewTarget {
             repository: repo.clone(),
@@ -946,13 +1005,15 @@ pub async fn run_daemon(
     let _probe_guard = AbortOnDrop(probe_task);
 
     let sleep_duration = Duration::from_secs(params.interval);
-    let (discovery_sender, discoveries) = tokio::sync::watch::channel(Vec::new());
+    let (discovery_sender, discoveries) = tokio::sync::watch::channel(DiscoveryBatch::default());
     let submitter_cancel = cancel_token.child_token();
     let _submitter_guard = submitter_cancel.clone().drop_guard();
     let submitter = tokio::spawn(async move {
-        PendingPollReviews::default()
+        let result = PendingPollReviews::default()
             .run(&scheduler, &submitter_cancel, discoveries)
-            .await
+            .await;
+        scheduler.poll.lock().await.deferred.clear();
+        result
     });
 
     loop {
@@ -962,7 +1023,7 @@ pub async fn run_daemon(
         }
 
         tracing::debug!("Starting polling cycle");
-        let mut discoveries = Vec::new();
+        let mut discoveries = DiscoveryBatch::default();
 
         for repo in &repo_list {
             if cancel_token.is_cancelled() {
@@ -1022,33 +1083,12 @@ pub async fn run_daemon(
                             "Collecting discovered review jobs"
                         );
                         for job in jobs {
-                            let is_retry = crate::state::get_pr_review(
-                                &params.db_path,
-                                repo,
-                                job.pr.number,
-                                &job.review_kind,
-                            )
-                            .ok()
-                            .flatten()
-                            .is_some_and(|record| {
-                                record.commit_hash == job.pr.head_ref_oid
-                                    && record.status == crate::state::ReviewStatus::Failed
-                            });
-                            let request = ReviewRequest {
-                                is_retry,
-                                target: ReviewTarget {
-                                    repository: repo.clone(),
-                                    pr_number: job.pr.number,
-                                    commit_hash: job.pr.head_ref_oid.clone(),
-                                    review_kind: job.review_kind.clone(),
-                                },
-                                payload: DaemonWork::Poll {
-                                    repo: repo.clone(),
-                                    job,
-                                    honor_mention_trigger: true,
-                                },
-                            };
-                            discoveries.push(request);
+                            if cancel_token.is_cancelled() {
+                                break;
+                            }
+                            let eligibility =
+                                check_eligibility(&params, repo, &job, ReviewOrigin::Poll).await;
+                            discoveries.add(repo, job, eligibility.map(|(decision, _)| decision));
                         }
                     }
                     Err(error) => {
@@ -1145,17 +1185,12 @@ fn mark_skipped_if_needed(params: &DaemonParams, repo: &str, job: &ReviewJob) {
     }
 }
 
-async fn process_daemon_job(
+async fn check_eligibility(
     params: &DaemonParams,
     repo: &str,
     job: &ReviewJob,
-    cancel_token: CancellationToken,
     origin: ReviewOrigin,
-) -> Result<PrProcessStatus> {
-    if cancel_token.is_cancelled() {
-        return Ok(PrProcessStatus::Skipped);
-    }
-
+) -> Result<(crate::state::ReviewDecision, Option<ValidMention>), PrProcessStatus> {
     let pr = &job.pr;
     let skip = params
         .skip_prs
@@ -1170,7 +1205,7 @@ async fn process_daemon_job(
             "Skipping PR as requested"
         );
         mark_skipped_if_needed(params, repo, job);
-        return Ok(PrProcessStatus::Skipped);
+        return Err(PrProcessStatus::Skipped);
     }
 
     let mention_user = if origin == ReviewOrigin::Poll {
@@ -1196,7 +1231,7 @@ async fn process_daemon_job(
             allowed = ?params.allowed_author_associations,
             "Skipping PR because author association is not allowed"
         );
-        return Ok(PrProcessStatus::Skipped);
+        return Err(PrProcessStatus::Skipped);
     }
 
     let mention = if let Some(mention_user) = mention_user {
@@ -1209,7 +1244,7 @@ async fn process_daemon_job(
                     error = %e,
                     "Failed to fetch PR mention details"
                 );
-                return Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
+                return Err(PrProcessStatus::Failed(ExecutionFailure::classify(
                     "discovery",
                     &e,
                 )));
@@ -1229,7 +1264,7 @@ async fn process_daemon_job(
                 mention_user = %mention_user,
                 "Skipping PR because no allowlisted user has mentioned the trigger account"
             );
-            return Ok(PrProcessStatus::Skipped);
+            return Err(PrProcessStatus::Skipped);
         };
         Some(mention)
     } else {
@@ -1243,7 +1278,7 @@ async fn process_daemon_job(
             "Skipping backport PR"
         );
         mark_skipped_if_needed(params, repo, job);
-        return Ok(PrProcessStatus::Skipped);
+        return Err(PrProcessStatus::Skipped);
     }
 
     let mention_ts = mention.as_ref().map(|mention| mention.timestamp);
@@ -1292,11 +1327,39 @@ async fn process_daemon_job(
     };
 
     match review_decision {
-        Ok(
-            decision @ (crate::state::ReviewDecision::FirstReview
-            | crate::state::ReviewDecision::ReReview
-            | crate::state::ReviewDecision::RetryFailed),
-        ) => {
+        Ok(crate::state::ReviewDecision::Skip) => Err(PrProcessStatus::Skipped),
+        Ok(decision) => Ok((decision, mention)),
+        Err(e) => {
+            tracing::error!(
+                "Failed to check review state for PR {} in {}: {}",
+                pr.number,
+                repo,
+                e
+            );
+            Err(PrProcessStatus::Failed(ExecutionFailure::classify(
+                "state", &e,
+            )))
+        }
+    }
+}
+
+async fn process_daemon_job(
+    params: &DaemonParams,
+    repo: &str,
+    job: &ReviewJob,
+    cancel_token: CancellationToken,
+    origin: ReviewOrigin,
+) -> Result<PrProcessStatus> {
+    if cancel_token.is_cancelled() {
+        return Ok(PrProcessStatus::Skipped);
+    }
+
+    crate::scheduler::record_claim(None).await;
+    match check_eligibility(params, repo, job, origin).await {
+        Err(status) => Ok(status),
+        Ok((decision, mention)) => {
+            let pr = &job.pr;
+            let mention_ts = mention.as_ref().map(|mention| mention.timestamp);
             let retry_count_for_attempt = if decision == crate::state::ReviewDecision::RetryFailed {
                 crate::state::get_pr_review(&params.db_path, repo, pr.number, &job.review_kind)
                     .ok()
@@ -1341,6 +1404,7 @@ async fn process_daemon_job(
                 }
             }
 
+            crate::scheduler::record_claim(Some(job.target(repo))).await;
             match decision {
                 crate::state::ReviewDecision::RetryFailed => {
                     tracing::info!(
@@ -1587,18 +1651,6 @@ async fn process_daemon_job(
             }
 
             Ok(PrProcessStatus::Reviewed)
-        }
-        Ok(crate::state::ReviewDecision::Skip) => Ok(PrProcessStatus::Skipped),
-        Err(e) => {
-            tracing::error!(
-                "Failed to check review state for PR {} in {}: {}",
-                pr.number,
-                repo,
-                e
-            );
-            Ok(PrProcessStatus::Failed(ExecutionFailure::classify(
-                "state", &e,
-            )))
         }
     }
 }
@@ -2521,6 +2573,7 @@ mod tests {
             review_kind: "security".to_string(),
         };
         ReviewRequest {
+            poll_eligible: None,
             is_retry: false,
             target: ReviewTarget {
                 repository: repo.clone(),
@@ -2534,6 +2587,32 @@ mod tests {
                 honor_mention_trigger: true,
             },
         }
+    }
+
+    #[test]
+    fn discovery_keeps_rejected_heads_visible_without_queueing_them() {
+        let mut batch = DiscoveryBatch::default();
+        let mut add = |pr, decision| {
+            let DaemonWork::Poll { repo, job, .. } = poll_request(pr).payload else {
+                unreachable!()
+            };
+            batch.add(&repo, job, decision);
+        };
+        add(1, Err(PrProcessStatus::Skipped));
+        add(
+            2,
+            Err(PrProcessStatus::Failed(ExecutionFailure::classify(
+                "discovery",
+                &anyhow::anyhow!("timeout"),
+            ))),
+        );
+        add(3, Ok(crate::state::ReviewDecision::RetryFailed));
+        assert_eq!(batch.observed.len(), 3);
+        assert_eq!(batch.requests.len(), 2);
+        assert_eq!(batch.requests[0].target.pr_number, 2);
+        assert_eq!(batch.requests[0].poll_eligible, Some(false));
+        assert_eq!(batch.requests[1].poll_eligible, Some(true));
+        assert!(batch.requests[1].is_retry);
     }
 
     #[tokio::test]
@@ -2738,7 +2817,7 @@ mod tests {
             })
         };
         let scheduler = crate::scheduler::start(1, cancel.clone(), handler);
-        let (discovered, discoveries) = tokio::sync::watch::channel(Vec::new());
+        let (discovered, discoveries) = tokio::sync::watch::channel(DiscoveryBatch::default());
         let submitter = {
             let scheduler = scheduler.clone();
             let cancel = cancel.clone();
@@ -2749,13 +2828,32 @@ mod tests {
             })
         };
 
-        discovered
-            .send((1..=22).map(poll_request).collect())
-            .unwrap();
+        let batch = |range: std::ops::RangeInclusive<u64>| {
+            let requests: Vec<_> = range
+                .map(poll_request)
+                .map(|mut r| {
+                    r.poll_eligible = Some(true);
+                    r
+                })
+                .collect();
+            DiscoveryBatch {
+                observed: requests.iter().map(|r| r.target.clone()).collect(),
+                requests,
+            }
+        };
+        discovered.send(batch(1..=22)).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while scheduler.stats().await.queued != 16 {
                 tokio::task::yield_now().await;
             }
+            let (poll, jobs) = scheduler.backlog().await;
+            assert_eq!(poll.deferred.len(), 5);
+            assert_eq!(jobs.len(), 17);
+            assert!(
+                jobs.iter().all(|job| job.poll_eligible == Some(true)
+                    && !poll.deferred.contains_key(&job.target))
+            );
+            assert_eq!(poll.candidates.len(), 22);
             // Free one worker at a time. All 22 must run from this one discovery,
             // even though the scheduler can initially accept only 17.
             for expected in 1..=22 {
@@ -2772,9 +2870,7 @@ mod tests {
 
         // New discoveries still wake an idle submitter, and cancellation stops
         // it promptly even when the scheduler is full again.
-        discovered
-            .send((23..=44).map(poll_request).collect())
-            .unwrap();
+        discovered.send(batch(23..=44)).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while scheduler.stats().await.queued != 16 {
                 tokio::task::yield_now().await;

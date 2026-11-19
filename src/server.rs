@@ -1,3 +1,5 @@
+mod backlog;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -111,6 +113,7 @@ pub async fn start_server(port: u16, state: AppState) -> Result<()> {
         .route("/ready", get(readiness_check))
         .route("/metrics", get(metrics))
         .route("/reviews", get(get_reviews))
+        .route("/reviews/backlog", get(backlog::get_backlog))
         .route("/review", get(get_review).post(trigger_review))
         .route("/review/content", get(get_review_content))
         .route("/jobs/{job_id}", get(get_job))

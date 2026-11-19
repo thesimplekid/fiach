@@ -344,6 +344,55 @@ Set `FIACH_SERVER_TOKEN` to require `Authorization: Bearer <token>` or `X-Fiach-
   Report content is loaded from the authoritative absolute artifact path stored
   with the review record, including reports produced by sandbox workers.
 
+### Review backlog for Grafana
+
+Use `GET /reviews/backlog` for a per-PR table and `/metrics` for Prometheus
+aggregates. A Grafana JSON data source can send the server token as a secure
+Bearer header and read the `items` array. For example, this prints every
+eligible waiting PR, including work deferred beyond scheduler capacity:
+
+```bash
+offset=0
+while [[ $offset != null ]]; do
+  page=$(curl -fsS -H "Authorization: Bearer $FIACH_SERVER_TOKEN" \
+    "http://localhost:3000/reviews/backlog?offset=$offset&limit=100") || exit 1
+  jq -r '.items[] | select(.phase == "eligible_waiting") |
+    [.repository, .pr_number, .commit_hash, .review_kind, .source] | @tsv' <<< "$page"
+  offset=$(jq -r '.next_offset' <<< "$page")
+done
+```
+
+Each item represents one repository, PR number, head commit and review kind.
+`source=poll` means deferred work. `source=scheduler` identifies an admitted
+job with an ID and queue/start timestamps. Poll work becomes `eligible_waiting`
+after the eligibility checks pass. Workers recheck before claiming the review.
+`candidate` covers requests awaiting checks, including manual requests whose
+head is still `pending`. A manual job can claim several personas in sequence.
+`running` starts at the concrete review claim. A checked job that a later poll
+drops while queued is `retired` until the scheduler drains it.
+
+`source=history` means there is no live job or deferred request for that row.
+The nested `record` gives the latest durable outcome for that target, retry
+count, earliest retry time, intervention flag and sanitized failure category.
+Phases include `retry_cooldown`, `needs_intervention`, `failed`, `completed`,
+`unverified`, `markdown_only`, `skipped` and `cancelled`. A terminal job with
+no durable result can be `finished`. A durable queued or in-progress record
+alone is `recorded`. Only a live claim appears as running after restart.
+
+All timestamps are Unix seconds. `snapshot_at` dates the response.
+`discovery_at` dates the last poll batch consumed by the submitter and is null
+before the first batch. `in_latest_discovery` indicates whether that exact head
+appeared in the batch, subject to configured PR states, filters, limits and
+successful forge queries. It can include closed PRs when configured. Older
+heads and closed PRs can remain visible through retained jobs or durable
+records. The scheduler retains up to 1,000 terminal jobs until restart. The
+database retains the latest record per repository/PR/kind until replaced.
+
+Pages are ordered by repository, PR number, head and kind. The default limit is
+100 and the maximum is 500. Follow `next_offset` until null. Each page reads
+live data; changes between requests can shift offsets. Refresh from offset zero
+and key dashboard rows by the four identity fields.
+
 ### State database migration
 
 The redb schema is versioned and migrated automatically when the daemon opens
