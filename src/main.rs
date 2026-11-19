@@ -510,7 +510,7 @@ enum Commands {
 
 // Goose logs failed provider responses verbatim at warn from http_status, and
 // they can echo prompt content. Fiach logs metadata-only request diagnostics.
-const DEFAULT_LOG_FILTER: &str = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error";
+const DEFAULT_LOG_FILTER: &str = "fiach=info,goose=warn,oi_kit=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,oi_kit_providers::http_status=error";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1160,9 +1160,9 @@ mod tests {
             .with_writer(move || Writer(sink.clone()))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            tracing::warn!(target: "goose_providers::http_status", "private-response");
-            tracing::error!(target: "goose_providers::http_status", "http-status-error");
-            tracing::warn!(target: "goose_providers::api_client", "provider-warning");
+            tracing::warn!(target: "oi_kit_providers::http_status", "private-response");
+            tracing::error!(target: "oi_kit_providers::http_status", "http-status-error");
+            tracing::warn!(target: "oi_kit_providers::api_client", "provider-warning");
             tracing::warn!(target: "goose::agents", "agent-warning");
         });
         let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();

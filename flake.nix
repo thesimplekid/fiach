@@ -100,7 +100,7 @@
               lockFile = ./Cargo.lock;
               outputHashes = {
                 "buzz-client-0.1.0" = "sha256-qxOkoR44k3pr9+TmRSZWmRZRXt+56ohCrE4zwF+/nMM=";
-                "goose-1.58.1" = "sha256-HParN7kv/F5rP8RRzl7EkJM5mYYOboCe9p1KDGCQgvA=";
+                "goose-1.60.0" = "sha256-E2SZ8hG2DH5x6cIY57jFE1ujvOrRwM7onmxZrd56Kws=";
               };
             };
 
@@ -528,7 +528,7 @@
 
             logFilter = lib.mkOption {
               type = lib.types.str;
-              default = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error";
+              default = "fiach=info,goose=warn,oi_kit=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,oi_kit_providers::http_status=error";
               description = "Tracing filter passed to RUST_LOG for the daemon and sandboxed review children.";
             };
 

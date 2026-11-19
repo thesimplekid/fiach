@@ -21,7 +21,7 @@ use super::{
     github::{command, git},
 };
 use crate::review::agent_loop::{
-    AgentLoop, HostTools, LoopConfig, LoopRetry, McpTools, ReplyEnd, StopCondition,
+    AgentLoop, HostTools, LoopConfig, LoopRetry, PlatformTools, ReplyEnd, StopCondition,
 };
 
 mod reporting;
@@ -945,7 +945,7 @@ fn append_transcript(transcript: &mut std::fs::File, message: &Message) -> Resul
 async fn developer_tools(workspace: &Path) -> Result<Arc<dyn HostTools>> {
     let client = DeveloperClient::new()?;
     Ok(Arc::new(
-        McpTools::new(Arc::new(client), "issue-worker", workspace.to_path_buf()).await?,
+        PlatformTools::new(Arc::new(client), "issue-worker", workspace.to_path_buf()).await?,
     ))
 }
 

@@ -15,10 +15,11 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use goose::agents::{mcp_client::McpClientTrait, tool_execution::ToolCallContext};
+use goose::agents::{platform_extensions::PlatformExtension, tool_execution::ToolCallContext};
 use goose_agent::{
+    empty_response::{EMPTY_RESPONSE_MESSAGE, EmptyResponseOperation},
     events::AgentEvent,
-    inference::{InferenceEffect, InferenceRunner, is_empty_response_marker},
+    inference::{InferenceEffect, InferenceRunner},
     machine::{EffectHandler, MachineSession, SessionLoader, StateMachine, Step},
     operation::{
         ConversationEffect, Emitter, MachineEffect, Operation, OperationResult, applied,
@@ -232,6 +233,7 @@ impl AgentLoop {
                 max_turns: self.max_turns.load(Ordering::SeqCst),
                 reached: self.turn_limit_reached.clone(),
             })) as Step<'_, LoopSession, LoopEffect>,
+            Step::Operation(Arc::new(EmptyResponseOperation)),
             Step::Operation(Arc::new(EmptyResponse)),
             Step::Operation(Arc::new(Compaction {
                 provider: self.provider.clone(),
@@ -271,8 +273,8 @@ impl AgentLoop {
         result?;
 
         let mut conversation = lock(&self.conversation);
-        // After its own retries, the GDK marks a still-empty response instead of
-        // failing; it is a transient failure, not a result.
+        // GDK recovery emits a fallback after exhausting empty-response retries.
+        // Treat that fallback as a transient failure, not a result.
         if conversation.last().is_some_and(is_empty_response_marker) {
             conversation.pop();
             return Ok(ReplyEnd::ProviderError(ErrorContent {
@@ -556,27 +558,26 @@ impl Operation<LoopSession, LoopEffect> for StopWhen {
     }
 }
 
-/// Serves an in-process Goose MCP client, such as the developer tools, as
+/// Serves an in-process Goose platform extension, such as the developer tools, as
 /// host tools rooted in one working directory.
-pub(crate) struct McpTools {
-    client: Arc<dyn McpClientTrait>,
+pub(crate) struct PlatformTools {
+    client: Arc<dyn PlatformExtension>,
     tools: Vec<Tool>,
     instructions: Option<String>,
     session_id: String,
     working_dir: PathBuf,
 }
 
-impl McpTools {
+impl PlatformTools {
     pub async fn new(
-        client: Arc<dyn McpClientTrait>,
+        client: Arc<dyn PlatformExtension>,
         session_id: &str,
         working_dir: PathBuf,
     ) -> Result<Self> {
         let tools = client
-            .list_tools(session_id, None, CancellationToken::new())
+            .list_tools(session_id)
             .await
-            .map_err(|error| anyhow::anyhow!("Listing tools failed: {error}"))?
-            .tools;
+            .map_err(|error| anyhow::anyhow!("Listing tools failed: {error}"))?;
         Ok(Self {
             instructions: client.get_instructions(session_id, &working_dir).await,
             client,
@@ -588,7 +589,7 @@ impl McpTools {
 }
 
 #[async_trait::async_trait]
-impl HostTools for McpTools {
+impl HostTools for PlatformTools {
     fn tools(&self) -> Vec<Tool> {
         self.tools.clone()
     }
@@ -725,6 +726,19 @@ fn render_content(content: &MessageContent) -> String {
 
 /// Ends the reply when the model's response stayed empty after the GDK's own
 /// retries. Without this, inference would run again immediately.
+fn is_empty_response_marker(message: &Message) -> bool {
+    message.role == rmcp::model::Role::Assistant
+        && !message.metadata.output_token_limit_reached
+        && (message.as_concat_text() == EMPTY_RESPONSE_MESSAGE
+            || message.content.iter().all(|content| match content {
+                MessageContent::Text(text) => text.text.trim().is_empty(),
+                MessageContent::Thinking(thinking) => {
+                    thinking.thinking.trim().is_empty() && thinking.signature.is_empty()
+                }
+                _ => false,
+            }))
+}
+
 struct EmptyResponse;
 
 #[async_trait::async_trait]
@@ -811,21 +825,48 @@ impl Operation<LoopSession, LoopEffect> for Compaction {
             context_tokens = self.context_tokens.load(Ordering::SeqCst),
             "Compacting agent conversation"
         );
-        match goose::context_mgmt::compact_messages(
-            self.provider.as_ref(),
-            &self.model_config,
-            &session.id,
-            &conversation,
-            false,
+        let model = goose_context_management::ProviderModel::new(
+            self.provider.clone(),
+            self.model_config.clone(),
+        );
+        let visible: Vec<_> = conversation
+            .messages()
+            .iter()
+            .filter(|message| message.is_agent_visible())
+            .map(Message::agent_visible_content)
+            .collect();
+        match goose_context_management::summarize(
+            &model,
+            None,
+            &goose_context_management::Templates::default(),
+            &visible,
         )
         .await
         {
-            Ok(result) => applied([
-                LoopEffect::Conversation(ConversationEffect::ReplaceConversation(
-                    result.conversation,
-                )),
-                LoopEffect::CompactionUsage(result.usage),
-            ]),
+            Ok(result) => {
+                let mut messages: Vec<_> = conversation
+                    .messages()
+                    .iter()
+                    .cloned()
+                    .map(|mut message| {
+                        message.metadata = message.metadata.with_agent_invisible();
+                        message
+                    })
+                    .collect();
+                messages.push(result.message);
+                // Preserve the current task after the summary so inference can continue.
+                if let Some(kickoff) = messages_since_kickoff(&conversation)?.first() {
+                    let mut prompt = kickoff.clone().agent_only();
+                    prompt.id = None;
+                    messages.push(prompt);
+                }
+                applied([
+                    LoopEffect::Conversation(ConversationEffect::ReplaceConversation(
+                        Conversation::new_unvalidated(messages),
+                    )),
+                    LoopEffect::CompactionUsage(result.usage),
+                ])
+            }
             Err(error) => {
                 // Continue uncompacted; an overflow then ends the reply as a
                 // provider error.
@@ -836,7 +877,7 @@ impl Operation<LoopSession, LoopEffect> for Compaction {
     }
 }
 
-fn nonnegative(tokens: Option<i32>) -> u64 {
+fn nonnegative(tokens: Option<i64>) -> u64 {
     tokens.unwrap_or(0).max(0) as u64
 }
 
@@ -958,7 +999,7 @@ pub(crate) mod testing {
         responses: Mutex<std::collections::VecDeque<Result<Message, ProviderError>>>,
         pub calls: Mutex<Vec<(String, Vec<String>)>>,
         /// Input tokens reported for every call, if any.
-        input_tokens: Option<i32>,
+        input_tokens: Option<i64>,
     }
 
     impl Scripted {
@@ -968,7 +1009,7 @@ pub(crate) mod testing {
 
         pub fn reporting(
             responses: Vec<Result<Message, ProviderError>>,
-            input_tokens: Option<i32>,
+            input_tokens: Option<i64>,
         ) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(responses.into()),
@@ -1136,7 +1177,10 @@ mod tests {
 
         assert_eq!(end, ReplyEnd::Finished);
         assert!(lock(&tools.0).is_empty());
-        assert_eq!(tool_results(&agent), ["true:Tool shell is not available"]);
+        assert_eq!(
+            tool_results(&agent),
+            ["true:Tool 'shell' was not available in this request. Available tools: [echo]."]
+        );
         assert_eq!(lock(&provider.calls).len(), 2);
     }
 
@@ -1345,7 +1389,10 @@ mod tests {
         assert_eq!(lock(&tools.0).len(), 1);
         assert_eq!(
             tool_results(&agent),
-            ["false:echoed", "true:Tool echo is not available"]
+            [
+                "false:echoed",
+                "true:Tool 'echo' was not available in this request. Available tools: []."
+            ]
         );
         let calls = lock(&provider.calls);
         assert_eq!(calls[2], ("Policy.".to_owned(), Vec::<String>::new()));
@@ -1353,7 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_responses_are_retryable_failures_not_results() {
-        // The GDK retries an empty response three times within one call.
+        // The GDK recovery operation retries an empty response three times.
         let blank = || Ok(Message::assistant().with_text("  "));
         let provider = Scripted::new(vec![blank(), Ok(Message::assistant().with_text("result"))]);
         let recovered = agent(provider, Arc::new(Echo(Mutex::new(Vec::new()))), 10);
@@ -1423,6 +1470,11 @@ mod tests {
         );
         let tools = Arc::new(Echo(Mutex::new(Vec::new())));
         let agent = agent(provider.clone(), tools.clone(), 10);
+        lock(&agent.conversation).push(
+            Message::assistant()
+                .with_text("ARCHIVED CONTENT MUST NOT BE RESUMMARIZED")
+                .with_visibility(true, false),
+        );
 
         let end = agent
             .reply(
@@ -1436,6 +1488,11 @@ mod tests {
         assert_eq!(end, ReplyEnd::Finished);
         assert_eq!(lock(&tools.0).len(), 1);
         assert_eq!(lock(&provider.calls).len(), 3);
+        assert!(
+            !lock(&provider.calls)[1]
+                .0
+                .contains("ARCHIVED CONTENT MUST NOT BE RESUMMARIZED")
+        );
         let visible = agent_visible_text(&agent).join("\n");
         assert!(visible.contains("SUMMARY OF EARLIER WORK"), "{visible}");
         assert!(visible.contains("go"));
