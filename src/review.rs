@@ -132,7 +132,7 @@ fn list_available_skills(skills_dir: Option<&std::path::Path>) -> Vec<String> {
     available
 }
 
-fn nonnegative_token_count(tokens: Option<i32>) -> u64 {
+fn nonnegative_token_count(tokens: Option<i64>) -> u64 {
     tokens.unwrap_or(0).max(0) as u64
 }
 

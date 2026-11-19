@@ -5,10 +5,10 @@ edition = "2024"
 rust-version = "1.98.1"
 
 [dependencies]
-goose = { git = "https://github.com/aaif-goose/goose", rev = "c97af00bca96442611bb95155c56d6109afa42d6", default-features = false, features = ["rustls-tls"] }
-goose-providers = { git = "https://github.com/aaif-goose/goose", rev = "c97af00bca96442611bb95155c56d6109afa42d6", default-features = false, features = ["rustls-tls"] }
-goose-agent = { git = "https://github.com/aaif-goose/goose", rev = "c97af00bca96442611bb95155c56d6109afa42d6" }
-goose-context-management = { git = "https://github.com/aaif-goose/goose", rev = "c97af00bca96442611bb95155c56d6109afa42d6" }
+goose = { git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a", default-features = false, features = ["rustls-tls"] }
+goose-providers = { package = "oi-kit-providers", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a", default-features = false, features = ["rustls-tls"] }
+goose-agent = { package = "oi-kit-agent", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a" }
+goose-context-management = { package = "oi-kit-context-management", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a" }
 buzz-client = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }
 buzz-sdk = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }
 nostr = "0.44"
@@ -25,7 +25,7 @@ dotenvy = "0.15"
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rmcp = "3.4.1"
+rmcp = "3.9.0"
 tokio-util = "0.7.19"
 redb = "4"
 time = { version = "0.3", features = ["formatting", "parsing"] }
@@ -33,8 +33,3 @@ tempfile = "3.27.0"
 config = { version = "0.15.25", features = ["toml"] }
 axum = "0.8.9"
 tower-http = { version = "0.7.1", features = ["trace"] }
-
-[target.'cfg(unix)'.dependencies]
-# Goose uses ProcessSession but relied on RMCP to enable this feature.
-# RMCP 3.3+ uses process-wrap 10, so enable it explicitly for Goose's version.
-process-wrap = { version = "9", default-features = false, features = ["std", "process-session"] }

@@ -541,9 +541,9 @@ dependencies = [
 
 [[package]]
 name = "axum-server"
-version = "0.8.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
+checksum = "3766086d344b8f8d2a9cf6fb211b581de5b160e052d7bc75a92e58cc41909054"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -556,6 +556,7 @@ dependencies = [
  "pin-project-lite",
  "rustls",
  "rustls-pki-types",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -1417,6 +1418,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive-new"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cdc8d50f426189eef89dac62fabfa0abb27d5cc008f25bf4156a0203325becc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1656,6 +1668,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a2e16b9a584b602f1e0e5e22c30ca0906786088c27500653e432d086def8b53"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1684,11 +1707,10 @@ dependencies = [
  "dotenvy",
  "futures",
  "goose",
- "goose-agent",
- "goose-context-management",
- "goose-providers",
  "nostr",
- "process-wrap 9.1.1",
+ "oi-kit-agent",
+ "oi-kit-context-management",
+ "oi-kit-providers",
  "redb",
  "reqwest",
  "rmcp",
@@ -2018,9 +2040,9 @@ dependencies = [
 
 [[package]]
 name = "gloo-timers"
-version = "0.3.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+checksum = "a4460540da666acdb5722b2a62ac47d18f627fcfc0c728d04dc7226b3f6d40a7"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -2030,8 +2052,8 @@ dependencies = [
 
 [[package]]
 name = "goose"
-version = "1.58.1"
-source = "git+https://github.com/aaif-goose/goose?rev=c97af00bca96442611bb95155c56d6109afa42d6#c97af00bca96442611bb95155c56d6109afa42d6"
+version = "1.60.0"
+source = "git+https://github.com/aaif-goose/goose?rev=bf074d6d114690de6cbe7edc925cb26efdf6f16a#bf074d6d114690de6cbe7edc925cb26efdf6f16a"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
@@ -2053,11 +2075,7 @@ dependencies = [
  "futures",
  "gethostname",
  "goose-acp-macros",
- "goose-agent",
- "goose-context-management",
- "goose-download-manager",
- "goose-providers",
- "goose-sdk-types",
+ "goose-acp-types",
  "ignore",
  "image",
  "include_dir",
@@ -2070,6 +2088,10 @@ dependencies = [
  "nanoid",
  "ntapi",
  "oauth2",
+ "oi-kit-agent",
+ "oi-kit-context-management",
+ "oi-kit-download-manager",
+ "oi-kit-providers",
  "once_cell",
  "pastey",
  "pem",
@@ -2118,123 +2140,17 @@ dependencies = [
 
 [[package]]
 name = "goose-acp-macros"
-version = "1.58.1"
-source = "git+https://github.com/aaif-goose/goose?rev=c97af00bca96442611bb95155c56d6109afa42d6#c97af00bca96442611bb95155c56d6109afa42d6"
+version = "1.60.0"
+source = "git+https://github.com/aaif-goose/goose?rev=bf074d6d114690de6cbe7edc925cb26efdf6f16a#bf074d6d114690de6cbe7edc925cb26efdf6f16a"
 dependencies = [
  "quote",
  "syn 3.0.10",
 ]
 
 [[package]]
-name = "goose-agent"
-version = "0.1.0-alpha.13"
-source = "git+https://github.com/aaif-goose/goose?rev=c97af00bca96442611bb95155c56d6109afa42d6#c97af00bca96442611bb95155c56d6109afa42d6"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "goose-provider-types",
- "goose-sdk-types",
- "regex",
- "rmcp",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-futures",
- "uuid",
-]
-
-[[package]]
-name = "goose-context-management"
-version = "0.1.0-alpha.13"
-source = "git+https://github.com/aaif-goose/goose?rev=c97af00bca96442611bb95155c56d6109afa42d6#c97af00bca96442611bb95155c56d6109afa42d6"
-dependencies = [
- "anyhow",
- "async-trait",
- "goose-provider-types",
- "include_dir",
- "minijinja",
- "rmcp",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "goose-download-manager"
-version = "0.1.0-alpha.13"
-source = "git+https://github.com/aaif-goose/goose?rev=c97af00bca96442611bb95155c56d6109afa42d6#c97af00bca96442611bb95155c56d6109afa42d6"
-dependencies = [
- "anyhow",
- "once_cell",
- "reqwest",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "goose-provider-types"
-version = "0.1.0-alpha.13"
-source = "git+https://github.com/aaif-goose/goose?rev=c97af00bca96442611bb95155c56d6109afa42d6#c97af00bca96442611bb95155c56d6109afa42d6"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "base64 0.23.1",
- "chrono",
- "futures",
- "getrandom 0.4.3",
- "gloo-timers",
- "once_cell",
- "rand 0.10.3",
- "regex",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "strum",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "unicode-normalization",
- "uuid",
- "zstd",
-]
-
-[[package]]
-name = "goose-providers"
-version = "0.1.0-alpha.13"
-source = "git+https://github.com/aaif-goose/goose?rev=c97af00bca96442611bb95155c56d6109afa42d6#c97af00bca96442611bb95155c56d6109afa42d6"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "base64 0.23.1",
- "chrono",
- "futures",
- "goose-provider-types",
- "include_dir",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "url",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
-name = "goose-sdk-types"
-version = "0.1.0-alpha.13"
-source = "git+https://github.com/aaif-goose/goose?rev=c97af00bca96442611bb95155c56d6109afa42d6#c97af00bca96442611bb95155c56d6109afa42d6"
+name = "goose-acp-types"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/aaif-goose/goose?rev=bf074d6d114690de6cbe7edc925cb26efdf6f16a#bf074d6d114690de6cbe7edc925cb26efdf6f16a"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
@@ -2881,15 +2797,15 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.55.1"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b68339c3d874e48151d74ffe256d93a58cffa240983cb0967d3cbaea083a44fe"
+checksum = "0e37f27df77c7887edbc5f5a59ecd8e5ec4a669319266ec1b61068667a603183"
 dependencies = [
  "ahash",
  "bytecount",
  "data-encoding",
  "email_address",
- "fancy-regex",
+ "fancy-regex 0.20.2",
  "fraction",
  "getrandom 0.3.4",
  "itoa",
@@ -2909,23 +2825,24 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.55.1"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6307b5b51216ec9b941b52244c74043fa0b1d6b657b56199f57cb1416d3641c5"
+checksum = "7e41151614b6c927e21982be8bef5a26741ae5a0ae6a781eedee2aa930a980e6"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.55.1"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0230ac05e09c6111e96c147b75c390579f5cbd45654b980c68ac60fe17b3f129"
+checksum = "1515b9a91134ef67d7bac95c2d76fbc7e383c4c55ee544204ceec8088f881fef"
 dependencies = [
  "ahash",
  "bytecount",
  "fraction",
  "getrandom 0.3.4",
+ "memchr",
  "num-cmp",
  "num-traits",
  "serde_json",
@@ -2999,9 +2916,9 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lru"
-version = "0.18.5"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
 
 [[package]]
 name = "lru-slab"
@@ -3377,6 +3294,123 @@ dependencies = [
 ]
 
 [[package]]
+name = "oi-kit-agent"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/aaif-goose/goose?rev=bf074d6d114690de6cbe7edc925cb26efdf6f16a#bf074d6d114690de6cbe7edc925cb26efdf6f16a"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "futures",
+ "goose-acp-types",
+ "indexmap 2.14.2",
+ "indoc",
+ "jsonschema",
+ "libc",
+ "oi-kit-context-management",
+ "oi-kit-provider-types",
+ "once_cell",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-futures",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "oi-kit-context-management"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/aaif-goose/goose?rev=bf074d6d114690de6cbe7edc925cb26efdf6f16a#bf074d6d114690de6cbe7edc925cb26efdf6f16a"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "include_dir",
+ "minijinja",
+ "oi-kit-provider-types",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "oi-kit-download-manager"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/aaif-goose/goose?rev=bf074d6d114690de6cbe7edc925cb26efdf6f16a#bf074d6d114690de6cbe7edc925cb26efdf6f16a"
+dependencies = [
+ "anyhow",
+ "once_cell",
+ "reqwest",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "oi-kit-provider-types"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/aaif-goose/goose?rev=bf074d6d114690de6cbe7edc925cb26efdf6f16a#bf074d6d114690de6cbe7edc925cb26efdf6f16a"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "futures",
+ "getrandom 0.4.3",
+ "gloo-timers",
+ "once_cell",
+ "rand 0.10.3",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "oi-kit-providers"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/aaif-goose/goose?rev=bf074d6d114690de6cbe7edc925cb26efdf6f16a#bf074d6d114690de6cbe7edc925cb26efdf6f16a"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "futures",
+ "include_dir",
+ "oi-kit-provider-types",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3636,16 +3670,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "process-wrap"
-version = "9.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f95f6259ebd0640685b7cd26d635861f39208df0f89b2b61ff5cf76310fa54f6"
-dependencies = [
- "indexmap 2.14.2",
- "nix",
 ]
 
 [[package]]
@@ -3925,9 +3949,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.55.1"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a196a5b4a8a12f46b6353174df865a05d41a6055aff212ec30877492788618b6"
+checksum = "a028057ef852c58a42d75e09da87b5e733f4030f4c7411728955e4f87203a577"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -4051,7 +4075,7 @@ dependencies = [
  "oauth2",
  "pastey",
  "pin-project-lite",
- "process-wrap 10.0.1",
+ "process-wrap",
  "reqwest",
  "rmcp-macros",
  "schemars 1.2.3",
@@ -5061,7 +5085,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bstr",
- "fancy-regex",
+ "fancy-regex 0.19.2",
  "regex",
  "rustc-hash",
 ]
@@ -5595,15 +5619,18 @@ dependencies = [
 
 [[package]]
 name = "v_escape-base"
-version = "0.1.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1212fce830b75af194b578e55b3db9049f2c8c45f58d397fb25602fdb50fb3d"
+checksum = "be17d1ebd0a2a1acc817577248ebe21bad513adf35b5bad71ab6adfd74a6de35"
+dependencies = [
+ "derive-new",
+]
 
 [[package]]
 name = "v_htmlescape"
-version = "0.17.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "befb3d53c9e3ec641417685896cbc8cc5bd264d6a2e190c56aaef1af24740d99"
+checksum = "70210eadf6232ce4de5cc24c46500ba6f1ae59308ea445a865b1dff3396c4f7a"
 dependencies = [
  "v_escape-base",
 ]
