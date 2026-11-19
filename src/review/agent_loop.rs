@@ -86,8 +86,23 @@ impl UsageLog {
         lock(&self.0).clone()
     }
 
-    fn push(&self, usage: ProviderUsage) {
+    pub(super) fn push(&self, usage: ProviderUsage) {
         lock(&self.0).push(usage);
+    }
+
+    /// Reserve a cumulative ACP session entry. Updating it avoids counting
+    /// repeated notifications or a late provider charge more than once.
+    pub(super) fn reserve(&self, model: &str) -> usize {
+        let mut entries = lock(&self.0);
+        let index = entries.len();
+        entries.push(ProviderUsage::new(model.to_owned(), Default::default()));
+        index
+    }
+
+    pub(super) fn update(&self, index: usize, usage: ProviderUsage) {
+        if let Some(entry) = lock(&self.0).get_mut(index) {
+            *entry = usage;
+        }
     }
 }
 
@@ -107,7 +122,7 @@ pub(crate) struct AgentLoop {
     provider: Arc<dyn Provider>,
     model_config: ModelConfig,
     system_prompt: String,
-    tools: Mutex<Vec<Arc<dyn HostTools>>>,
+    tools: Arc<Mutex<Vec<Arc<dyn HostTools>>>>,
     max_turns: AtomicU32,
     stop_when: Option<StopCondition>,
     conversation: Mutex<Conversation>,
@@ -115,6 +130,7 @@ pub(crate) struct AgentLoop {
     turn_limit_reached: Arc<AtomicBool>,
     /// Context size of the latest model call; drives proactive compaction.
     context_tokens: Arc<AtomicU64>,
+    acp: Option<super::acp_loop::AcpLoop>,
 }
 
 impl AgentLoop {
@@ -124,14 +140,36 @@ impl AgentLoop {
             provider: config.provider,
             model_config: config.model_config,
             system_prompt: config.system_prompt,
-            tools: Mutex::new(config.tools),
+            tools: Arc::new(Mutex::new(config.tools)),
             max_turns: AtomicU32::new(config.max_turns),
             stop_when: config.stop_when,
             conversation: Mutex::new(Conversation::empty()),
             usage: UsageLog::default(),
             turn_limit_reached: Arc::new(AtomicBool::new(false)),
             context_tokens: Arc::new(AtomicU64::new(0)),
+            acp: None,
         }
+    }
+
+    /// Use a persistent Goose ACP conversation for review-only phases.
+    pub fn with_acp(
+        mut self,
+        command: Option<&std::path::Path>,
+        provider: &str,
+        timeout: Duration,
+    ) -> Self {
+        if let Some(command) = command {
+            self.acp = Some(super::acp_loop::AcpLoop::new(
+                command,
+                provider,
+                &self.model_config.model_name,
+                self.system_prompt(&lock(&self.tools)),
+                self.tools.clone(),
+                self.max_turns.load(Ordering::SeqCst),
+                timeout,
+            ));
+        }
+        self
     }
 
     /// Replaces the tools offered from the next reply on. Earlier tool calls and
@@ -182,6 +220,9 @@ impl AgentLoop {
     /// last `max_chars` characters. It is untrusted model output: write it to
     /// artifacts, never to logs.
     pub fn last_reply_transcript(&self, max_chars: usize) -> String {
+        if let Some(acp) = &self.acp {
+            return acp.transcript(max_chars);
+        }
         let conversation = lock(&self.conversation);
         let rendered = last_reply(conversation.messages())
             .iter()
@@ -206,6 +247,36 @@ impl AgentLoop {
         cancel: &CancellationToken,
         mut on_message: impl FnMut(&Message),
     ) -> Result<ReplyEnd> {
+        if let Some(acp) = &self.acp {
+            on_message(&message);
+            lock(&self.conversation).push(message.clone());
+            let text = message.as_concat_text();
+            let execution = acp.reply(&text, cancel, &self.usage);
+            tokio::pin!(execution);
+            // ACP usage arrives independently of assistant text. Keep the
+            // existing phase budget callbacks active while a prompt runs.
+            let mut budget_tick = tokio::time::interval(Duration::from_millis(100));
+            let result = loop {
+                tokio::select! {
+                    result = &mut execution => break result?,
+                    _ = budget_tick.tick() => on_message(&Message::assistant()),
+                }
+            };
+            let reply = Message::assistant().with_text(&result.text);
+            on_message(&reply);
+            lock(&self.conversation).push(reply);
+            return match result.status {
+                harness_acp::Completion::Completed | harness_acp::Completion::Cancelled => {
+                    Ok(ReplyEnd::Finished)
+                }
+                _ => Ok(ReplyEnd::ProviderError(ErrorContent {
+                    kind: MessageErrorKind::Other,
+                    message: result
+                        .error
+                        .unwrap_or_else(|| format!("ACP execution ended: {:?}", result.status)),
+                })),
+            };
+        }
         self.drop_trailing_error();
         self.turn_limit_reached.store(false, Ordering::SeqCst);
         on_message(&message);

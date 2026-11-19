@@ -12,6 +12,12 @@
     };
 
     flake-utils.url = "github:numtide/flake-utils";
+    goose = {
+      url = "github:aaif-goose/goose/bf074d6d114690de6cbe7edc925cb26efdf6f16a";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
   outputs =
@@ -19,6 +25,7 @@
     , nixpkgs
     , rust-overlay
     , flake-utils
+    , goose
     , ...
     }:
     flake-utils.lib.eachDefaultSystem
@@ -47,6 +54,19 @@
               "llvm-tools-preview"
             ];
           };
+
+          # Reuse the pinned upstream CLI recipe with its binary Rust toolchain.
+          # nixpkgs rustc currently fails candle-core AVX512 intrinsics.
+          gooseRust = pkgs.rust-bin.fromRustupToolchainFile "${goose}/rust-toolchain.toml";
+          gooseOutputs = (import "${goose}/flake.nix").outputs {
+            self = goose;
+            inherit nixpkgs flake-utils;
+            rust-overlay.overlays.default = final: prev:
+              (rust-overlay.overlays.default final prev) // {
+                rustPlatform = final.makeRustPlatform { cargo = gooseRust; rustc = gooseRust; };
+              };
+          };
+          goosePackage = gooseOutputs.packages.${system}.default;
 
           # Common inputs
           envVars = {
@@ -86,6 +106,7 @@
         in
         rec {
           packages.attic-client = pkgs.attic-client;
+          packages.goose = goosePackage;
 
           packages.default = (pkgs.makeRustPlatform {
             cargo = stable_toolchain;
@@ -104,7 +125,10 @@
               };
             };
 
-            nativeBuildInputs = with pkgs; [ pkg-config protobuf ];
+            nativeBuildInputs = with pkgs; [ pkg-config protobuf makeWrapper ];
+            postInstall = ''
+              wrapProgram "$out/bin/fiach" --prefix PATH : ${lib.makeBinPath [ goosePackage ]}
+            '';
             # cacert sets SSL_CERT_FILE; TLS clients built in tests need a CA store.
             nativeCheckInputs = with pkgs; [ cacert git python3 ripgrep ];
             buildInputs = with pkgs; [ openssl sqlite zlib ] ++ libsDarwin;
@@ -318,6 +342,7 @@
             {
               inherit stable;
               default = stable;
+              acp = pkgs.mkShell { inputsFrom = [ stable ]; packages = [ goosePackage ]; };
             };
         }
       ) // {
@@ -592,6 +617,13 @@
               type = lib.types.int;
               default = 30;
               description = "Timeout in minutes for each review session.";
+            };
+
+            acpCommand = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "goose";
+              description = "Opt-in Goose ACP executable for review phases.";
             };
 
             laneTimeoutMins = lib.mkOption {
@@ -1019,6 +1051,8 @@
                         provider_probe_interval_secs = cfg.providerProbeIntervalSecs;
                       } // lib.optionalAttrs (cfg.laneTimeoutMins != null) {
                         lane_timeout_mins = cfg.laneTimeoutMins;
+                      } // lib.optionalAttrs (cfg.acpCommand != null) {
+                        acp_command = cfg.acpCommand;
                       } // personaConfig // buzzConfig // lib.optionalAttrs (cfg.verifierProvider != null) {
                         verifier_provider = cfg.verifierProvider;
                       } // lib.optionalAttrs (cfg.verifierModel != null) {

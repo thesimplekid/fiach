@@ -969,3 +969,39 @@ Monitor that flag or the `fiach_review_processing_*`, `fiach_provider_circuit_*`
 `fiach_failed_reviews{class}`, and `fiach_reviews_needing_intervention` metrics in
 `/metrics`, rather than using it as a liveness probe. Failure details use fixed categories, never raw
 provider responses or source/model content.
+
+## ACP review execution
+
+Set `acp_command = "goose"` in `[review]` or `[daemon]`, or pass
+`--acp-command goose`, to run review lanes, coordinator, verifier, and duplicate-suppression sessions through the shared
+`harness-acp` adapter. The default remains the embedded runner while the ACP
+migration is verified. Issue-fixing workers retain the embedded runtime: their live turn-limit
+narrowing and stop-before-next-inference reporting conditions are not yet
+represented by the fixed ACP recipe contract.
+
+`nix develop .#acp` provides the pinned Goose executable. The packaged Fiach
+also places that executable first on PATH; an explicit executable path overrides
+it. Each review phase starts a fresh Goose process with private configuration, an
+explicit provider environment, and only its authenticated MCP bridge. The coordinator and verifier use the same
+host reporting handlers as embedded execution. Continuations keep the same ACP
+session; narrowed tool permissions are checked again at dispatch even if Goose
+still advertises the old tool catalog. A failed connection is never replayed.
+Goose runs in an empty task directory, with repository access supplied only by
+MCP, so its internal skill discovery cannot load checkout skills.
+No developer extension, file/terminal client capability, or ambient Goose
+extension configuration is supplied. The bridge validates tool schemas and
+rejects calls outside its fixed catalog. Existing inspection path confinement
+and evidence recording remain authoritative.
+
+Lanes submit schema-validated JSON through Goose's `final_output` tool. Missing
+or invalid output remains an incomplete lane, never a no-findings result.
+Cumulative Goose usage updates feed the existing observed review budget;
+context-window occupancy and final prompt summaries are not counted as new
+spending. Cancellation and deadlines stop and reap the owned Goose process.
+The advisory 80% budget nudge waits for an ACP prompt to finish; the hard
+observed budget still cancels the running process. Cancelled sessions cannot
+be resumed or silently replayed.
+The launcher boundary can later carry a VM connection; this change adds no VM.
+
+The canonical shared library is maintained in `harness-acp`; the versioned
+`vendor/harness-acp` snapshot keeps this repository independently buildable.

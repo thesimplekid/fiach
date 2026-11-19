@@ -7,6 +7,7 @@
 
 use std::{
     collections::BTreeMap,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -71,6 +72,7 @@ pub(super) struct Lanes {
     tasks: Vec<LaneTask>,
     snapshots: Mutex<BTreeMap<String, LaneSnapshot>>,
     provider_failure: Mutex<Option<anyhow::Error>>,
+    acp: Option<(PathBuf, String)>,
 }
 
 impl Lanes {
@@ -111,7 +113,13 @@ impl Lanes {
             tasks,
             snapshots: Mutex::new(snapshots),
             provider_failure: Mutex::new(None),
+            acp: None,
         }
+    }
+
+    pub fn with_acp(mut self, command: Option<&Path>, provider: &str) -> Self {
+        self.acp = command.map(|path| (path.to_path_buf(), provider.to_owned()));
+        self
     }
 
     /// Current lane states, sorted by lane name.
@@ -261,6 +269,9 @@ impl Lanes {
         task: &LaneTask,
         cancel: &CancellationToken,
     ) -> Result<String, LaneFailure> {
+        if let Some((command, provider)) = &self.acp {
+            return self.acp_attempt(command, provider, task, cancel).await;
+        }
         let agent = AgentLoop::new(
             session_id,
             LoopConfig {
@@ -327,6 +338,174 @@ impl Lanes {
             change(snapshot);
         }
     }
+
+    async fn acp_attempt(
+        &self,
+        command: &Path,
+        provider: &str,
+        task: &LaneTask,
+        cancel: &CancellationToken,
+    ) -> Result<String, LaneFailure> {
+        let failed = |reason, transcript: String| LaneFailure {
+            reason,
+            error_kind: None,
+            shape: ReplyShape::default(),
+            transcript,
+        };
+        let bridge =
+            harness_acp::mcp::McpBridge::start(Arc::new(InspectionTools(self.inspection.clone())))
+                .await
+                .map_err(|_| failed("session_error", String::new()))?;
+        // Goose has internal skill discovery even with no extensions. Run its
+        // session outside the untrusted checkout; only MCP can inspect it.
+        let scratch = tempfile::Builder::new()
+            .prefix("fiach-acp-lane-")
+            .tempdir()
+            .map_err(|_| failed("session_error", String::new()))?;
+        let mut launch = harness_acp::LaunchSpec::new(command);
+        // Pass only this provider's route. In sandbox children these are the
+        // broker URL and per-job key, never the host provider credentials.
+        let route = crate::broker::Provider::from_name(provider)
+            .map_err(|_| failed("unsupported_acp_provider", String::new()))?;
+        for name in [
+            "PATH",
+            "TMPDIR",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "NIX_SSL_CERT_FILE",
+            route.key_env(),
+            route.host_env(),
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                launch.env.insert(name.into(), value);
+            }
+        }
+        let request = harness_acp::Task {
+            prompt: task.instructions.clone(),
+            instructions: format!(
+                "{LANE_SYSTEM}\nUse the final_output tool to submit the requested JSON object."
+            ),
+            provider: provider.into(),
+            model: self.model_config.model_name.clone(),
+            cwd: scratch.path().to_path_buf(),
+            output_schema: Some(lane_schema(&task.lane)),
+            extensions: vec![bridge.extension("inspection")],
+            timeout: self.attempt_timeout,
+            max_turns: self.max_turns,
+        };
+        let observed = Mutex::new(AcpUsage::default());
+        let usage_slot = self.usage.reserve(&request.model);
+        let observe = |update: &serde_json::Value| {
+            if let Some(usage) = lock(&observed).observe(update, &request.model) {
+                self.usage.update(usage_slot, usage);
+            }
+        };
+        let result =
+            harness_acp::run_observed(&launch, &request, cancel.child_token(), &observe).await;
+        if let Some(usage) = &result.usage {
+            observe(usage);
+        }
+        let transcript = serde_json::to_string(&result.transcript)
+            .unwrap_or_default()
+            .chars()
+            .take(MAX_NOTES_CHARS)
+            .collect();
+        match result.status {
+            harness_acp::Completion::Completed => result
+                .output
+                .map(|output| output.to_string())
+                .ok_or_else(|| failed("invalid_output", transcript)),
+            harness_acp::Completion::Cancelled => Err(failed("phase_stopped", transcript)),
+            harness_acp::Completion::TimedOut => Err(failed("lane_deadline", transcript)),
+            harness_acp::Completion::InvalidOutput => Err(failed("invalid_output", transcript)),
+            harness_acp::Completion::ProviderError => {
+                *lock(&self.provider_failure) = Some(anyhow::anyhow!("ACP lane provider failed"));
+                Err(failed(PROVIDER_FAILURE, transcript))
+            }
+            _ => Err(failed("session_error", transcript)),
+        }
+    }
+}
+
+/// Track cumulative Goose session usage without counting the
+/// final prompt summary a second time. Context-window `used` is not spending.
+#[derive(Default)]
+pub(super) struct AcpUsage {
+    input: i64,
+    output: i64,
+    cost: f64,
+}
+
+impl AcpUsage {
+    pub(super) fn observe(
+        &mut self,
+        update: &serde_json::Value,
+        model: &str,
+    ) -> Option<goose_providers::conversation::token_usage::ProviderUsage> {
+        let input = update.get("accumulatedInputTokens")?.as_i64()?.max(0);
+        let output = update.get("accumulatedOutputTokens")?.as_i64()?.max(0);
+        let cost = update
+            .get("accumulatedCost")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0);
+        let input_delta = input.saturating_sub(self.input).max(0);
+        let output_delta = output.saturating_sub(self.output).max(0);
+        let cost_delta = cost.map(|cost| (cost - self.cost).max(0.0));
+        if input_delta == 0 && output_delta == 0 && cost_delta.unwrap_or(0.0) == 0.0 {
+            return None;
+        }
+        self.input = self.input.max(input);
+        self.output = self.output.max(output);
+        if let Some(cost) = cost {
+            self.cost = self.cost.max(cost);
+        }
+        let mut usage = goose_providers::conversation::token_usage::ProviderUsage::new(
+            model.to_owned(),
+            goose_providers::conversation::token_usage::Usage::new(
+                Some(self.input),
+                Some(self.output),
+                Some(self.input.saturating_add(self.output)),
+            ),
+        );
+        usage.cost = cost;
+        Some(usage)
+    }
+}
+
+struct InspectionTools(Inspection);
+
+#[async_trait::async_trait]
+impl harness_acp::mcp::ToolHandler for InspectionTools {
+    fn tools(&self) -> Vec<rmcp::model::Tool> {
+        super::agent_loop::HostTools::tools(&self.0)
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Option<rmcp::model::JsonObject>,
+        cancel: CancellationToken,
+    ) -> rmcp::model::CallToolResult {
+        super::agent_loop::HostTools::call(&self.0, name, arguments, cancel).await
+    }
+}
+
+fn lane_schema(lane: &str) -> serde_json::Value {
+    if super::is_summary_lane(lane) {
+        serde_json::json!({"type":"object", "required":["overview","key_changes","affected_areas","testing"],
+            "properties":{"overview":{"type":"string"},"testing":{"type":"string"},
+            "key_changes":{"type":"array","items":{"type":"string"}},"affected_areas":{"type":"array","items":{"type":"string"}}}, "additionalProperties":false})
+    } else {
+        let candidate = crate::reporting::reporting_tools()
+            .into_iter()
+            .find(|tool| tool.name == "submit_finding")
+            .map(|tool| serde_json::Value::Object(tool.input_schema.as_ref().clone()))
+            .unwrap_or(serde_json::Value::Bool(false));
+        serde_json::json!({"type":"object", "required":["status","candidates"],
+            "properties":{"status":{"enum":["candidates","no_findings"]},"candidates":{"type":"array","items":candidate},
+            "summary":{"type":"string"},"skills_used":{"type":"array","items":{"type":"string"}}}, "additionalProperties":false,
+            "allOf":[{"if":{"properties":{"status":{"const":"no_findings"}}},"then":{"properties":{"candidates":{"maxItems":0}}}},{"if":{"properties":{"status":{"const":"candidates"}}},"then":{"properties":{"candidates":{"minItems":1}}}}]})
+    }
 }
 
 /// Whether a failed attempt earns a replacement. A deadline, provider failure,
@@ -345,6 +524,46 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn acp_usage_counts_cumulative_updates_once_and_ignores_context_size() {
+        let mut usage = super::AcpUsage::default();
+        assert!(
+            usage
+                .observe(&serde_json::json!({"used":999,"size":1000}), "model")
+                .is_none()
+        );
+        let first = serde_json::json!({"accumulatedInputTokens":10,"accumulatedOutputTokens":2,"accumulatedCost":0.02});
+        let delta = usage.observe(&first, "model").unwrap();
+        assert_eq!(delta.usage.input_tokens, Some(10));
+        assert_eq!(delta.cost, Some(0.02));
+        assert!(usage.observe(&first, "model").is_none());
+        let second = serde_json::json!({"accumulatedInputTokens":35,"accumulatedOutputTokens":7,"accumulatedCost":0.05});
+        let delta = usage.observe(&second, "model").unwrap();
+        assert_eq!(delta.usage.input_tokens, Some(35));
+        assert_eq!(delta.usage.output_tokens, Some(7));
+        assert!((delta.cost.unwrap() - 0.05).abs() < 1e-9);
+        assert!(
+            usage
+                .observe(
+                    &serde_json::json!({"promptUsage":{"inputTokens":35,"outputTokens":7}}),
+                    "model"
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn acp_lane_schema_requires_explicit_no_findings_and_nonempty_candidates() {
+        let schema = super::lane_schema("security");
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&serde_json::json!({"status":"no_findings","candidates":[]})));
+        assert!(!validator.is_valid(&serde_json::json!({"status":"candidates","candidates":[]})));
+        assert!(
+            !validator.is_valid(&serde_json::json!({"status":"no_findings","candidates":[{}]}))
+        );
+        assert!(!validator.is_valid(&serde_json::json!({"summary":"Looks fine"})));
+    }
 
     use goose_providers::{base::MessageStream, errors::ProviderError};
     use rmcp::model::Tool;

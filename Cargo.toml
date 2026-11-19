@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.98.1"
 
 [dependencies]
+harness-acp = { path = "vendor/harness-acp" }
 goose = { git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a", default-features = false, features = ["rustls-tls"] }
 goose-providers = { package = "oi-kit-providers", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a", default-features = false, features = ["rustls-tls"] }
 goose-agent = { package = "oi-kit-agent", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a" }
@@ -33,3 +34,6 @@ tempfile = "3.27.0"
 config = { version = "0.15.25", features = ["toml"] }
 axum = "0.8.9"
 tower-http = { version = "0.7.1", features = ["trace"] }
+
+[dev-dependencies]
+jsonschema = { version = "0.55", default-features = false }

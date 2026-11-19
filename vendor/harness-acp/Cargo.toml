@@ -1,0 +1,30 @@
+[package]
+name = "harness-acp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "Bounded Goose ACP tasks for application-owned workflows"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "process", "rt-multi-thread", "macros", "time", "sync", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tempfile = "3"
+jsonschema = { version = "0.55", default-features = false }
+nix = { version = "0.30", features = ["signal", "process"] }
+rmcp = { version = "3.9", features = ["server", "transport-streamable-http-server"] }
+axum = "0.8"
+uuid = { version = "1", features = ["v4"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[workspace]

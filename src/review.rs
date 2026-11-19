@@ -25,6 +25,7 @@ use crate::state;
 use crate::workspace;
 use agent_loop::{AgentLoop, HostTools, LoopConfig, LoopRetry, ReplyEnd};
 
+mod acp_loop;
 pub(crate) mod agent_loop;
 mod lanes;
 
@@ -195,8 +196,8 @@ fn cost_from_provider_usage(
         estimate_cost(
             provider,
             model,
-            nonnegative_token_count(usage.usage.input_tokens),
-            nonnegative_token_count(usage.usage.output_tokens),
+            u64::try_from(usage.usage.input_tokens?).ok()?,
+            u64::try_from(usage.usage.output_tokens?).ok()?,
             input_price_per_m,
             output_price_per_m,
         )
@@ -403,6 +404,8 @@ pub struct ReviewParams {
     pub timeout_mins: u64,
     /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
+    /// Opt-in Goose ACP executable for review phases.
+    pub acp_command: Option<PathBuf>,
     /// Path to the redb database
     pub db_path: PathBuf,
     /// Persona-specific review identity used for report paths and state keys.
@@ -1489,6 +1492,7 @@ pub async fn run_review(
             },
         ),
     );
+    let lanes = lanes.with_acp(params.acp_command.as_deref(), &params.provider);
     if !normalized_review_lanes.is_empty() {
         tracing::info!(
             repo = %params.repo,
@@ -1518,6 +1522,11 @@ pub async fn run_review(
             max_turns: params.max_turns,
             stop_when: None,
         },
+    )
+    .with_acp(
+        params.acp_command.as_deref(),
+        &params.provider,
+        Duration::from_secs(params.timeout_mins.saturating_mul(60)),
     );
     let direct_cost = direct_call_cost_usd;
     let usage_cost = |usage: &[ProviderUsage]| {
@@ -1722,7 +1731,12 @@ pub async fn run_review(
                         && !nudge_requested.swap(true, Ordering::SeqCst)
                         && let Some(reply) = std_lock(&coordinator_reply).as_ref()
                     {
-                        reply.cancel();
+                        // ACP cancellation closes the session. Deliver its
+                        // advisory nudge after the current prompt completes;
+                        // the hard budget above still cancels immediately.
+                        if params.acp_command.is_none() {
+                            reply.cancel();
+                        }
                     }
                 }
             }
@@ -1823,6 +1837,7 @@ pub async fn run_review(
             );
 
             let verifier_result = run_verification_pass(VerificationParams {
+                acp_command: params.acp_command.as_deref(),
                 artifact: reporting_artifact.clone(),
                 workspace_path: &workspace.path,
                 read_roots: &read_roots,
@@ -2672,17 +2687,20 @@ async fn resume_coordinator_for_duplicates(params: DedupeParams<'_>) -> Result<(
         phase: ReviewPhase::Dedupe,
         artifact: params.artifact.clone(),
     })]);
-    let initial_calls = agent.usage().len();
-    let continuation_cost = || {
-        let usage = agent.usage();
+    let session_cost = || {
         cost_from_usage(
-            &usage[initial_calls.min(usage.len())..],
+            &agent.usage(),
             params.provider_name,
             params.model,
             params.input_price_per_m,
             params.output_price_per_m,
         )
     };
+    // Embedded logs append model calls; ACP updates one cumulative session
+    // entry. A cost difference handles both without ignoring continuations.
+    let initial_cost = session_cost();
+    let continuation_cost =
+        || session_cost().map(|cost| (cost - initial_cost.unwrap_or(0.0)).max(0.0));
 
     let findings = serde_json::to_string_pretty(params.findings)?;
     let existing_comments = serde_json::to_string_pretty(params.existing_comments)?;
@@ -2781,6 +2799,7 @@ async fn dedupe_complete(artifact: &SharedReportingArtifact, expected_ids: &[Str
 }
 
 struct VerificationParams<'a> {
+    acp_command: Option<&'a std::path::Path>,
     artifact: SharedReportingArtifact,
     workspace_path: &'a std::path::Path,
     /// Directories the verifier may inspect besides the checkout.
@@ -2874,6 +2893,11 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
             max_turns: params.max_turns,
             stop_when: None,
         },
+    )
+    .with_acp(
+        params.acp_command,
+        params.provider_name,
+        Duration::from_secs(params.timeout_mins.saturating_mul(60)),
     );
     let usage_cost = |usage: &[ProviderUsage]| {
         cost_from_usage(
@@ -3492,6 +3516,15 @@ Reviewed the PR and found no vulnerabilities.
     }
 
     #[test]
+    fn missing_acp_usage_is_not_a_zero_cost_call() {
+        let usage = ProviderUsage::new("unknown".into(), Default::default());
+        assert_eq!(
+            cost_from_provider_usage(&usage, "openrouter", "unknown", Some(2.0), Some(6.0)),
+            None
+        );
+    }
+
+    #[test]
     fn skill_selection_cost_prefers_charge_and_falls_back_to_prices() {
         use goose_providers::conversation::token_usage::{CostSource, ProviderUsage, Usage};
 
@@ -3548,6 +3581,7 @@ Reviewed the PR and found no vulnerabilities.
             diff_base: "base",
             repo_guidance: "",
             provider_name: "invalid-provider",
+            acp_command: None,
             model: "invalid-model",
             max_retries: 0,
             retry_delay_secs: 0,

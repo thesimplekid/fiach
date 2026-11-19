@@ -74,6 +74,8 @@ max_turns = 300
 # """
 
 [review]
+# Opt-in review phases over the pinned Goose ACP runtime:
+# acp_command = "goose"
 provider = "openrouter"
 model = "google/gemini-3.1-pro-preview"
 # Optional: defaults to provider/model above when unset

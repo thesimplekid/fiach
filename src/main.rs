@@ -224,6 +224,10 @@ enum Commands {
         #[arg(long)]
         lane_timeout_mins: Option<std::num::NonZeroU64>,
 
+        /// Run review phases through this Goose ACP executable (opt-in)
+        #[arg(long)]
+        acp_command: Option<PathBuf>,
+
         /// Path to the redb state database
         #[arg(long)]
         db_path: Option<PathBuf>,
@@ -363,6 +367,10 @@ enum Commands {
         /// Timeout in minutes per lane attempt (timed-out lanes are not replaced; phase timeout still applies)
         #[arg(long)]
         lane_timeout_mins: Option<std::num::NonZeroU64>,
+
+        /// Run review phases through this Goose ACP executable (opt-in)
+        #[arg(long)]
+        acp_command: Option<PathBuf>,
 
         /// Path to the redb state database
         #[arg(long)]
@@ -595,6 +603,7 @@ async fn main() -> Result<()> {
             max_turns,
             timeout_mins,
             lane_timeout_mins,
+            acp_command,
             db_path,
             force,
             max_retries,
@@ -689,6 +698,7 @@ async fn main() -> Result<()> {
                     max_turns: max_turns.or(rev_cfg.max_turns).unwrap_or(60),
                     timeout_mins: timeout_mins.or(rev_cfg.timeout_mins).unwrap_or(30),
                     lane_timeout_mins: lane_timeout_mins.or(rev_cfg.lane_timeout_mins),
+                    acp_command: acp_command.clone().or(rev_cfg.acp_command.clone()),
                     db_path: db_path.clone(),
                     review_kind: review_kind
                         .clone()
@@ -769,6 +779,7 @@ async fn main() -> Result<()> {
             max_turns,
             timeout_mins,
             lane_timeout_mins,
+            acp_command,
             db_path,
             max_retries,
             max_review_retries,
@@ -944,6 +955,7 @@ async fn main() -> Result<()> {
                 max_turns: max_turns.or(daemon_cfg.max_turns).unwrap_or(60),
                 timeout_mins: timeout_mins.or(daemon_cfg.timeout_mins).unwrap_or(30),
                 lane_timeout_mins: lane_timeout_mins.or(daemon_cfg.lane_timeout_mins),
+                acp_command: acp_command.or(daemon_cfg.acp_command),
                 db_path: db_path
                     .clone()
                     .or(daemon_cfg.db_path)
