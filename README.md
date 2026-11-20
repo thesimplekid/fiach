@@ -1004,3 +1004,38 @@ The canonical library is maintained in `harness-acp`; its versioned
 `vendor/harness-acp` snapshot keeps Fiach independently buildable. Provider DTOs,
 workspace tool handlers, and one-shot classifier calls still use Goose libraries;
 agent orchestration always uses ACP.
+
+### Packaged worker pipeline integration
+
+`tests/scripts/worker_acp_e2e.py` runs the packaged Fiach worker and real Goose
+inside disposable `systemd-nspawn` containers against a loopback mock model.
+It uses synthetic credentials and performs no forge publishing or live-model
+calls. This tests the worker code/check/verify pipeline; the separate Rust
+integration tests cover daemon, broker, and publication orchestration.
+
+Build the managed root and its generated configuration, then run on a Linux
+host with `systemd-nspawn` and permission to launch containers:
+
+```bash
+nix build .#checks.x86_64-linux.nixos-module --out-link /data/rust/tmp/fiach-module-check
+nix develop -c python3 tests/scripts/worker_acp_e2e.py \
+  --module-config /data/rust/tmp/fiach-module-check/config.toml --sudo
+```
+
+The runner retains its disposable repositories, worker outputs, request logs,
+and `summary.json` under `/data/rust/tmp/fiach-acp-e2e-*`. It checks a real patch,
+a failing baseline regression, a passing patched regression, independent
+verification, invalid-report recovery, turn exhaustion, bounded recovery,
+graceful cancellation and forced native container shutdown during an active tool, and
+disconnected providers. Recovery is tested
+with a deliberately forbidden workspace tool call; action markers detect work
+replay. Cancellation checks that the tool heartbeat, child processes, and model requests
+stop. Forced shutdown stops the container init first, then sends the same TERM
+signal twice to nspawn, exercising its native namespace cleanup. Rust supervisor
+tests separately verify that cancellation and owner drop use this sequence.
+Streamed tool evidence survives forced shutdown without claiming a terminal result.
+If native cleanup stalls, the host reports incomplete cleanup and retains the
+supervisor while the runtime remains alive, plus scratch paths. Runtime teardown
+can only send a best-effort graceful signal; it never SIGKILLs nspawn and abandons its payload.
+`--sudo` is limited to starting containers and signalling the runner's own
+process groups or recorded descendants with matching process start times. Custom roots can instead be supplied through `--rootfs`.

@@ -596,6 +596,7 @@ async fn sandbox(
             "--keep-unit",
             "--settings=no",
             "--register=no",
+            "--kill-signal=SIGINT",
             "--no-new-privileges=yes",
             "--quiet",
             "--resolv-conf=copy-host",
@@ -676,22 +677,29 @@ async fn sandbox(
         "/input/request.json",
     ]);
     let log = std::fs::File::create(output.path().join("worker.log"))?;
-    cmd.stdout(log.try_clone()?).stderr(log).kill_on_drop(true);
-    let mut child = cmd.spawn().context("Starting isolated issue worker")?;
+    cmd.stdout(log.try_clone()?).stderr(log);
+    let mut child = crate::process::NspawnChild::spawn(&mut cmd)?;
+    // Once a container owns these mounts, retain them even if this future is
+    // dropped. Cleanup runs in a separate task and may outlive the caller.
+    let run = run.keep();
+    let output = output.keep();
     if let Some(network) = &network
         && let Err(error) = crate::daemon::configure_sandbox_veth_host(&machine, network).await
     {
-        let _ = child.kill().await;
+        child
+            .shutdown()
+            .await
+            .context("Cleaning up worker after network setup failure")?;
         return Err(error);
     }
     let mut outcome: Result<()> = tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(input.config.timeout_secs), child.wait()) => {
             match result {
-                Ok(status) => status.map_err(anyhow::Error::from).and_then(|s| { ensure!(s.success(), "Issue worker failed"); Ok(()) }),
-                Err(_) => { let _ = child.kill().await; Err(anyhow::anyhow!("Issue worker timed out")) }
+                Ok(status) => status.and_then(|s| { ensure!(s.success(), "Issue worker failed"); Ok(()) }),
+                Err(_) => { match child.shutdown().await { Ok(_) => Err(anyhow::anyhow!("Issue worker timed out")), Err(error) => Err(error.context("Issue worker timed out; cleaning up container")) } }
             }
         }
-        _ = cancel.cancelled() => { let _ = child.kill().await; Err(anyhow::anyhow!("Issue worker cancelled")) }
+        _ = cancel.cancelled() => { match child.shutdown().await { Ok(_) => Err(anyhow::anyhow!("Issue worker cancelled")), Err(error) => Err(error.context("Issue worker cancelled; cleaning up container")) } }
     };
     // A quarantined phase fails even if the worker succeeded.
     if let Some(broker) = broker
@@ -700,18 +708,24 @@ async fn sandbox(
         outcome = Err(error);
     }
     if let Err(error) = outcome {
-        let artifacts = output.keep();
+        let artifacts = output;
         // Preserve edits and untracked tests without executing repository code on the host.
         // Never automatically apply this unvalidated workspace to a later attempt.
-        if let Err(retention_error) =
-            tokio::fs::rename(root.join("workspace"), artifacts.join("workspace")).await
+        if child.is_reaped()
+            && let Err(retention_error) =
+                tokio::fs::rename(root.join("workspace"), artifacts.join("workspace")).await
         {
             tracing::warn!(error = %retention_error, artifacts = %artifacts.display(), "Failed to retain issue workspace");
         }
-        let _ = tokio::fs::write(artifacts.join("failure.txt"), format!("{error:#}")).await;
+        let _ = tokio::fs::write(
+            artifacts.join("failure.txt"),
+            format!("{error:#}\nContainer scratch: {}", run.display()),
+        )
+        .await;
         return Err(error).with_context(|| format!("Worker artifacts: {}", artifacts.display()));
     }
-    let path = output.keep();
+    let path = output;
+    let _ = tokio::fs::remove_dir_all(&run).await;
     tracing::info!(phase = %input.phase, artifacts = %path.display(), "Issue worker artifacts retained");
     Ok(path)
 }
@@ -947,9 +961,31 @@ async fn run_acp_worker(
         request.timeout = deadline
             .checked_duration_since(tokio::time::Instant::now())
             .context("Issue worker deadline exceeded before report recovery")?;
-        let result = harness_acp::run(launch, &request, cancel.child_token()).await;
-        for event in &result.transcript {
-            append_transcript(transcript, event)?;
+        // The supervisor can kill the container while a tool is running.
+        // Persist each sanitized event before waiting for the final response.
+        let writer = std::sync::Mutex::new(&mut *transcript);
+        let write_error = std::sync::Mutex::new(None);
+        let attempt_cancel = cancel.child_token();
+        let observe = |event: &serde_json::Value| {
+            let mut failure = write_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if failure.is_some() {
+                return;
+            }
+            let mut file = writer.lock().unwrap_or_else(|error| error.into_inner());
+            if let Err(error) = append_transcript(&mut file, event) {
+                *failure = Some(error);
+                attempt_cancel.cancel();
+            }
+        };
+        let result =
+            harness_acp::run_observed(launch, &request, attempt_cancel.clone(), &observe).await;
+        if let Some(error) = write_error
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner())
+        {
+            return Err(error.context("Persisting worker transcript"));
         }
         append_transcript(
             transcript,
@@ -1065,7 +1101,14 @@ mod tests {
         mode: &str,
         timeout: Duration,
     ) -> (Result<Report>, tempfile::TempDir) {
-        let output = tempfile::tempdir().unwrap();
+        acp_worker_fixture_at(mode, timeout, tempfile::tempdir().unwrap()).await
+    }
+
+    async fn acp_worker_fixture_at(
+        mode: &str,
+        timeout: Duration,
+        output: tempfile::TempDir,
+    ) -> (Result<Report>, tempfile::TempDir) {
         let script = output.path().join("acp.py");
         std::fs::write(&script, include_str!("../../tests/fixtures/acp_worker.py")).unwrap();
         let mut launch = LaunchSpec::new("python3");
@@ -1087,7 +1130,11 @@ mod tests {
             report: Arc::new(Mutex::new(None)),
         };
         let tools = developer_tools(output.path()).await.unwrap();
-        let mut transcript = std::fs::File::create(output.path().join("transcript.jsonl")).unwrap();
+        let transcript_path = output.path().join("transcript.jsonl");
+        let mut transcript = std::fs::File::create(&transcript_path).unwrap();
+        if mode == "write_failure" {
+            transcript = std::fs::File::open(transcript_path).unwrap();
+        }
         let result = run_acp_worker(
             &launch,
             "openai",
@@ -1111,6 +1158,43 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn acp_transcript_is_flushed_while_the_worker_is_still_running() {
+        let output = tempfile::tempdir().unwrap();
+        let path = output.path().join("transcript.jsonl");
+        let execution = acp_worker_fixture_at("stall", Duration::from_secs(3), output);
+        tokio::pin!(execution);
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_to_string(&path)
+                    .is_ok_and(|text| text.contains("regression did not finish"))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        tokio::select! {
+            result = &mut execution => panic!("Worker completed before streamed evidence: {:?}", result.0),
+            result = observed => result.expect("Evidence must be persisted before the final ACP response"),
+        }
+        let (result, _) = execution.await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn acp_transcript_write_failure_cancels_without_accepting_a_report() {
+        let (result, output) = acp_worker_fixture("write_failure", Duration::from_secs(3)).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Persisting worker transcript")
+        );
+        assert!(!output.path().join("report.json").exists());
+        assert_eq!(recorded_sessions(output.path()).len(), 1);
     }
 
     #[tokio::test]

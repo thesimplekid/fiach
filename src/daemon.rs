@@ -1782,7 +1782,7 @@ async fn run_sandboxed_review(
     let result_json = run_dir.join("result.json");
     let nspawn_log = run_dir.join("nspawn.log");
     let runtime_rootfs = prepare_runtime_rootfs(rootfs, &run_dir).await?;
-    let _runtime_rootfs_guard = RuntimeRootfsGuard::new(runtime_rootfs.clone());
+    let mut runtime_rootfs_guard = RuntimeRootfsGuard::new(runtime_rootfs.clone());
     let sandbox_home = "/tmp";
     let sandbox_xdg_state_home = "/tmp/.local/state";
 
@@ -1824,6 +1824,7 @@ async fn run_sandboxed_review(
     cmd.arg("--keep-unit");
     cmd.arg("--settings=no");
     cmd.arg("--register=no");
+    cmd.arg("--kill-signal=SIGINT");
     cmd.arg("--no-new-privileges=yes");
     // Set PATH inside the sandbox so the child fiach process can find git, gh, etc.
     // in /bin (populated by the Nix-built rootfs's pathsToLink = [ "/bin" ... ]).
@@ -1867,7 +1868,7 @@ async fn run_sandboxed_review(
     // The host stages the checkout and PR inputs, so the sandbox needs no
     // GitHub credentials. It gets a planted token instead: any request that
     // carries it to the model broker quarantines the review.
-    let staging = stage_sandbox_review(review_params, &runtime_rootfs).await?;
+    let mut staging = stage_sandbox_review(review_params, &runtime_rootfs).await?;
     let github_canary = crate::broker::github_canary();
     plant_github_canary(&runtime_rootfs, &github_canary).await?;
     forward_sandbox_secret(&mut cmd, "GITHUB_TOKEN", &github_canary);
@@ -2034,13 +2035,18 @@ async fn run_sandboxed_review(
     ));
     cmd.stderr(Stdio::from(log_file));
 
-    cmd.kill_on_drop(true);
-    let mut child = cmd.spawn().context("Failed to spawn systemd-nspawn")?;
+    let mut child = crate::process::NspawnChild::spawn(&mut cmd)?;
+    runtime_rootfs_guard.remove_on_drop = false;
+    staging._workspace.retain_for_container();
 
     if let Some(network) = &veth_network
         && let Err(error) = configure_sandbox_veth_host(&machine_name, network).await
     {
-        let _ = child.kill().await;
+        child
+            .shutdown()
+            .await
+            .context("Cleaning up review after network setup failure")?;
+        runtime_rootfs_guard.remove_on_drop = child.is_reaped();
         anyhow::bail!(
             "Failed to configure sandbox veth host link for machine {} using subnet 10.64.{}.0/30: {}",
             machine_name,
@@ -2075,19 +2081,24 @@ async fn run_sandboxed_review(
                         repo = %review_params.repo,
                         pr = review_params.pr_number,
                         timeout_secs = timeout_duration.as_secs(),
-                        "Sandboxed review exceeded hard timeout, killing process"
+                        "Sandboxed review exceeded hard timeout, stopping container"
                     );
-                    let _ = child.kill().await;
-                    Err(anyhow::anyhow!("Sandboxed review timed out"))
+                    match child.shutdown().await {
+                        Ok(_) => Err(anyhow::anyhow!("Sandboxed review timed out")),
+                        Err(error) => Err(error.context("Sandboxed review timed out; cleaning up container")),
+                    }
                 }
             }
         }
         _ = cancel_token.cancelled() => {
-            tracing::info!("Cancellation requested, killing sandbox...");
-            let _ = child.kill().await;
-            Err(anyhow::anyhow!("Sandboxed review cancelled"))
+            tracing::info!("Cancellation requested, stopping sandbox");
+            match child.shutdown().await {
+                Ok(_) => Err(anyhow::anyhow!("Sandboxed review cancelled")),
+                Err(error) => Err(error.context("Sandboxed review cancelled; cleaning up container")),
+            }
         }
     };
+    runtime_rootfs_guard.remove_on_drop = child.is_reaped();
     // A quarantined job fails even if the child succeeded, so none of its
     // artifacts are disclosed.
     if let Some(broker) = broker {
@@ -2315,17 +2326,21 @@ async fn start_review_broker(
 
 struct RuntimeRootfsGuard {
     path: PathBuf,
+    remove_on_drop: bool,
 }
 
 impl RuntimeRootfsGuard {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            remove_on_drop: true,
+        }
     }
 }
 
 impl Drop for RuntimeRootfsGuard {
     fn drop(&mut self) {
-        if self.path.exists() {
+        if self.remove_on_drop && self.path.exists() {
             tracing::debug!(path = %self.path.display(), "Removing sandbox runtime rootfs");
             if let Err(error) = std::fs::remove_dir_all(&self.path) {
                 tracing::warn!(
@@ -2341,16 +2356,11 @@ impl Drop for RuntimeRootfsGuard {
 async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<PathBuf> {
     let runtime_rootfs = run_dir.join("rootfs");
 
-    if runtime_rootfs.exists() {
-        tokio::fs::remove_dir_all(&runtime_rootfs)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to remove stale sandbox runtime rootfs at {}",
-                    runtime_rootfs.display()
-                )
-            })?;
-    }
+    anyhow::ensure!(
+        !runtime_rootfs.exists(),
+        "Retained sandbox rootfs at {}; previous container cleanup must be confirmed before retrying",
+        runtime_rootfs.display()
+    );
 
     tracing::debug!(
         source = %source_rootfs.display(),
@@ -2469,6 +2479,19 @@ fn tail_file(path: &Path, max_lines: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_container_root_survives_caller_drop() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("rootfs");
+        std::fs::create_dir(&root).unwrap();
+        let mut guard = RuntimeRootfsGuard::new(root.clone());
+        guard.remove_on_drop = false;
+        drop(guard);
+        assert!(root.exists());
+        drop(RuntimeRootfsGuard::new(root.clone()));
+        assert!(!root.exists());
+    }
 
     #[test]
     fn recovery_probes_cover_verifier_overrides_and_deduplicate() {
@@ -2825,6 +2848,22 @@ mod tests {
         );
         assert_eq!(pending.requests.len(), 1);
         assert_eq!(scheduler.stats().await.total, 0);
+    }
+
+    #[tokio::test]
+    async fn retained_container_root_is_never_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("rootfs");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("evidence"), "active").unwrap();
+        let error = prepare_runtime_rootfs(Path::new("/nonexistent"), temp.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Retained sandbox rootfs"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("evidence")).unwrap(),
+            "active"
+        );
     }
 
     #[test]

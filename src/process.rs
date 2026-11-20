@@ -4,6 +4,117 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
+/// Own nspawn in a separate task: dropping the caller requests orderly shutdown
+/// instead of SIGKILLing the supervisor and orphaning its PID namespace.
+pub(crate) struct NspawnChild {
+    cancel: tokio_util::sync::CancellationToken,
+    result: tokio::sync::oneshot::Receiver<Result<ExitStatus>>,
+    shutdown_timeout: Duration,
+    reaped: bool,
+}
+
+impl NspawnChild {
+    pub(crate) fn spawn(command: &mut Command) -> Result<Self> {
+        Self::spawn_with_grace(command, Duration::from_secs(5))
+    }
+
+    fn spawn_with_grace(command: &mut Command, grace: Duration) -> Result<Self> {
+        let mut child = command
+            .kill_on_drop(false)
+            .spawn()
+            .context("Starting nspawn supervisor")?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let stop = cancel.clone();
+        let (send, result) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut teardown = NspawnSignalGuard(child.id());
+            let outcome = async {
+                tokio::select! {
+                    result = child.wait() => return result.context("Waiting for nspawn"),
+                    _ = stop.cancelled() => {}
+                }
+                signal_nspawn(&child)?;
+                if let Ok(result) = tokio::time::timeout(grace, child.wait()).await {
+                    return result.context("Waiting for graceful nspawn shutdown");
+                }
+                // nspawn's first TERM forwards --kill-signal to its init. The
+                // second *same* signal exits its event loop, which kills and
+                // reaps the container init (and thereby its PID namespace).
+                // SIGKILL to nspawn skips that cleanup and must never be used.
+                signal_nspawn(&child)?;
+                child
+                    .wait()
+                    .await
+                    .context("Waiting for forced nspawn cleanup")
+            }
+            .await;
+            if child.id().is_none() {
+                teardown.0 = None;
+            }
+            let _ = send.send(outcome);
+        });
+        Ok(Self {
+            cancel,
+            result,
+            shutdown_timeout: grace * 2 + Duration::from_secs(1),
+            reaped: false,
+        })
+    }
+
+    pub(crate) fn is_reaped(&self) -> bool {
+        self.reaped
+    }
+
+    pub(crate) async fn wait(&mut self) -> Result<ExitStatus> {
+        let result = (&mut self.result)
+            .await
+            .context("nspawn supervisor task stopped")?;
+        self.reaped = result.is_ok();
+        result
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<ExitStatus> {
+        self.cancel.cancel();
+        tokio::time::timeout(self.shutdown_timeout, self.wait())
+            .await
+            .context("nspawn cleanup did not finish; supervisor retained to reap container")?
+    }
+}
+
+impl Drop for NspawnChild {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+// Runtime teardown cannot await cleanup; at least ask nspawn to forward the
+// graceful signal. Normal caller cancellation retains the full cleanup task.
+struct NspawnSignalGuard(Option<u32>);
+impl Drop for NspawnSignalGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    }
+}
+
+fn signal_nspawn(child: &tokio::process::Child) -> Result<()> {
+    if let Some(pid) = child.id() {
+        // Exclusively owned, unreaped Child: PID cannot have been reused.
+        match nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => return Err(error).context("Signalling nspawn shutdown"),
+        }
+    }
+    Ok(())
+}
+
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 pub const LONG_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
@@ -152,6 +263,72 @@ async fn read_capped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn supervised_fixture(grace: Duration) -> (super::NspawnChild, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("signals");
+        let script = r#"
+import signal, sys, time
+path = sys.argv[1]
+count = 0
+def stop(signum, frame):
+    global count
+    count += 1
+    with open(path, 'a') as out: out.write('TERM\n')
+    if count == 2: sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+with open(path, 'w') as out: out.write('ready\n')
+while True: time.sleep(0.01)
+"#;
+        let child = super::NspawnChild::spawn_with_grace(
+            Command::new("python3").args(["-c", script]).arg(&marker),
+            grace,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        (child, dir)
+    }
+
+    #[tokio::test]
+    async fn nspawn_shutdown_escalates_with_the_same_signal_and_reaps() {
+        let grace = Duration::from_millis(100);
+        let (mut child, dir) = supervised_fixture(grace).await;
+        let started = std::time::Instant::now();
+        let status = tokio::time::timeout(Duration::from_secs(3), child.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.success());
+        assert!(started.elapsed() >= grace);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("signals")).unwrap(),
+            "ready\nTERM\nTERM\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_nspawn_owner_still_runs_native_cleanup() {
+        let (child, dir) = supervised_fixture(Duration::from_millis(100)).await;
+        drop(child);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if std::fs::read_to_string(dir.path().join("signals")).unwrap()
+                    == "ready\nTERM\nTERM\n"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn captures_command_output() {

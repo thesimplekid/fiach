@@ -62,6 +62,14 @@ struct DefaultBranchRef {
 }
 
 impl PreparedWorkspace {
+    /// Transfer cleanup to the enclosing container root. A live container can
+    /// outlast its caller while the supervisor finishes native shutdown.
+    pub(crate) fn retain_for_container(&mut self) {
+        if let Some(directory) = self.directory.take() {
+            let _ = directory.keep();
+        }
+    }
+
     /// Clean up only the temporary directory owned by this execution.
     pub async fn cleanup(self) -> Result<()> {
         let Some(directory) = self.directory else {
@@ -446,6 +454,17 @@ mod tests {
                 head_commit: "head".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn container_workspace_outlives_its_caller() {
+        let parent = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(parent.path()).unwrap();
+        let path = directory.path().to_path_buf();
+        let mut workspace = prepared(directory);
+        workspace.retain_for_container();
+        drop(workspace);
+        assert!(path.exists());
     }
 
     #[tokio::test]

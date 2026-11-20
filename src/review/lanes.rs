@@ -484,7 +484,7 @@ mod tests {
         );
         assert!(!validator.is_valid(&serde_json::json!({"summary":"Looks fine"})));
     }
-    fn acp_lanes_fixture(mode: &str) -> (super::Lanes, tempfile::TempDir) {
+    async fn acp_lanes_fixture(mode: &str) -> (super::Lanes, tempfile::TempDir) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log =
@@ -501,7 +501,14 @@ mod tests {
                 &serde_json::to_string(&output).unwrap(),
             );
         let command = dir.path().join("acp-fixture");
-        std::fs::write(&command, format!("#!/usr/bin/env python3\n{script}")).unwrap();
+        let python = tokio::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .await
+            .unwrap();
+        assert!(python.status.success());
+        let python = String::from_utf8(python.stdout).unwrap();
+        std::fs::write(&command, format!("#!{}\n{script}", python.trim())).unwrap();
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
         let inspection =
             crate::inspection::Inspection::new(dir.path(), &[], &"a".repeat(40), &"b".repeat(40))
@@ -524,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn acp_lane_completes_only_with_validated_output() {
-        let (lanes, _dir) = acp_lanes_fixture("output");
+        let (lanes, _dir) = acp_lanes_fixture("output").await;
         let results = lanes.run(&tokio_util::sync::CancellationToken::new()).await;
         assert_eq!(results.len(), 1);
         assert!(lanes.complete());
@@ -533,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn acp_turn_limit_is_incomplete_and_never_replaced() {
-        let (lanes, dir) = acp_lanes_fixture("empty");
+        let (lanes, dir) = acp_lanes_fixture("empty").await;
         assert!(
             lanes
                 .run(&tokio_util::sync::CancellationToken::new())
@@ -553,7 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn acp_read_only_transport_failure_replacement_is_bounded() {
-        let (lanes, dir) = acp_lanes_fixture("disconnect");
+        let (lanes, dir) = acp_lanes_fixture("disconnect").await;
         assert!(
             lanes
                 .run(&tokio_util::sync::CancellationToken::new())

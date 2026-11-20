@@ -286,7 +286,10 @@
               grep -F 'trigger_mention = "fiach-bot"' "$config_path" >/dev/null
               grep -F 'allowed_mention_users = ["lead-maintainer"]' "$config_path" >/dev/null
 
-              touch "$out"
+              # Preserve the generated fixture for packaged worker integration
+              # tests, including the exact managed root filesystem store path.
+              mkdir -p "$out"
+              cp "$config_path" "$out/config.toml"
             '';
 
           checks.package = packages.default;
