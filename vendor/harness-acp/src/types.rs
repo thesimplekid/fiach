@@ -42,6 +42,7 @@ pub struct Task {
     /// Explicit Goose recipe extensions, including MCP endpoints and allowlists.
     pub extensions: Vec<Value>,
     pub timeout: Duration,
+    /// Maximum autonomous actions per prompt. Must be positive.
     pub max_turns: u32,
 }
 
@@ -51,6 +52,8 @@ pub enum Completion {
     Completed,
     Cancelled,
     TimedOut,
+    /// The agent exhausted its configured autonomous-action budget.
+    TurnLimit,
     InvalidOutput,
     ProviderError,
     ProtocolError,

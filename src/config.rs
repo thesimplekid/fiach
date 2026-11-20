@@ -62,10 +62,10 @@ pub struct DaemonConfig {
     pub timeout_mins: Option<u64>,
     /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
-    /// Opt-in Goose ACP executable for review phases.
+    /// Goose ACP executable override; defaults to goose from PATH.
     pub acp_command: Option<PathBuf>,
     pub db_path: Option<PathBuf>,
-    /// In-session provider retries within one agent session.
+    /// Follow-up prompts for completed ACP turns with missing submissions.
     pub max_retries: Option<u32>,
     /// Whole-review retries per commit after a failed attempt.
     pub max_review_retries: Option<u32>,
@@ -123,7 +123,7 @@ pub struct ReviewConfig {
     pub timeout_mins: Option<u64>,
     /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
-    /// Opt-in Goose ACP executable for review phases.
+    /// Goose ACP executable override; defaults to goose from PATH.
     pub acp_command: Option<PathBuf>,
     pub db_path: Option<PathBuf>,
     pub force: Option<bool>,

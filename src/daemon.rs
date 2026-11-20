@@ -145,11 +145,10 @@ pub struct DaemonParams {
     pub timeout_mins: u64,
     /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
-    /// Opt-in Goose ACP executable for review phases.
+    /// Goose ACP executable override; defaults to goose from PATH.
     pub acp_command: Option<PathBuf>,
     pub db_path: PathBuf,
-    /// In-session provider retries: how often one agent session re-prompts
-    /// after a transient model error.
+    /// Follow-up prompts for completed ACP turns with missing submissions.
     pub max_retries: u32,
     /// Whole-review retries per commit after a failed attempt. Failures while
     /// the provider circuit is open do not count.

@@ -13,18 +13,11 @@ use std::{
 };
 
 use futures::future::join_all;
-use goose_providers::{
-    base::Provider,
-    conversation::message::{Message, MessageErrorKind},
-    model::ModelConfig,
-};
+use goose_providers::model::ModelConfig;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    agent_loop::{AgentLoop, LoopConfig, LoopRetry, ReplyEnd, ReplyShape, UsageLog},
-    classify_lane_load_text,
-};
+use super::{agent_loop::UsageLog, classify_lane_load_text};
 use crate::{
     inspection::Inspection,
     reporting::{LaneSnapshot, LaneStatus},
@@ -45,8 +38,6 @@ const PROVIDER_FAILURE: &str = "provider_failure";
 /// Why an attempt produced no usable result, with what the model last did.
 struct LaneFailure {
     reason: &'static str,
-    error_kind: Option<MessageErrorKind>,
-    shape: ReplyShape,
     /// Untrusted model output, kept for the incomplete-finder artifact.
     transcript: String,
 }
@@ -62,7 +53,7 @@ pub(super) struct LaneResult {
 }
 
 pub(super) struct Lanes {
-    pub provider: Arc<dyn Provider>,
+    pub provider: String,
     pub model_config: ModelConfig,
     pub inspection: Inspection,
     pub max_turns: u32,
@@ -72,12 +63,12 @@ pub(super) struct Lanes {
     tasks: Vec<LaneTask>,
     snapshots: Mutex<BTreeMap<String, LaneSnapshot>>,
     provider_failure: Mutex<Option<anyhow::Error>>,
-    acp: Option<(PathBuf, String)>,
+    command: PathBuf,
 }
 
 impl Lanes {
     pub fn new(
-        provider: Arc<dyn Provider>,
+        provider: String,
         model_config: ModelConfig,
         inspection: Inspection,
         max_turns: u32,
@@ -113,12 +104,12 @@ impl Lanes {
             tasks,
             snapshots: Mutex::new(snapshots),
             provider_failure: Mutex::new(None),
-            acp: None,
+            command: PathBuf::from("goose"),
         }
     }
 
-    pub fn with_acp(mut self, command: Option<&Path>, provider: &str) -> Self {
-        self.acp = command.map(|path| (path.to_path_buf(), provider.to_owned()));
+    pub fn with_command(mut self, command: Option<&Path>) -> Self {
+        self.command = super::agent_loop::executable(command);
         self
     }
 
@@ -214,12 +205,7 @@ impl Lanes {
                 }
                 Err(failure) => failure,
             };
-            let LaneFailure {
-                reason,
-                error_kind,
-                shape,
-                transcript,
-            } = failure;
+            let LaneFailure { reason, transcript } = failure;
             let replace = attempt + 1 < ATTEMPTS && replaceable(reason);
             // Only fixed labels and counts are logged; lane output and provider
             // errors may contain checkout content or attacker-controlled text.
@@ -230,16 +216,6 @@ impl Lanes {
                 recovery_attempt = attempt,
                 reason,
                 replace,
-                error_kind = ?error_kind,
-                assistant_messages = shape.assistant_messages,
-                tool_calls = shape.tool_calls,
-                malformed_tool_calls = shape.malformed_tool_calls,
-                tool_errors = shape.tool_errors,
-                last_text_chars = shape.last_text_chars,
-                last_thinking_chars = shape.last_thinking_chars,
-                last_redacted_thinking = shape.last_redacted_thinking,
-                last_tool_calls = shape.last_tool_calls,
-                last_errors = shape.last_errors,
                 "Review lane failed"
             );
             self.update(lane, |snapshot| {
@@ -265,72 +241,12 @@ impl Lanes {
 
     async fn attempt(
         &self,
-        session_id: &str,
+        _session_id: &str,
         task: &LaneTask,
         cancel: &CancellationToken,
     ) -> Result<String, LaneFailure> {
-        if let Some((command, provider)) = &self.acp {
-            return self.acp_attempt(command, provider, task, cancel).await;
-        }
-        let agent = AgentLoop::new(
-            session_id,
-            LoopConfig {
-                provider: self.provider.clone(),
-                model_config: self.model_config.clone(),
-                system_prompt: LANE_SYSTEM.into(),
-                tools: vec![Arc::new(self.inspection.clone())],
-                max_turns: self.max_turns,
-                stop_when: None,
-            },
-        )
-        .sharing_usage(self.usage.clone());
-        let attempt_cancel = cancel.child_token();
-        let reply = tokio::time::timeout(
-            self.attempt_timeout,
-            agent.reply(
-                Message::user().with_text(&task.instructions),
-                &attempt_cancel,
-                |_| {},
-            ),
-        )
-        .await;
-        attempt_cancel.cancel();
-        let fail = |reason, error_kind| {
-            Err(LaneFailure {
-                reason,
-                error_kind,
-                shape: agent.reply_shape(),
-                transcript: agent.last_reply_transcript(MAX_NOTES_CHARS),
-            })
-        };
-        if cancel.is_cancelled() {
-            return fail("phase_stopped", None);
-        }
-        match reply {
-            Err(_) => fail("lane_deadline", None),
-            Ok(Err(_)) => fail("session_error", None),
-            Ok(Ok(ReplyEnd::ProviderError(error))) => {
-                let failure = match LoopRetry::new("lane", 0, 0).provider_error(&error) {
-                    Ok(failure) | Err(failure) => failure,
-                };
-                {
-                    let mut stored = lock(&self.provider_failure);
-                    if stored.is_none() || super::is_fatal_provider_error(&failure) {
-                        *stored = Some(failure);
-                    }
-                }
-                fail(PROVIDER_FAILURE, Some(error.kind))
-            }
-            Ok(Ok(ReplyEnd::TurnLimit)) => fail("turn_limit", None),
-            Ok(Ok(ReplyEnd::Finished)) => {
-                let output = agent.final_text();
-                if output.trim().is_empty() {
-                    fail("empty_result", None)
-                } else {
-                    Ok(output)
-                }
-            }
-        }
+        self.acp_attempt(&self.command, &self.provider, task, cancel)
+            .await
     }
 
     fn update(&self, lane: &str, change: impl FnOnce(&mut LaneSnapshot)) {
@@ -346,12 +262,7 @@ impl Lanes {
         task: &LaneTask,
         cancel: &CancellationToken,
     ) -> Result<String, LaneFailure> {
-        let failed = |reason, transcript: String| LaneFailure {
-            reason,
-            error_kind: None,
-            shape: ReplyShape::default(),
-            transcript,
-        };
+        let failed = |reason, transcript: String| LaneFailure { reason, transcript };
         let bridge =
             harness_acp::mcp::McpBridge::start(Arc::new(InspectionTools(self.inspection.clone())))
                 .await
@@ -417,9 +328,19 @@ impl Lanes {
                 .ok_or_else(|| failed("invalid_output", transcript)),
             harness_acp::Completion::Cancelled => Err(failed("phase_stopped", transcript)),
             harness_acp::Completion::TimedOut => Err(failed("lane_deadline", transcript)),
+            harness_acp::Completion::TurnLimit => Err(failed("turn_limit", transcript)),
             harness_acp::Completion::InvalidOutput => Err(failed("invalid_output", transcript)),
             harness_acp::Completion::ProviderError => {
-                *lock(&self.provider_failure) = Some(anyhow::anyhow!("ACP lane provider failed"));
+                let error = anyhow::anyhow!(
+                    "ACP lane provider failed: {}",
+                    result.error.unwrap_or_default()
+                );
+                let error = if super::is_fatal_error(&error) {
+                    super::fatal_provider_error(error, "lane")
+                } else {
+                    error
+                };
+                *lock(&self.provider_failure) = Some(error);
                 Err(failed(PROVIDER_FAILURE, transcript))
             }
             _ => Err(failed("session_error", transcript)),
@@ -523,7 +444,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn acp_usage_counts_cumulative_updates_once_and_ignores_context_size() {
@@ -564,264 +484,98 @@ mod tests {
         );
         assert!(!validator.is_valid(&serde_json::json!({"summary":"Looks fine"})));
     }
-
-    use goose_providers::{base::MessageStream, errors::ProviderError};
-    use rmcp::model::Tool;
-
-    use super::*;
-    use crate::review::agent_loop::testing::Scripted;
-
-    fn lane_runner(provider: Arc<Scripted>, workspace: &std::path::Path, tasks: &[&str]) -> Lanes {
-        let inspection = Inspection::new(workspace, &[], &"a".repeat(40), &"b".repeat(40)).unwrap();
-        Lanes::new(
-            provider,
-            ModelConfig::new("scripted"),
-            inspection,
-            10,
-            Duration::from_secs(10),
-            1,
-            tasks
-                .iter()
-                .map(|lane| LaneTask {
-                    lane: (*lane).into(),
-                    instructions: format!("Review lane: {lane}"),
-                })
-                .collect(),
-        )
-    }
-
-    fn status(lanes: &Lanes, lane: &str) -> LaneSnapshot {
-        lanes
-            .snapshots()
-            .into_iter()
-            .find(|snapshot| snapshot.lane == lane)
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn lanes_complete_in_task_order_with_inspection_only() {
-        let workspace = tempfile::tempdir().unwrap();
-        let provider = Scripted::new(vec![
-            Ok(Message::assistant().with_text(r#"{"status":"no_findings","candidates":[]}"#)),
-            Ok(Message::assistant().with_text(r#"{"status":"candidates","candidates":[{}]}"#)),
-        ]);
-        let lanes = lane_runner(provider.clone(), workspace.path(), &["persona", "security"]);
-        assert!(!lanes.complete());
-
-        let results = lanes.run(&CancellationToken::new()).await;
-
-        assert!(lanes.complete());
-        let names: Vec<_> = results.iter().map(|result| result.lane.as_str()).collect();
-        assert_eq!(names, ["persona", "security"]);
-        assert!(results[1].output.contains("candidates"));
-        let persona = status(&lanes, "persona");
-        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-1"));
-        assert!(persona.raw_notes.unwrap().contains("no_findings"));
-        let calls = provider.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].1, ["inspect"]);
-        assert!(calls[0].0.starts_with(LANE_SYSTEM));
-    }
-
-    /// A provider whose model call never returns.
-    struct Stalled {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for Stalled {
-        fn get_name(&self) -> &str {
-            "stalled"
-        }
-
-        async fn stream(
-            &self,
-            _model_config: &ModelConfig,
-            _system: &str,
-            _messages: &[Message],
-            _tools: &[Tool],
-        ) -> Result<MessageStream, ProviderError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            std::future::pending().await
-        }
-    }
-
-    #[tokio::test]
-    async fn an_empty_result_is_replaced_once_then_incomplete() {
-        let workspace = tempfile::tempdir().unwrap();
-        // Thinking-only replies are not empty responses to the GDK, but leave
-        // no final text: an empty result.
-        let thinking = || Ok(Message::assistant().with_thinking("considering", "signature"));
-        let provider = Scripted::new(vec![
-            thinking(),
-            thinking(),
-            Ok(Message::assistant().with_text(r#"{"status":"no_findings","candidates":[]}"#)),
-        ]);
-        let lanes = lane_runner(provider.clone(), workspace.path(), &["persona", "security"]);
-
-        let results = lanes.run(&CancellationToken::new()).await;
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].lane, "security");
-        assert!(!lanes.complete());
-        let persona = status(&lanes, "persona");
-        assert_eq!(persona.status, LaneStatus::Incomplete);
-        assert_eq!(persona.recovery_attempt, 1);
-        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-2"));
-        assert_eq!(persona.reason.as_deref(), Some("recovery_exhausted"));
-        // The artifact keeps what the model last said.
-        assert_eq!(
-            persona.raw_notes.as_deref(),
-            Some("[thinking]\nconsidering")
-        );
-        assert_eq!(status(&lanes, "security").status, LaneStatus::Completed);
-        assert_eq!(provider.calls.lock().unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn an_empty_result_replacement_can_complete() {
-        let workspace = tempfile::tempdir().unwrap();
-        let provider = Scripted::new(vec![
-            Ok(Message::assistant().with_thinking("considering", "signature")),
-            Ok(Message::assistant().with_text(r#"{"status":"no_findings","candidates":[]}"#)),
-        ]);
-        let lanes = lane_runner(provider, workspace.path(), &["persona"]);
-
-        let results = lanes.run(&CancellationToken::new()).await;
-
-        assert_eq!(results.len(), 1);
-        assert!(lanes.complete());
-        let persona = status(&lanes, "persona");
-        assert_eq!(persona.recovery_attempt, 1);
-        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-2"));
-    }
-
-    #[tokio::test]
-    async fn a_provider_failure_is_not_replaced() {
-        let workspace = tempfile::tempdir().unwrap();
-        let provider = Scripted::new(vec![
-            Err(ProviderError::ServerError("unavailable".into())),
-            Ok(Message::assistant().with_text(r#"{"status":"no_findings","candidates":[]}"#)),
-        ]);
-        let lanes = lane_runner(provider.clone(), workspace.path(), &["persona", "security"]);
-
-        let results = lanes.run(&CancellationToken::new()).await;
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].lane, "security");
-        let persona = status(&lanes, "persona");
-        assert_eq!(persona.status, LaneStatus::Incomplete);
-        assert_eq!(persona.recovery_attempt, 0);
-        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-1"));
-        assert_eq!(persona.reason.as_deref(), Some("provider_failure"));
-        assert_eq!(provider.calls.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn a_lane_deadline_is_not_replaced() {
-        let workspace = tempfile::tempdir().unwrap();
-        let provider = Arc::new(Stalled {
-            calls: AtomicUsize::new(0),
-        });
+    fn acp_lanes_fixture(mode: &str) -> (super::Lanes, tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log =
+            serde_json::to_string(&dir.path().join("sessions.jsonl").to_string_lossy()).unwrap();
+        let output = serde_json::json!({"status":"no_findings","candidates":[]}).to_string();
+        let script = include_str!("../../tests/fixtures/acp_worker.py")
+            .replace("os.environ[\"FIXTURE_LOG\"]", &log)
+            .replace(
+                "os.environ.get(\"FIXTURE_MODE\", \"recovery\")",
+                &serde_json::to_string(mode).unwrap(),
+            )
+            .replace(
+                "os.environ[\"FIXTURE_OUTPUT\"]",
+                &serde_json::to_string(&output).unwrap(),
+            );
+        let command = dir.path().join("acp-fixture");
+        std::fs::write(&command, format!("#!/usr/bin/env python3\n{script}")).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
         let inspection =
-            Inspection::new(workspace.path(), &[], &"a".repeat(40), &"b".repeat(40)).unwrap();
-        let lanes = Lanes::new(
-            provider.clone(),
-            ModelConfig::new("stalled"),
+            crate::inspection::Inspection::new(dir.path(), &[], &"a".repeat(40), &"b".repeat(40))
+                .unwrap();
+        let lanes = super::Lanes::new(
+            "openai".into(),
+            goose_providers::model::ModelConfig::new("test"),
             inspection,
-            10,
-            Duration::from_millis(20),
+            5,
+            std::time::Duration::from_secs(5),
             1,
-            vec![LaneTask {
-                lane: "persona".into(),
-                instructions: "Review lane: persona".into(),
+            vec![super::LaneTask {
+                lane: "security".into(),
+                instructions: "Inspect".into(),
             }],
-        );
-
-        assert!(lanes.run(&CancellationToken::new()).await.is_empty());
-
-        let persona = status(&lanes, "persona");
-        assert_eq!(persona.status, LaneStatus::Incomplete);
-        assert_eq!(persona.recovery_attempt, 0);
-        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-1"));
-        assert_eq!(persona.reason.as_deref(), Some("lane_deadline"));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn only_session_errors_and_empty_results_are_replaceable() {
-        assert!(replaceable("session_error"));
-        assert!(replaceable("empty_result"));
-        for reason in [
-            "lane_deadline",
-            "provider_failure",
-            "turn_limit",
-            "phase_stopped",
-        ] {
-            assert!(!replaceable(reason), "{reason}");
-        }
+        )
+        .with_command(Some(&command));
+        (lanes, dir)
     }
 
     #[tokio::test]
-    async fn a_provider_failure_does_not_spend_the_lane_replacement() {
-        let workspace = tempfile::tempdir().unwrap();
-        let provider = Scripted::new(vec![
-            Err(ProviderError::ServerError("request timed out".into())),
-            Ok(Message::assistant().with_text(r#"{"status":"no_findings","candidates":[]}"#)),
-        ]);
-        let lanes = lane_runner(provider.clone(), workspace.path(), &["persona", "security"]);
-
-        let results = lanes.run(&CancellationToken::new()).await;
-
+    async fn acp_lane_completes_only_with_validated_output() {
+        let (lanes, _dir) = acp_lanes_fixture("output");
+        let results = lanes.run(&tokio_util::sync::CancellationToken::new()).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].lane, "security");
+        assert!(lanes.complete());
+        assert!(results[0].output.contains("no_findings"));
+    }
+
+    #[tokio::test]
+    async fn acp_turn_limit_is_incomplete_and_never_replaced() {
+        let (lanes, dir) = acp_lanes_fixture("empty");
+        assert!(
+            lanes
+                .run(&tokio_util::sync::CancellationToken::new())
+                .await
+                .is_empty()
+        );
         assert!(!lanes.complete());
-        let persona = status(&lanes, "persona");
-        assert_eq!(persona.status, LaneStatus::Incomplete);
-        assert_eq!(persona.recovery_attempt, 0);
-        assert_eq!(persona.task_id.as_deref(), Some("lane-persona-1"));
-        assert_eq!(persona.reason.as_deref(), Some(PROVIDER_FAILURE));
-        assert_eq!(status(&lanes, "security").status, LaneStatus::Completed);
-        assert_eq!(provider.calls.lock().unwrap().len(), 2);
-        let error = lanes.take_provider_failure().unwrap();
-        let failure = crate::scheduler::ExecutionFailure::classify("execution", &error);
-        assert_eq!(failure.class, crate::state::FailureClass::Provider);
-        assert!(!super::super::is_fatal_provider_error(&error));
-    }
-
-    #[tokio::test]
-    async fn permanent_lane_provider_errors_remain_fatal() {
-        let workspace = tempfile::tempdir().unwrap();
-        let provider = Scripted::new(vec![Err(ProviderError::Authentication(
-            "invalid credentials".into(),
-        ))]);
-        let lanes = lane_runner(provider, workspace.path(), &["persona"]);
-        assert!(lanes.run(&CancellationToken::new()).await.is_empty());
-        let error = lanes.take_provider_failure().unwrap();
-        assert!(super::super::is_fatal_provider_error(&error));
-    }
-
-    #[tokio::test]
-    async fn a_stopped_phase_leaves_lanes_incomplete() {
-        let workspace = tempfile::tempdir().unwrap();
-        let provider = Scripted::new(vec![]);
-        let lanes = lane_runner(provider.clone(), workspace.path(), &["persona", "security"]);
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-
-        assert!(lanes.run(&cancel).await.is_empty());
-        assert!(provider.calls.lock().unwrap().is_empty());
-        for lane in ["persona", "security"] {
-            let snapshot = status(&lanes, lane);
-            assert_eq!(snapshot.status, LaneStatus::Incomplete);
-            assert_eq!(snapshot.reason.as_deref(), Some("phase_stopped"));
-        }
-
-        let unstarted = lane_runner(Scripted::new(vec![]), workspace.path(), &["persona"]);
-        unstarted.stop();
+        assert_eq!(lanes.snapshots()[0].reason.as_deref(), Some("turn_limit"));
         assert_eq!(
-            status(&unstarted, "persona").reason.as_deref(),
-            Some("phase_stopped")
+            std::fs::read_to_string(dir.path().join("sessions.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_read_only_transport_failure_replacement_is_bounded() {
+        let (lanes, dir) = acp_lanes_fixture("disconnect");
+        assert!(
+            lanes
+                .run(&tokio_util::sync::CancellationToken::new())
+                .await
+                .is_empty()
+        );
+        let snapshot = &lanes.snapshots()[0];
+        assert_eq!(snapshot.reason.as_deref(), Some("recovery_exhausted"));
+        assert_eq!(snapshot.recovery_attempt, 1);
+        assert!(
+            snapshot
+                .raw_notes
+                .as_deref()
+                .unwrap()
+                .contains("regression did not finish")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sessions.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
         );
     }
 }

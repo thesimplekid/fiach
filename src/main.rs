@@ -224,7 +224,7 @@ enum Commands {
         #[arg(long)]
         lane_timeout_mins: Option<std::num::NonZeroU64>,
 
-        /// Run review phases through this Goose ACP executable (opt-in)
+        /// Goose ACP executable for review phases (defaults to goose from PATH)
         #[arg(long)]
         acp_command: Option<PathBuf>,
 
@@ -236,11 +236,11 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// In-session provider retries: how often one agent session re-prompts after a transient model error
+        /// Follow-up prompts for a successfully completed ACP turn with missing structured submissions
         #[arg(long)]
         max_retries: Option<u32>,
 
-        /// Initial delay in seconds before an in-session provider retry (doubles each retry)
+        /// Initial delay in seconds before an ACP follow-up prompt (doubles each retry)
         #[arg(long)]
         retry_delay_secs: Option<u64>,
 
@@ -368,7 +368,7 @@ enum Commands {
         #[arg(long)]
         lane_timeout_mins: Option<std::num::NonZeroU64>,
 
-        /// Run review phases through this Goose ACP executable (opt-in)
+        /// Goose ACP executable for review phases (defaults to goose from PATH)
         #[arg(long)]
         acp_command: Option<PathBuf>,
 
@@ -376,7 +376,7 @@ enum Commands {
         #[arg(long)]
         db_path: Option<PathBuf>,
 
-        /// In-session provider retries: how often one agent session re-prompts after a transient model error. Distinct from --max-review-retries
+        /// Follow-up prompts for a successfully completed ACP turn with missing structured submissions. Distinct from --max-review-retries
         #[arg(long)]
         max_retries: Option<u32>,
 
@@ -384,7 +384,7 @@ enum Commands {
         #[arg(long)]
         max_review_retries: Option<u32>,
 
-        /// Initial delay in seconds before an in-session provider retry (doubles each retry)
+        /// Initial delay in seconds before an ACP follow-up prompt (doubles each retry)
         #[arg(long)]
         retry_delay_secs: Option<u64>,
 

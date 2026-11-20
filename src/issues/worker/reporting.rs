@@ -16,6 +16,21 @@ pub(super) struct ReportingClient {
 }
 
 impl ReportingClient {
+    /// Accept only the schema-validated output of a completed ACP operation.
+    pub(super) async fn accept_output(&self, output: serde_json::Value) -> Result<Report> {
+        let report: Report =
+            serde_json::from_value(output.clone()).context("Invalid worker report")?;
+        let name = if self.verify {
+            "submit_verdict"
+        } else if report.status == "candidate" {
+            "submit_candidate"
+        } else {
+            "submit_blocked"
+        };
+        self.submit(name, output.as_object().cloned()).await?;
+        Ok(report)
+    }
+
     async fn submit(&self, name: &str, arguments: Option<JsonObject>) -> Result<()> {
         let report: Report = serde_json::from_value(serde_json::Value::Object(
             arguments.context("Missing report arguments")?,

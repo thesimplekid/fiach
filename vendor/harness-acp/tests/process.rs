@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 fn fixture() -> (tempfile::TempDir, LaunchSpec, Task) {
     let dir = tempfile::tempdir().unwrap();
-    let mut spec = LaunchSpec::new(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()));
+    let mut spec = LaunchSpec::new("sh");
     spec.args = vec![
         "-c".into(),
         "(while :; do printf x >> \"$MARKER\"; sleep 0.02; done) & wait".into(),
@@ -70,4 +70,13 @@ async fn dropping_execution_stops_owned_descendants() {
     future.abort();
     let _ = future.await;
     stopped(&marker).await;
+}
+
+#[tokio::test]
+async fn zero_turn_limit_is_rejected_before_launch() {
+    let (dir, spec, mut task) = fixture();
+    task.max_turns = 0;
+    let result = run(&spec, &task, CancellationToken::new()).await;
+    assert_eq!(result.status, Completion::LaunchError);
+    assert!(!dir.path().join("marker").exists());
 }

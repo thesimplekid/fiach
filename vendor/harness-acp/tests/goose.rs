@@ -41,13 +41,19 @@ async fn model(
 #[tokio::test]
 #[ignore = "requires GOOSE_TEST_BINARY pointing at pinned Goose executable; no external provider"]
 async fn pinned_goose_accepts_schema_and_has_no_ambient_tools() {
-    probe(false).await;
+    probe(false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires pinned Goose; local mock provider only"]
 async fn pinned_goose_custom_provider_and_restricted_mcp() {
-    probe(true).await;
+    probe(true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Goose; local mock provider only"]
+async fn pinned_goose_enforces_task_limit_over_inherited_environment() {
+    probe(true, true).await;
 }
 
 #[derive(Clone)]
@@ -56,14 +62,14 @@ struct Mock {
     calls: Arc<Mutex<std::collections::VecDeque<Value>>>,
 }
 
-async fn probe(custom: bool) {
+async fn probe(custom: bool, limited: bool) {
     let executable = std::env::var_os("GOOSE_TEST_BINARY").expect("GOOSE_TEST_BINARY");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(vec![]));
     let router = axum::Router::new()
         .route("/v1/chat/completions", post(model))
-        .with_state(Mock{seen:seen.clone(),calls:Arc::new(Mutex::new(if custom {std::collections::VecDeque::from([json!({"name":"developer__shell","arguments":"{\"command\":\"touch FORBIDDEN_EFFECT\"}"}),json!({"name":"load_skill","arguments":"{\"name\":\"/etc/passwd\"}"}),json!({"name":"inspection__inspect","arguments":"{\"path\":\"source.rs\"}"})])}else{Default::default()}))});
+        .with_state(Mock{seen:seen.clone(),calls:Arc::new(Mutex::new(if limited {std::collections::VecDeque::from([json!({"name":"inspection__inspect","arguments":"{\"path\":\"source.rs\"}"})])}else if custom {std::collections::VecDeque::from([json!({"name":"developer__shell","arguments":"{\"command\":\"touch FORBIDDEN_EFFECT\"}"}),json!({"name":"load_skill","arguments":"{\"name\":\"/etc/passwd\"}"}),json!({"name":"inspection__inspect","arguments":"{\"path\":\"source.rs\"}"})])}else{Default::default()}))});
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -72,6 +78,8 @@ async fn probe(custom: bool) {
         .insert("OPENAI_API_KEY".into(), "test-provider-secret".into());
     spec.env
         .insert("OPENAI_BASE_URL".into(), format!("http://{addr}/v1").into());
+    // Supplied environment cannot weaken the task limit.
+    spec.env.insert("GOOSE_MAX_TURNS".into(), "100".into());
     let cwd = tempfile::tempdir().unwrap();
     let handler = Arc::new(Inspection(std::sync::atomic::AtomicUsize::new(0)));
     let bridge = harness_acp::mcp::McpBridge::start(handler.clone())
@@ -95,9 +103,9 @@ async fn probe(custom: bool) {
             vec![]
         },
         timeout: Duration::from_secs(30),
-        max_turns: 8,
+        max_turns: if limited || !custom { 1 } else { 8 },
     };
-    let result = if custom {
+    let result = if !limited {
         let mut session = harness_acp::Session::connect(&spec, &task, CancellationToken::new())
             .await
             .unwrap();
@@ -126,14 +134,45 @@ async fn probe(custom: bool) {
                 .unwrap()
                 .iter()
                 .any(|body| body.to_string().contains("Second turn")
-                    && body.to_string().contains("inspected source.rs"))
+                    && (!custom || body.to_string().contains("inspected source.rs")))
         );
         result
     } else {
         run(&spec, &task, CancellationToken::new()).await
     };
+    let structured_calls = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| {
+            body["tools"].as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|t| t["function"]["name"] == "final_output")
+            })
+        })
+        .count();
+    if limited {
+        assert_eq!(result.status, Completion::TurnLimit, "{result:#?}");
+        assert!(
+            result.output.is_none(),
+            "must not accept output after exhaustion"
+        );
+        assert_eq!(structured_calls, 1, "limit must stop the next inference");
+        assert_eq!(handler.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            !result.transcript.is_empty(),
+            "keep partial inspection evidence"
+        );
+        server.abort();
+        return;
+    }
     assert_eq!(result.status, Completion::Completed, "{result:#?}");
     assert_eq!(result.output, Some(json!({"ok":true})));
+    // A completed final_output must terminate inference. Custom mode has three
+    // inspection attempts, one final output, then one follow-up final output. The built-in provider completes two
+    // prompts with max_turns=1, proving the limit resets per prompt.
+    assert_eq!(structured_calls, if custom { 5 } else { 2 });
     let requests = seen.lock().unwrap();
     assert!(!requests.is_empty());
     for request in requests.iter() {

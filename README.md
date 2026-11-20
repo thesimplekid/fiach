@@ -2,7 +2,7 @@
 
 > **Main repository:** `ssh://git@git.cashu.dev/thesimplekid/fiach.git`. The GitHub repository is just a mirror.
 
-**Fiach** (Irish for *Hunter* or *Seeker*) is an autonomous, AI-powered PR reviewer built in Rust on the [goose](https://github.com/aaif-goose/goose) development kit (GDK). 
+**Fiach** (Irish for *Hunter* or *Seeker*) is an autonomous, AI-powered PR reviewer built in Rust with [Goose](https://github.com/aaif-goose/goose) agents running through ACP. 
 
 It acts as a background daemon that monitors configured GitHub repositories, checks out active Pull Requests, and uses an LLM (OpenRouter by default, or OpenAI, Anthropic, or Google directly) to review the code against a fully customizable **Persona**. If the agent finds actionable issues (like security vulnerabilities or code quality violations), `fiach` can automatically report them by commenting on the PR or opening a dedicated disclosure PR on a centralized tracking repository.
 
@@ -553,7 +553,7 @@ auth-tag variable) in `services.fiach.environmentFile`.
 
 ### Structured Reporting and Verification
 
-Fiach uses structured reporting as the default review path for all personas. The finder agent does not directly post to GitHub and does not decide disclosure from Markdown frontmatter. Instead, it submits candidates through in-process reporting tools:
+Fiach uses structured reporting as the default review path for all personas. The finder agent does not directly post to GitHub and does not decide disclosure from Markdown frontmatter. Instead, it submits candidates through host reporting tools exposed over MCP:
 
 - `submit_finding` records one candidate finding.
 - `submit_no_findings` records that the finder found no candidates.
@@ -789,9 +789,9 @@ The following options are available under `services.fiach`:
 | `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
 | `timeoutMins` | integer | `30` | Timeout in minutes for each review session. |
 | `laneTimeoutMins` | positive integer or null | `null` | Timeout per lane attempt. A lane that times out is not replaced; a replacement after a session error or empty result gets the same allowance. Null preserves the derived default (one quarter of the phase timeout, capped at five minutes). |
-| `maxRetries` | integer | `3` | In-session provider retries: how often one agent session re-prompts after a transient model error. Distinct from `maxReviewRetries`. |
+| `maxRetries` | integer | `3` | Follow-up prompts for a successfully completed ACP turn with missing structured submissions. Distinct from `maxReviewRetries`. |
 | `maxReviewRetries` | unsigned integer | `5` | Whole-review retries per commit after a failed review attempt, with backoff. Failures while the provider circuit is open do not count. |
-| `retryDelaySecs` | integer | `10` | Initial delay in seconds before an in-session provider retry; doubles after each retry. |
+| `retryDelaySecs` | integer | `10` | Initial delay in seconds before an ACP follow-up prompt; doubles after each retry. |
 | `providerFailureThreshold` | unsigned integer | `5` | Consecutive transient provider failures that open the provider circuit and pause review dispatch. `0` disables the breaker. |
 | `providerProbeIntervalSecs` | positive integer | `60` | Seconds between probe calls while the provider circuit is open. |
 | `maxCostUsd` | float or null | `null` | Maximum observed budget in USD for each review. Cancels finder, verifier, and duplicate-suppression work at the limit. |
@@ -904,9 +904,9 @@ are stored separately from structured findings. These artifacts are explicitly
 incomplete: no completed-review result is emitted and neither GitHub nor Buzz
 finding disclosure runs. Cleanup of outstanding lanes is bounded and concurrent.
 
-Whole-review retry policy is independent of in-session provider retries:
+Whole-review retry policy is independent of ACP follow-up prompts:
 `--max-retries` (NixOS `maxRetries`) controls how often one agent session
-re-prompts after a transient model error, while daemon `--max-review-retries`
+requests missing structured submissions after a completed turn, while daemon `--max-review-retries`
 (`daemon.max_review_retries` in TOML; NixOS `maxReviewRetries`) defaults to five
 whole-review retries after the initial attempt. Failed reviews wait 5, 10, 20, 40, ... minutes,
 capped at six hours plus up to 59 seconds of stable jitter. The persisted attempt
@@ -935,9 +935,8 @@ daemon probes each distinct finder/verifier provider and model every
 only a fully successful round closes the circuit. Ordinary successful calls
 cannot clear another model’s outage. Failures recorded while the circuit is open
 are classed `provider_unavailable` and do not use up whole-review retries. There
-is no automatic model fallback. Unsandboxed daemon reviews call the provider
-in-process, so the breaker counts whole failed review attempts instead of model
-calls. Set the threshold to `0` to disable the breaker (CLI:
+is no automatic model fallback. Unsandboxed daemon reviews call the provider without the broker, so the breaker
+counts whole failed review attempts instead of model calls. Set the threshold to `0` to disable the breaker (CLI:
 `--provider-failure-threshold`, `--provider-probe-interval-secs`; NixOS:
 `providerFailureThreshold`, `providerProbeIntervalSecs`).
 
@@ -970,38 +969,38 @@ Monitor that flag or the `fiach_review_processing_*`, `fiach_provider_circuit_*`
 `/metrics`, rather than using it as a liveness probe. Failure details use fixed categories, never raw
 provider responses or source/model content.
 
-## ACP review execution
+## ACP execution
 
-Set `acp_command = "goose"` in `[review]` or `[daemon]`, or pass
-`--acp-command goose`, to run review lanes, coordinator, verifier, and duplicate-suppression sessions through the shared
-`harness-acp` adapter. The default remains the embedded runner while the ACP
-migration is verified. Issue-fixing workers retain the embedded runtime: their live turn-limit
-narrowing and stop-before-next-inference reporting conditions are not yet
-represented by the fixed ACP recipe contract.
+All review lanes, coordinators, verifiers, duplicate-suppression continuations,
+and issue workers execute through Goose ACP. There is no embedded agent runtime.
+Review `acp_command` (or `--acp-command`) overrides the default `goose` executable.
+The packaged Fiach includes the pinned Goose CLI; `nix develop .#acp` supplies it
+for development. Custom issue root filesystems must provide `goose` on PATH.
+The NixOS module includes it in the managed sandbox root filesystem.
 
-`nix develop .#acp` provides the pinned Goose executable. The packaged Fiach
-also places that executable first on PATH; an explicit executable path overrides
-it. Each review phase starts a fresh Goose process with private configuration, an
-explicit provider environment, and only its authenticated MCP bridge. The coordinator and verifier use the same
-host reporting handlers as embedded execution. Continuations keep the same ACP
-session; narrowed tool permissions are checked again at dispatch even if Goose
-still advertises the old tool catalog. A failed connection is never replayed.
-Goose runs in an empty task directory, with repository access supplied only by
-MCP, so its internal skill discovery cannot load checkout skills.
-No developer extension, file/terminal client capability, or ambient Goose
-extension configuration is supplied. The bridge validates tool schemas and
-rejects calls outside its fixed catalog. Existing inspection path confinement
-and evidence recording remain authoritative.
+Each phase owns a Goose process with private configuration and an empty task
+directory. Authenticated MCP bridges expose existing host tools, and host-side
+validation and disclosure remain authoritative. Review phases use inspection
+and structured reporting tools; lane outputs use a validated final_output schema.
+Continuations retain the same ACP conversation and dispatch rechecks current
+permissions. Failed or cancelled sessions cannot be replayed.
 
-Lanes submit schema-validated JSON through Goose's `final_output` tool. Missing
-or invalid output remains an incomplete lane, never a no-findings result.
-Cumulative Goose usage updates feed the existing observed review budget;
-context-window occupancy and final prompt summaries are not counted as new
-spending. Cancellation and deadlines stop and reap the owned Goose process.
-The advisory 80% budget nudge waits for an ACP prompt to finish; the hard
-observed budget still cancels the running process. Cancelled sessions cannot
-be resumed or silently replayed.
-The launcher boundary can later carry a VM connection; this change adds no VM.
+Issue workers keep the existing container and host publication boundaries. Their
+work phase exposes the workspace developer tools through MCP and ends through
+final_output. The host applies the existing report policy and persists report.json
+before producing a candidate patch. Missing or invalid reports and turn exhaustion
+can enter at most two fresh reporting recovery sessions, each limited to three
+turns with no workspace tools. Recovery receives prior evidence, never reruns work,
+and shares the original deadline. Transport failures retain evidence and fail
+closed; unconfirmed output is never accepted as a report.
 
-The canonical shared library is maintained in `harness-acp`; the versioned
-`vendor/harness-acp` snapshot keeps this repository independently buildable.
+Cumulative usage updates drive observed budgets without double-counting prompt
+summaries or context occupancy. The advisory 80% budget nudge waits for the current
+prompt to finish; the hard observed budget cancels the process. Cancellation and
+deadlines stop and reap owned processes. This boundary can later support VMs; no
+VM infrastructure is introduced here.
+
+The canonical library is maintained in `harness-acp`; its versioned
+`vendor/harness-acp` snapshot keeps Fiach independently buildable. Provider DTOs,
+workspace tool handlers, and one-shot classifier calls still use Goose libraries;
+agent orchestration always uses ACP.

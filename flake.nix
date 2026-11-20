@@ -623,7 +623,7 @@
               type = lib.types.nullOr lib.types.str;
               default = null;
               example = "goose";
-              description = "Opt-in Goose ACP executable for review phases.";
+              description = "Goose ACP executable for review phases; null uses goose from PATH.";
             };
 
             laneTimeoutMins = lib.mkOption {
@@ -635,7 +635,7 @@
             maxRetries = lib.mkOption {
               type = lib.types.int;
               default = 3;
-              description = "In-session provider retries: how often one agent session re-prompts after a transient model error. Distinct from maxReviewRetries.";
+              description = "Follow-up prompts for a successfully completed ACP turn with missing structured submissions. Distinct from maxReviewRetries.";
             };
 
             maxReviewRetries = lib.mkOption {
@@ -647,7 +647,7 @@
             retryDelaySecs = lib.mkOption {
               type = lib.types.int;
               default = 10;
-              description = "Initial delay in seconds before an in-session provider retry; doubles after each retry.";
+              description = "Initial delay in seconds before an ACP follow-up prompt; doubles after each retry.";
             };
 
             providerFailureThreshold = lib.mkOption {
@@ -967,6 +967,7 @@
                     name = "fiach-sandbox-rootfs";
                     paths = with pkgs; [
                       fiachPkg
+                      self.packages.${pkgs.stdenv.hostPlatform.system}.goose
                       bashInteractive
                       coreutils
                       git

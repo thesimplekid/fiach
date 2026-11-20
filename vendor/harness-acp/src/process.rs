@@ -65,6 +65,12 @@ impl Transport for Process {
 #[async_trait]
 impl Launcher for ProcessLauncher {
     async fn launch(&self, spec: &LaunchSpec, task: &Task) -> io::Result<Connection> {
+        if task.max_turns == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "task max_turns must be positive",
+            ));
+        }
         if !task.cwd.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -106,6 +112,9 @@ impl Launcher for ProcessLauncher {
             .env("XDG_DATA_HOME", root.path().join("xdg-data"))
             .env("XDG_STATE_HOME", root.path().join("xdg-state"))
             .env("GOOSE_MODE", "auto")
+            // Pinned ACP ignores recipe.settings.max_turns; the agent reads this
+            // configuration value. Task policy must override inherited values.
+            .env("GOOSE_MAX_TURNS", task.max_turns.to_string())
             .env("GOOSE_DISABLE_KEYRING", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

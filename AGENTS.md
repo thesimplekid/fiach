@@ -5,8 +5,8 @@ High-signal constraints and instructions for AI agents working in this repositor
 ## Architecture & Layout
 
 - **Pre-stage then delegate**: The app isolates work in a temp dir using host-side forge adapters *before* giving control to an agent session. This prevents wasting agent turns on git operations.
-- **ACP review backend**: `acp_command` opts review lanes, coordinator, verifier, and duplicate suppression into the shared `harness-acp` adapter. MCP bridges expose existing phase tools; lane final outputs are schema validated. Continuations preserve one ACP session and dispatch enforces narrowed tools. Issue workers retain embedded execution for live turn-limit and stop-condition semantics.
-- **Embedded agent loop on the Goose GDK**: The default backend in `src/review/agent_loop.rs` assembles sessions from `goose-agent` operations. Tools are host-side `HostTools` called in-process. The optional ACP backend exposes those handlers through a private MCP bridge.
+- **ACP-only agent execution**: `src/review/agent_loop.rs` adapts persistent Goose ACP sessions; host tools run behind authenticated MCP bridges. `acp_command` overrides the default Goose executable. No embedded agent runtime remains.
+- **Issue worker completion**: Work uses developer MCP tools plus schema-validated final_output. The host validates and persists reports. At most two fresh report-only recovery sessions get three turns each and share the original deadline; failures never replay workspace actions.
 - **Host-driven review lanes**: `src/review/lanes.rs` runs each selected lane as an inspection-only child session (bounded concurrency, one deadline per attempt, one replacement only after a session error or empty result). The coordinator receives completed lane results and only synthesizes and submits.
 - **Structured reporting first**: The coordinator submits candidates through the host `ReportingClient` tools (`submit_finding` / `submit_no_findings`). Markdown is rendered by the host from structured data.
 - **Separate verifier session**: Candidate findings are adjudicated in a second agent session. The verifier submits one `submit_verdict` per finding; structured verdicts are authoritative for metadata and disclosure.
@@ -14,7 +14,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 - `src/main.rs`: Entrypoint, clap CLI parsing, tracing init.
 - `src/daemon.rs`: Polling loop, PR discovery via GitHub CLI or Forgejo REST, deduplication.
 - `src/review.rs`: Runs lanes, the coordinator, verifier, and duplicate-suppression continuation; reporting tools, artifact rendering, retries, and token/cost accounting.
-- `src/review/agent_loop.rs`: In-memory agent session (`AgentLoop`), host tools, turn limit, stop condition, empty-response handling, compaction, and provider-error retry classification.
+- `src/review/agent_loop.rs`: ACP session adapter (`AgentLoop`), host tool interfaces, usage accounting, and bounded follow-up prompts. Goose owns inference and compaction.
 - `src/reporting.rs`: Structured finding/verdict schemas, validation, Markdown rendering, diff-anchor parsing, and disclosure policy helpers.
 - `src/forge.rs`, `src/github.rs`, `src/forgejo.rs`: Forge selection and host adapters. Bare `owner/name` means GitHub; an HTTPS repository URL means Forgejo.
 - `src/workspace.rs`: Uses forge adapters to clone repo/PR to a temp dir and records PR lifecycle/base/default-branch context.

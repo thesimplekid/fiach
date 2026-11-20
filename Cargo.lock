@@ -1710,8 +1710,6 @@ dependencies = [
  "harness-acp",
  "jsonschema 0.55.1",
  "nostr",
- "oi-kit-agent",
- "oi-kit-context-management",
  "oi-kit-providers",
  "redb",
  "reqwest",

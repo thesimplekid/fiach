@@ -17,7 +17,7 @@ tool response linked to its exact call ID, followed by host schema validation.
 Arbitrary assistant JSON and an `end_turn` stop reason alone are not accepted
 as structured results. A task without a schema returns visible assistant text.
 
-`RunResult` distinguishes completion, cancellation, timeout, invalid output,
+`RunResult` distinguishes completion, cancellation, timeout, turn-limit exhaustion, invalid output,
 provider/agent errors, protocol errors, and launch errors. It retains bounded
 partial evidence on failure. `usage` is optional: missing information is not
 zero. Goose's custom `accumulatedInputTokens`, `accumulatedOutputTokens`, and
@@ -35,6 +35,12 @@ tools require executable lookup, provider credentials, and any required CA
 configuration. Declarative provider definitions are copied into private task
 configuration. The launcher overrides HOME, XDG paths, and GOOSE_PATH_ROOT,
 disables keyring access, and disables the implicit developer extension.
+`Task.max_turns` must be positive. The launcher forces `GOOSE_MAX_TURNS` after
+applying the supplied environment because this pinned ACP server does not apply
+the recipe turn limit. This bounds autonomous actions per prompt; persistent
+sessions use the same fixed limit on each follow-up. `TurnLimit` retains partial
+evidence and closes the session without retrying the task.
+
 Recipes explicitly select extensions; no configured or project plugin MCP
 servers are inherited. Client filesystem, terminal, and approval capabilities
 are refused. Explicitly exposed tools still run with the subprocess's OS

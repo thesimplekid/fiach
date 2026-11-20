@@ -8,8 +8,6 @@ rust-version = "1.98.1"
 harness-acp = { path = "vendor/harness-acp" }
 goose = { git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a", default-features = false, features = ["rustls-tls"] }
 goose-providers = { package = "oi-kit-providers", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a", default-features = false, features = ["rustls-tls"] }
-goose-agent = { package = "oi-kit-agent", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a" }
-goose-context-management = { package = "oi-kit-context-management", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a" }
 buzz-client = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }
 buzz-sdk = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }
 nostr = "0.44"

@@ -1,17 +1,17 @@
 {
   "repository": "harness-acp",
-  "revision": "4717ee3aa8086f82ac9b5a23e0b4711d9b8a72e4",
+  "revision": "f8844120c3fcb0f6ba19b18f9e2d82c38e5f06c3",
   "sha256": {
     "Cargo.toml": "3542e4293cccad0e21ff73b3a0ad0b34a9c05777533f15c1bf65ac4dfe9dafde",
-    "README.md": "6e0c8521543e3942bef0ff7d9eb767879767a699572fcef26d70c6281f11eb38",
+    "README.md": "20d370fc1f507c510728c7cd5af703961f0cea061f2ccbc73aed69ea6505cfb2",
     "LICENSE": "6bbdde43f8b87cc7caba3ef8a7b20f29f33192c216573541bd15c4be6cdba861",
-    "src/client.rs": "852e831cd39c20b2b95a6ee91ba5cd350c3b2aee749e154a65aef19d3e8e46e7",
+    "src/client.rs": "cdcc9c75b4b14132e65658a452c433f66cfbf2b1bb8e24d4bd86fd22c3c0da2b",
     "src/lib.rs": "614f5d9702c596bd268c1687ef982f71559fd5946ec5fa2f62c961ecc17d065f",
     "src/mcp.rs": "4418770f475538dc6cfa8f21a6cb3133a47d34aaca528c52dc944391f3365d1b",
-    "src/process.rs": "95877cd8b50a66362ce43f3ffd2d4b9bcc6d9b76a55101d5d207c3e0f3369778",
-    "src/types.rs": "e27643987ec6de73b088818e8ce224c6d7e21ad2beadff77420bb8bb3be2284a",
-    "tests/goose.rs": "530baee5cb3116af3bbaf8dc0dc922c37a3306c9db9284c9e820c7a178f6bf87",
-    "tests/process.rs": "100001404309da2495e70e9139051eda2eca59c96361c5cd91f0726249374acf",
-    "tests/protocol.rs": "87c37b31d221ee8f3f6868c7bc80bbc760b5f5c9209f3d83a6b5731aede1458c"
+    "src/process.rs": "00479a74a77ba6e4e51ab75cc8baf93c5cf5eb245c5c265fd4fbec9671bb4ad2",
+    "src/types.rs": "c6e9cdd035a16320e509a1d822a9acfbd2e178f83cadf5620095aa41068279c6",
+    "tests/goose.rs": "1ae0ebb05181c028d1ca25767e4385c04d713967cbcfe24f86c54d2457a0c880",
+    "tests/process.rs": "2299a94e41c7f154118903421cfdc471c1b285e679d9afff8f27db5e487251fd",
+    "tests/protocol.rs": "b410d2e478cef9a807b1d95c1992f9285cd5980426ea589481d4c4628ce7f670"
   }
 }

@@ -30,7 +30,6 @@ pub(super) struct AcpLoop {
     max_turns: u32,
     timeout: Duration,
     state: tokio::sync::Mutex<Option<Running>>,
-    last: Mutex<Option<RunResult>>,
 }
 
 struct Running {
@@ -60,20 +59,7 @@ impl AcpLoop {
             max_turns,
             timeout,
             state: tokio::sync::Mutex::new(None),
-            last: Mutex::new(None),
         }
-    }
-
-    pub fn transcript(&self, max_chars: usize) -> String {
-        self.last
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .and_then(|result| serde_json::to_string(&result.transcript).ok())
-            .unwrap_or_default()
-            .chars()
-            .take(max_chars)
-            .collect()
     }
 
     pub async fn reply(
@@ -119,8 +105,6 @@ impl AcpLoop {
             let session = match Session::connect(&launch, &task, cancel.child_token()).await {
                 Ok(session) => session,
                 Err(result) => {
-                    *self.last.lock().unwrap_or_else(|error| error.into_inner()) =
-                        Some(result.clone());
                     return Ok(result);
                 }
             };
@@ -154,7 +138,6 @@ impl AcpLoop {
         if let Some(current) = &result.usage {
             observe(current);
         }
-        *self.last.lock().unwrap_or_else(|error| error.into_inner()) = Some(result.clone());
         Ok(result)
     }
 }

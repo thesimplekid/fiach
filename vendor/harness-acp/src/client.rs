@@ -350,7 +350,7 @@ impl Client {
                 ));
             }
             if let Some(error) = frame.get("error") {
-                return Err((Completion::ProviderError, error.to_string()));
+                return Err((rpc_error_status(error), error.to_string()));
             }
             return frame.get("result").cloned().ok_or_else(|| {
                 (
@@ -444,6 +444,9 @@ impl Client {
         }
         match response["stopReason"].as_str() {
             Some("end_turn") => {}
+            Some("max_turn_requests") => {
+                return Err((Completion::TurnLimit, "agent reached its turn limit".into()));
+            }
             Some("cancelled") => {
                 return Err((Completion::Cancelled, "agent cancelled turn".into()));
             }
@@ -660,4 +663,35 @@ fn secrets(spec: &LaunchSpec, task: &Task) -> Vec<String> {
 
 async fn cleanup(transport: &mut dyn crate::Transport) {
     let _ = tokio::time::timeout(Duration::from_secs(2), transport.shutdown()).await;
+}
+
+// Goose bf074d6 reports action exhaustion as a generic turn_failed RPC error.
+// Match its exact envelope and message rather than classifying arbitrary model
+// text or other failures containing "limit" as exhausted task policy.
+fn rpc_error_status(error: &Value) -> Completion {
+    const MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of actions I can do without user input. Would you like me to continue?";
+    if error["code"] == -32603
+        && error["data"]["reason"] == "turn_failed"
+        && error["message"] == MAX_TURNS_MESSAGE
+    {
+        Completion::TurnLimit
+    } else {
+        Completion::ProviderError
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn turn_limit_requires_the_pinned_goose_error_contract() {
+        let mut error = json!({"code":-32603,"message":"I've reached the maximum number of actions I can do without user input. Would you like me to continue?","data":{"reason":"turn_failed"}});
+        assert_eq!(rpc_error_status(&error), Completion::TurnLimit);
+        error["data"]["reason"] = json!("provider_error");
+        assert_eq!(rpc_error_status(&error), Completion::ProviderError);
+        error["data"]["reason"] = json!("turn_failed");
+        error["message"] = json!("Provider rate limit exceeded");
+        assert_eq!(rpc_error_status(&error), Completion::ProviderError);
+    }
 }

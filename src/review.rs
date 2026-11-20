@@ -404,7 +404,7 @@ pub struct ReviewParams {
     pub timeout_mins: u64,
     /// Timeout per lane attempt (any replacement gets the same); None preserves the derived default.
     pub lane_timeout_mins: Option<std::num::NonZeroU64>,
-    /// Opt-in Goose ACP executable for review phases.
+    /// Goose ACP executable override; defaults to goose from PATH.
     pub acp_command: Option<PathBuf>,
     /// Path to the redb database
     pub db_path: PathBuf,
@@ -1474,7 +1474,7 @@ pub async fn run_review(
         .iter()
         .any(|lane| is_summary_lane(lane));
     let lanes = lanes::Lanes::new(
-        provider.clone(),
+        params.provider.clone(),
         model_config.clone(),
         inspection.clone(),
         params.max_turns,
@@ -1492,7 +1492,7 @@ pub async fn run_review(
             },
         ),
     );
-    let lanes = lanes.with_acp(params.acp_command.as_deref(), &params.provider);
+    let lanes = lanes.with_command(params.acp_command.as_deref());
     if !normalized_review_lanes.is_empty() {
         tracing::info!(
             repo = %params.repo,
@@ -1509,8 +1509,10 @@ pub async fn run_review(
     let coordinator = AgentLoop::new(
         coordinator_id.clone(),
         LoopConfig {
-            provider: provider.clone(),
-            model_config: model_config.clone(),
+            provider: params.provider.clone(),
+            model: params.model.clone(),
+            command: agent_loop::executable(params.acp_command.as_deref()),
+            timeout: Duration::from_secs(params.timeout_mins.saturating_mul(60)),
             system_prompt: COORDINATOR_PROMPT.to_string(),
             tools: vec![
                 Arc::new(inspection),
@@ -1520,13 +1522,7 @@ pub async fn run_review(
                 }),
             ],
             max_turns: params.max_turns,
-            stop_when: None,
         },
-    )
-    .with_acp(
-        params.acp_command.as_deref(),
-        &params.provider,
-        Duration::from_secs(params.timeout_mins.saturating_mul(60)),
     );
     let direct_cost = direct_call_cost_usd;
     let usage_cost = |usage: &[ProviderUsage]| {
@@ -1566,7 +1562,6 @@ pub async fn run_review(
     );
     let budget_exceeded = AtomicBool::new(false);
     let nudge_requested = AtomicBool::new(false);
-    let coordinator_reply = std::sync::Mutex::new(None::<CancellationToken>);
     let finder_started = Instant::now();
     let review_future = async {
         if cost_budget_reached(direct_cost, finder_budget) {
@@ -1592,7 +1587,6 @@ pub async fn run_review(
         ));
         loop {
             let reply_cancel = phase_cancel_token.child_token();
-            *std_lock(&coordinator_reply) = Some(reply_cancel.clone());
             let end = coordinator
                 .reply(message, &reply_cancel, |message| {
                     if let Ok(json) = serde_json::to_string_pretty(message) {
@@ -1617,8 +1611,11 @@ pub async fn run_review(
 
             let last_text = coordinator.final_text();
             let last_text = last_text.trim();
+            if end == ReplyEnd::TurnLimit {
+                return Ok(());
+            }
             if nudge_requested.load(Ordering::SeqCst) && !budget_nudged {
-                // The nudge replaces an interrupted reply; it is not a retry.
+                // Advisory nudges wait for a completed prompt; never cancel a session.
                 budget_nudged = true;
                 tracing::info!(
                     cost = %format_cost(finder_cost()),
@@ -1629,20 +1626,9 @@ pub async fn run_review(
                 continue;
             }
             let follow_up = match end {
-                ReplyEnd::ProviderError(error) => {
-                    let error = retry.provider_error(&error)?;
-                    tracing::error!(error = %error, "Agent stream error");
-                    if last_text.is_empty() {
-                        format!(
-                            "The connection was interrupted due to an error: {error}. Continue the review."
-                        )
-                    } else {
-                        format!(
-                            "The connection was interrupted due to an error: {error}. Continue from where you left off. If you are done reviewing, call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using a reporting tool. The host will write the final report to {report_path}. Your last visible message was:\n\n{last_text}"
-                        )
-                    }
-                }
-                ReplyEnd::Finished | ReplyEnd::TurnLimit => {
+                ReplyEnd::TurnLimit => return Ok(()),
+
+                ReplyEnd::Finished => {
                     if budget_nudged && retry.retries() > 0 {
                         return Ok(());
                     }
@@ -1728,15 +1714,11 @@ pub async fn run_review(
                         phase_cancel_token.cancel();
                     } else if let (Some(max_cost), Some(current_cost)) = (finder_budget, current_cost)
                         && current_cost >= max_cost * 0.8
-                        && !nudge_requested.swap(true, Ordering::SeqCst)
-                        && let Some(reply) = std_lock(&coordinator_reply).as_ref()
                     {
                         // ACP cancellation closes the session. Deliver its
                         // advisory nudge after the current prompt completes;
                         // the hard budget above still cancels immediately.
-                        if params.acp_command.is_none() {
-                            reply.cancel();
-                        }
+                        nudge_requested.store(true, Ordering::SeqCst);
                     }
                 }
             }
@@ -2763,13 +2745,9 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
                 bail!("Duplicate suppression pass cancelled by user");
             }
             let follow_up = match end {
-                ReplyEnd::ProviderError(error) => {
-                    let error = retry.provider_error(&error)?;
-                    format!(
-                        "The duplicate suppression stream was interrupted due to this error: {error}. Continue and call `submit_duplicate_decision` exactly once for every remaining verified finding."
-                    )
-                }
-                ReplyEnd::Finished | ReplyEnd::TurnLimit => {
+                ReplyEnd::TurnLimit => return Ok(()),
+
+                ReplyEnd::Finished => {
                     if dedupe_complete(&params.artifact, &expected_ids).await || retry.exhausted() {
                         return Ok(());
                     }
@@ -2829,16 +2807,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
             ..VerificationStats::default()
         });
     }
-    let model_config = model_config_from_user_config(params.provider_name, params.model)
-        .context("Failed to configure verifier model")?;
-    let provider = create(params.provider_name, Vec::new())
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create verifier {} provider",
-                params.provider_name
-            )
-        })?;
+
     let (input_price_per_m, output_price_per_m) =
         resolve_price_overrides(params.provider_name, params.model, None, None).await;
     // Reviews are static: the verifier inspects code like the finder and has
@@ -2880,8 +2849,10 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     let agent = AgentLoop::new(
         "review-verifier",
         LoopConfig {
-            provider,
-            model_config,
+            provider: params.provider_name.into(),
+            model: params.model.into(),
+            command: agent_loop::executable(params.acp_command),
+            timeout: Duration::from_secs(params.timeout_mins.saturating_mul(60)),
             system_prompt: VERIFIER_POLICY.to_string(),
             tools: vec![
                 Arc::new(inspection),
@@ -2891,13 +2862,7 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                 }),
             ],
             max_turns: params.max_turns,
-            stop_when: None,
         },
-    )
-    .with_acp(
-        params.acp_command,
-        params.provider_name,
-        Duration::from_secs(params.timeout_mins.saturating_mul(60)),
     );
     let usage_cost = |usage: &[ProviderUsage]| {
         cost_from_usage(
@@ -2936,13 +2901,9 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
                 bail!("Verifier pass cancelled by user");
             }
             let follow_up = match end {
-                ReplyEnd::ProviderError(error) => {
-                    let error = retry.provider_error(&error)?;
-                    format!(
-                        "The verifier stream was interrupted due to this error: {error}. Continue verification and call `submit_verdict` exactly once for every candidate and `submit_prior_finding_status` exactly once for every earlier finding before stopping."
-                    )
-                }
-                ReplyEnd::Finished | ReplyEnd::TurnLimit => {
+                ReplyEnd::TurnLimit => return Ok(()),
+
+                ReplyEnd::Finished => {
                     if params.artifact.lock().await.verification_settled() || retry.exhausted() {
                         return Ok(());
                     }
@@ -3106,12 +3067,6 @@ fn fatal_provider_error(error: anyhow::Error, phase: &str) -> anyhow::Error {
 pub fn is_fatal_provider_error(e: &anyhow::Error) -> bool {
     e.chain()
         .any(|cause| cause.to_string().contains(FATAL_PROVIDER_ERROR))
-}
-
-fn std_lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn lane_attempt_timeout(
@@ -4227,117 +4182,6 @@ Reviewed the PR and found no vulnerabilities.
         assert_eq!(updated.findings, artifact.findings);
         assert_eq!(updated.no_findings, artifact.no_findings);
         assert_eq!(updated.verdicts, artifact.verdicts);
-    }
-
-    #[tokio::test]
-    async fn duplicate_continuation_only_reaches_duplicate_decisions() {
-        use crate::review::agent_loop::testing::Scripted;
-        use goose_providers::model::ModelConfig;
-
-        let workspace = tempfile::tempdir().unwrap();
-        let mut artifact = ReportingArtifact::default();
-        artifact.findings.push(
-            reporting::Finding::from_input(
-                1,
-                reporting::FindingInput {
-                    title: "Original".into(),
-                    severity: "high".into(),
-                    confidence: "high".into(),
-                    affected_locations: vec![],
-                    evidence: "code evidence".into(),
-                    skills_used: vec![],
-                    body_markdown: "Original body".into(),
-                },
-            )
-            .unwrap(),
-        );
-        let (_, mut findings, comments) = duplicate_fixture();
-        let finding_id = artifact.findings[0].id.clone();
-        findings[0].finding_id = finding_id.clone();
-        let mut verdict = findings[0].verdict.clone();
-        verdict.finding_id = finding_id.clone();
-        artifact.verdicts.push(verdict);
-        let shared = Arc::new(Mutex::new(artifact));
-        let decision = rmcp::object!({
-            "finding_id": finding_id.clone(),
-            "already_reported": true,
-            "matching_comment_ids": [42],
-            "confidence": "high",
-            "rationale": "Same empty-input panic"
-        });
-        let provider = Scripted::new(vec![
-            Ok(Message::assistant().with_tool_request(
-                "inspect",
-                Ok(CallToolRequestParams::new("inspect")
-                    .with_arguments(rmcp::object!({"operation": "files", "path": "."}))),
-            )),
-            Ok(Message::assistant().with_tool_request(
-                "decide",
-                Ok(CallToolRequestParams::new("submit_duplicate_decision")
-                    .with_arguments(decision)),
-            )),
-        ]);
-        let inspection = crate::inspection::Inspection::new(
-            workspace.path(),
-            &[],
-            &"a".repeat(40),
-            &"b".repeat(40),
-        )
-        .unwrap();
-        let coordinator = AgentLoop::new(
-            "pr-review",
-            LoopConfig {
-                provider: provider.clone(),
-                model_config: ModelConfig::new("scripted"),
-                system_prompt: COORDINATOR_PROMPT.into(),
-                tools: vec![
-                    Arc::new(inspection),
-                    Arc::new(reporting_client(ReviewPhase::Finder, &shared)),
-                ],
-                max_turns: 10,
-                stop_when: None,
-            },
-        );
-        let pr_context = reporting::PrContext {
-            state: "open".into(),
-            merged: false,
-            base_ref_name: "main".into(),
-            default_branch: "main".into(),
-            base_commit: "a".repeat(40),
-            head_commit: "b".repeat(40),
-        };
-
-        resume_coordinator_for_duplicates(DedupeParams {
-            agent: &coordinator,
-            artifact: shared.clone(),
-            repo: "owner/repo",
-            pr_number: 7,
-            pr_context: &pr_context,
-            findings: &findings,
-            existing_comments: &comments,
-            provider_name: "scripted",
-            model: "scripted",
-            input_price_per_m: None,
-            output_price_per_m: None,
-            max_retries: 0,
-            retry_delay_secs: 0,
-            timeout_mins: 1,
-            max_cost_usd: None,
-            cancel_token: CancellationToken::new(),
-        })
-        .await
-        .unwrap();
-
-        let offered_inspect = provider
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(_, tools)| tools.iter().any(|tool| tool == "inspect"));
-        assert!(!offered_inspect);
-        let updated = shared.lock().await;
-        assert_eq!(updated.duplicate_decisions.len(), 1);
-        assert!(updated.duplicate_decisions[0].already_reported);
     }
 
     #[test]

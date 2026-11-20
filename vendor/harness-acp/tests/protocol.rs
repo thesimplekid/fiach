@@ -120,7 +120,7 @@ async fn scripted(mode: &str, server: DuplexStream) {
                     send(&mut write,json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"f","_meta":{"goose":{"toolCall":{"toolName":"final_output"}}},"rawInput":args,"status":"pending"}}})).await;
                     send(&mut write,json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"f","status":if mode=="rejected"{"failed"}else{"completed"}}}})).await;
                 }
-                json!({"stopReason":"end_turn"})
+                json!({"stopReason":if mode == "turn_limit" {"max_turn_requests"} else {"end_turn"}})
             }
             Some("session/cancel") => return,
             _ => continue,
@@ -242,4 +242,12 @@ async fn cancellation_retains_partial_frame_evidence() {
     let result = scenario("fragment").await;
     assert_eq!(result.status, Completion::Cancelled);
     assert!(result.text.contains("fragmented evidence"));
+}
+
+#[tokio::test]
+async fn turn_limit_keeps_partial_output_without_accepting_success() {
+    let result = scenario("turn_limit").await;
+    assert_eq!(result.status, Completion::TurnLimit);
+    assert!(result.output.is_some());
+    assert!(!result.transcript.is_empty());
 }
