@@ -94,8 +94,9 @@ def read_json(path):
 
 
 class Runner(worker.Runner):
-    def __init__(self, rootfs, artifacts, sudo):
+    def __init__(self, rootfs, artifacts, sudo, timeout_scale=1):
         self.rootfs, self.artifacts = rootfs, artifacts
+        self.timeout_scale = timeout_scale
         self.privilege = ['sudo', '-n'] if sudo else []
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Model)
         self.server.daemon_threads = True
@@ -150,7 +151,7 @@ verifier_provider = "openai"
 verifier_model = "gpt-4o"
 network = "host"
 max_turns = 8
-timeout_secs = {5 if mode == "timeout" else 60}
+timeout_secs = {(5 if mode == "timeout" else 60) * self.timeout_scale}
 ''')
         (directory / 'gitconfig').write_text('[safe]\n\tdirectory = *\n[core]\n\thooksPath = /dev/null\n')
         env = dict(PATH=f'{bindir}:{os.environ["PATH"]}', HOME=str(directory), LANG='C.UTF-8',
@@ -174,19 +175,19 @@ timeout_secs = {5 if mode == "timeout" else 60}
                                        env={'PATH': os.environ['PATH'], 'LANG': 'C.UTF-8'})
             try:
                 if cancel or timeout:
-                    wait_for(lambda: any(directory.rglob('heartbeat.log')), process)
+                    wait_for(lambda: any(directory.rglob('heartbeat.log')), process, 90 * self.timeout_scale)
                     heartbeat = next(directory.rglob('heartbeat.log'))
                     size = heartbeat.stat().st_size
-                    time.sleep(0.3)
+                    time.sleep(0.3 * self.timeout_scale)
                     assert heartbeat.stat().st_size > size
                     owned = self.process_tree(process.pid)
                 elif watch:
-                    wait_for(lambda: log_path.read_text().count('Issue polling cycle complete') >= 2, process)
+                    wait_for(lambda: log_path.read_text().count('Issue polling cycle complete') >= 2, process, 90 * self.timeout_scale)
                 if watch or cancel:
                     owned = self.process_tree(process.pid)
                     host = next(member for member in owned if member[2] == '.fiach-wrapped')
                     self.signal_member(host, signal.SIGINT)
-                code = process.wait(timeout=90)
+                code = process.wait(timeout=90 * self.timeout_scale)
                 assert code == 0, f'Fiach failed: {log_path}'
             finally:
                 self.server.plan.release.set()
@@ -196,8 +197,8 @@ timeout_secs = {5 if mode == "timeout" else 60}
                     if hosts:
                         self.signal_member(hosts[0], signal.SIGINT)
                     with contextlib.suppress(subprocess.TimeoutExpired):
-                        process.wait(timeout=15)
-                deadline = time.monotonic() + 15
+                        process.wait(timeout=15 * self.timeout_scale)
+                deadline = time.monotonic() + 15 * self.timeout_scale
                 while any(self.is_same_process(member) for member in owned) and time.monotonic() < deadline:
                     time.sleep(0.1)
                 survivors = [member for member in owned if self.is_same_process(member)]
@@ -292,8 +293,11 @@ def main():
     parser.add_argument('--module-config', type=Path, required=True)
     parser.add_argument('--artifacts', type=Path)
     parser.add_argument('--sudo', action='store_true')
+    parser.add_argument('--timeout-scale', type=int, default=1, help='Multiply fixture time budgets for slow VM/CI hosts')
     parser.add_argument('--scenario', choices=['success', 'lost_response', 'reject', 'invalid', 'disconnect', 'cancel', 'timeout'])
     args = parser.parse_args()
+    if args.timeout_scale < 1:
+        parser.error('--timeout-scale must be positive')
     with args.module_config.open('rb') as stream:
         rootfs = Path(tomllib.load(stream)['issues']['worker']['rootfs'])
     artifacts = args.artifacts or Path(tempfile.mkdtemp(prefix='fiach-flow-', dir='/data/rust/tmp'))
@@ -302,7 +306,7 @@ def main():
     assert not any(artifacts.iterdir()), 'Artifact directory must be empty'
     assert len(str(artifacts / 'lost_response/fiach-artifacts-XXXXXX.broker/sockets/openai.sock').encode()) < 108, 'Artifact path is too long for Linux Unix sockets'
     print(f'Artifacts: {artifacts}', flush=True)
-    runner = Runner(rootfs, artifacts, args.sudo)
+    runner = Runner(rootfs, artifacts, args.sudo, args.timeout_scale)
     try:
         for scenario in [args.scenario] if args.scenario else ['success', 'lost_response', 'reject', 'invalid', 'disconnect', 'cancel', 'timeout']:
             runner.scenario(scenario)

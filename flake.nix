@@ -292,6 +292,36 @@
               cp "$config_path" "$out/config.toml"
             '';
 
+          # Container privileges stay inside a disposable VM; CI needs no sudo
+          # or provider credentials. The generated module config selects the
+          # exact package and managed worker root used by the production module.
+          checks.${if stdenv.hostPlatform.isLinux then "issues-acp" else null} =
+            pkgs.testers.runNixOSTest {
+              name = "fiach-issues-acp";
+              nodes.machine = { pkgs, ... }: {
+                virtualisation.memorySize = 4096;
+                virtualisation.cores = 4;
+                environment.systemPackages = with pkgs; [ python3 git procps systemd ];
+                environment.etc."fiach-tests".source = ./tests;
+                environment.etc."fiach-fixture.toml".source = "${checks.nixos-module}/config.toml";
+                systemd.tmpfiles.rules = [ "d /data/rust/tmp 1777 root root -" ];
+              };
+              testScript = ''
+                machine.start()
+                machine.wait_for_unit("multi-user.target")
+                try:
+                    print(machine.succeed(
+                        "python3 -B /etc/fiach-tests/scripts/issues_acp_e2e.py "
+                        "--module-config /etc/fiach-fixture.toml "
+                        "--artifacts /data/rust/tmp/flow --timeout-scale 4",
+                        timeout=960,
+                    ))
+                finally:
+                    machine.succeed("tar -czf /tmp/evidence.tar.gz -C /data/rust/tmp flow")
+                    machine.copy_from_vm("/tmp/evidence.tar.gz")
+              '';
+            };
+
           checks.package = packages.default;
 
           checks.rustfmt = pkgs.runCommand "fiach-rustfmt-check"
