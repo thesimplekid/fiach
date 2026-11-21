@@ -1039,3 +1039,40 @@ supervisor while the runtime remains alive, plus scratch paths. Runtime teardown
 can only send a best-effort graceful signal; it never SIGKILLs nspawn and abandons its payload.
 `--sudo` is limited to starting containers and signalling the runner's own
 process groups or recorded descendants with matching process start times. Custom roots can instead be supplied through `--rootfs`.
+
+### Complete issue workflow integration
+
+`tests/scripts/issues_acp_e2e.py` connects the real issue polling scheduler,
+durable state, triage adapter, model broker, container workers, Goose ACP, patch
+validation, and publication policy. Only GitHub and model responses are fixtures;
+Git clones and pushes use a disposable local repository. No account or real API
+key is needed.
+
+```bash
+nix build .#checks.x86_64-linux.nixos-module --out-link /data/rust/tmp/fiach-module-check
+nix develop -c python3 -B tests/scripts/issues_acp_e2e.py \
+  --module-config /data/rust/tmp/fiach-module-check/config.toml --sudo
+```
+
+Run this on a Linux host or privileged CI runner with `systemd-nspawn` and
+passwordless sudo. When already running as root, omit `--sudo`. The runner
+constructs a clean environment containing synthetic credentials. Its fixture
+configuration enables publication **only into the local GitHub adapter** so the
+actual publication policy and journal execute; it never invokes the real `gh`.
+The adapter is shared with the ordinary Rust issue integration tests.
+
+Scenarios cover a verified fix, a lost PR-creation response, verifier rejection,
+invalid-report recovery, provider disconnection, cancellation during an active
+tool, and deadline expiry. Assertions check failing baseline/passing patched
+regressions, independent verification, broker credential isolation, exact draft
+creation counts, preserved transcripts, process cleanup, and no worker replay
+or duplicate publication after restarting with the same database. The success
+case runs multiple polling cycles. This exercises the issue scheduler used by
+the daemon, not the separate PR-review scheduler or a real provider's behavior.
+
+Artifacts remain under `/data/rust/tmp/fiach-flow-*`: `summary.json`,
+per-scenario logs and state, model requests, exported broker logs, and
+`fixture.json.writes` containing the exact local publication attempts. The
+original broker directories retain their host-only permissions. `--scenario`
+selects one case for diagnosis. This suite requires container privileges and is
+separate from the ordinary unprivileged `cargo nextest run` suite.
