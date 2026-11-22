@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::Result;
-use harness_acp::{
+use goose_acp_runner::{
     LaunchSpec, RunResult, Session, Task,
     mcp::{McpBridge, ToolHandler},
 };

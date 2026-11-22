@@ -263,17 +263,18 @@ impl Lanes {
         cancel: &CancellationToken,
     ) -> Result<String, LaneFailure> {
         let failed = |reason, transcript: String| LaneFailure { reason, transcript };
-        let bridge =
-            harness_acp::mcp::McpBridge::start(Arc::new(InspectionTools(self.inspection.clone())))
-                .await
-                .map_err(|_| failed("session_error", String::new()))?;
+        let bridge = goose_acp_runner::mcp::McpBridge::start(Arc::new(InspectionTools(
+            self.inspection.clone(),
+        )))
+        .await
+        .map_err(|_| failed("session_error", String::new()))?;
         // Goose has internal skill discovery even with no extensions. Run its
         // session outside the untrusted checkout; only MCP can inspect it.
         let scratch = tempfile::Builder::new()
             .prefix("fiach-acp-lane-")
             .tempdir()
             .map_err(|_| failed("session_error", String::new()))?;
-        let mut launch = harness_acp::LaunchSpec::new(command);
+        let mut launch = goose_acp_runner::LaunchSpec::new(command);
         // Pass only this provider's route. In sandbox children these are the
         // broker URL and per-job key, never the host provider credentials.
         let route = crate::broker::Provider::from_name(provider)
@@ -291,7 +292,7 @@ impl Lanes {
                 launch.env.insert(name.into(), value);
             }
         }
-        let request = harness_acp::Task {
+        let request = goose_acp_runner::Task {
             prompt: task.instructions.clone(),
             instructions: format!(
                 "{LANE_SYSTEM}\nUse the final_output tool to submit the requested JSON object."
@@ -312,7 +313,7 @@ impl Lanes {
             }
         };
         let result =
-            harness_acp::run_observed(&launch, &request, cancel.child_token(), &observe).await;
+            goose_acp_runner::run_observed(&launch, &request, cancel.child_token(), &observe).await;
         if let Some(usage) = &result.usage {
             observe(usage);
         }
@@ -322,15 +323,17 @@ impl Lanes {
             .take(MAX_NOTES_CHARS)
             .collect();
         match result.status {
-            harness_acp::Completion::Completed => result
+            goose_acp_runner::Completion::Completed => result
                 .output
                 .map(|output| output.to_string())
                 .ok_or_else(|| failed("invalid_output", transcript)),
-            harness_acp::Completion::Cancelled => Err(failed("phase_stopped", transcript)),
-            harness_acp::Completion::TimedOut => Err(failed("lane_deadline", transcript)),
-            harness_acp::Completion::TurnLimit => Err(failed("turn_limit", transcript)),
-            harness_acp::Completion::InvalidOutput => Err(failed("invalid_output", transcript)),
-            harness_acp::Completion::ProviderError => {
+            goose_acp_runner::Completion::Cancelled => Err(failed("phase_stopped", transcript)),
+            goose_acp_runner::Completion::TimedOut => Err(failed("lane_deadline", transcript)),
+            goose_acp_runner::Completion::TurnLimit => Err(failed("turn_limit", transcript)),
+            goose_acp_runner::Completion::InvalidOutput => {
+                Err(failed("invalid_output", transcript))
+            }
+            goose_acp_runner::Completion::ProviderError => {
                 let error = anyhow::anyhow!(
                     "ACP lane provider failed: {}",
                     result.error.unwrap_or_default()
@@ -396,7 +399,7 @@ impl AcpUsage {
 struct InspectionTools(Inspection);
 
 #[async_trait::async_trait]
-impl harness_acp::mcp::ToolHandler for InspectionTools {
+impl goose_acp_runner::mcp::ToolHandler for InspectionTools {
     fn tools(&self) -> Vec<rmcp::model::Tool> {
         super::agent_loop::HostTools::tools(&self.0)
     }

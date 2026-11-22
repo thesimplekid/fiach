@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use goose::agents::platform_extensions::developer::DeveloperClient;
-use harness_acp::{Completion, LaunchSpec, Task};
+use goose_acp_runner::{Completion, LaunchSpec, Task};
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, sync::Mutex};
 use tokio_util::sync::CancellationToken;
@@ -928,7 +928,7 @@ async fn run_acp_worker(
     let scratch = tempfile::Builder::new()
         .prefix("fiach-issue-acp-")
         .tempdir()?;
-    let bridge = harness_acp::mcp::McpBridge::start(Arc::new(WorkerTools(developer.clone())))
+    let bridge = goose_acp_runner::mcp::McpBridge::start(Arc::new(WorkerTools(developer.clone())))
         .await
         .map_err(|error| anyhow::anyhow!("Starting worker MCP: {error}"))?;
     let schema = reporting
@@ -980,7 +980,8 @@ async fn run_acp_worker(
             }
         };
         let result =
-            harness_acp::run_observed(launch, &request, attempt_cancel.clone(), &observe).await;
+            goose_acp_runner::run_observed(launch, &request, attempt_cancel.clone(), &observe)
+                .await;
         if let Some(error) = write_error
             .into_inner()
             .unwrap_or_else(|error| error.into_inner())
@@ -1040,7 +1041,7 @@ fn bounded_context(text: &str, max_chars: usize) -> serde_json::Value {
 
 struct WorkerTools(Arc<dyn HostTools>);
 #[async_trait::async_trait]
-impl harness_acp::mcp::ToolHandler for WorkerTools {
+impl goose_acp_runner::mcp::ToolHandler for WorkerTools {
     fn tools(&self) -> Vec<rmcp::model::Tool> {
         self.0.tools()
     }

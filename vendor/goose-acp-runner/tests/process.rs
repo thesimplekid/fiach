@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use harness_acp::{Completion, LaunchSpec, Task, run};
+use goose_acp_runner::{Completion, LaunchSpec, Task, run};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 

@@ -371,7 +371,7 @@ impl Client {
     }
 
     async fn setup(&mut self, task: &Task) -> Result<(), Failure> {
-        let init=self.rpc("initialize",json!({"protocolVersion":1,"clientInfo":{"name":"harness-acp","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"_meta":{"goose":{"customNotifications":true}}}}),None).await?;
+        let init=self.rpc("initialize",json!({"protocolVersion":1,"clientInfo":{"name":"goose-acp-runner","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"_meta":{"goose":{"customNotifications":true}}}}),None).await?;
         if init["protocolVersion"] != 1 {
             return Err((
                 Completion::ProtocolError,

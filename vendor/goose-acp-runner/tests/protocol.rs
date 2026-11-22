@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use async_trait::async_trait;
-use harness_acp::*;
+use goose_acp_runner::*;
 use serde_json::{Value, json};
 use std::{
     sync::{

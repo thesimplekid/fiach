@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.98.1"
 
 [dependencies]
-harness-acp = { path = "vendor/harness-acp" }
+goose-acp-runner = { path = "vendor/goose-acp-runner" }
 goose = { git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a", default-features = false, features = ["rustls-tls"] }
 goose-providers = { package = "oi-kit-providers", git = "https://github.com/aaif-goose/goose", rev = "bf074d6d114690de6cbe7edc925cb26efdf6f16a", default-features = false, features = ["rustls-tls"] }
 buzz-client = { git = "https://github.com/thesimplekid/buzz", rev = "151317f568c9ffef63886db7051ad5966bffcd59" }

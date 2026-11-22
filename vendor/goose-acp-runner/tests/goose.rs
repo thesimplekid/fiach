@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Real pinned Goose integration using only a loopback mock model provider.
 use axum::{Json, extract::State, http::header, routing::post};
-use harness_acp::{Completion, LaunchSpec, Task, run};
+use goose_acp_runner::{Completion, LaunchSpec, Task, run};
 use serde_json::{Value, json};
 use std::{
     sync::{Arc, Mutex},
@@ -74,6 +74,9 @@ async fn probe(custom: bool, limited: bool) {
         axum::serve(listener, router).await.unwrap();
     });
     let mut spec = LaunchSpec::new(executable);
+    if let Some(cert_file) = std::env::var_os("SSL_CERT_FILE") {
+        spec.env.insert("SSL_CERT_FILE".into(), cert_file);
+    }
     spec.env
         .insert("OPENAI_API_KEY".into(), "test-provider-secret".into());
     spec.env
@@ -82,7 +85,7 @@ async fn probe(custom: bool, limited: bool) {
     spec.env.insert("GOOSE_MAX_TURNS".into(), "100".into());
     let cwd = tempfile::tempdir().unwrap();
     let handler = Arc::new(Inspection(std::sync::atomic::AtomicUsize::new(0)));
-    let bridge = harness_acp::mcp::McpBridge::start(handler.clone())
+    let bridge = goose_acp_runner::mcp::McpBridge::start(handler.clone())
         .await
         .unwrap();
     if custom {
@@ -106,9 +109,10 @@ async fn probe(custom: bool, limited: bool) {
         max_turns: if limited || !custom { 1 } else { 8 },
     };
     let result = if !limited {
-        let mut session = harness_acp::Session::connect(&spec, &task, CancellationToken::new())
-            .await
-            .unwrap();
+        let mut session =
+            goose_acp_runner::Session::connect(&spec, &task, CancellationToken::new())
+                .await
+                .unwrap();
         let result = session
             .prompt(&task.prompt, CancellationToken::new(), None)
             .await;
@@ -202,7 +206,7 @@ async fn probe(custom: bool, limited: bool) {
 
 struct Inspection(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
-impl harness_acp::mcp::ToolHandler for Inspection {
+impl goose_acp_runner::mcp::ToolHandler for Inspection {
     fn tools(&self) -> Vec<rmcp::model::Tool> {
         vec![rmcp::model::Tool::new(
             "inspect",

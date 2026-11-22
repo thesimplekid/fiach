@@ -77,7 +77,9 @@ impl Launcher for ProcessLauncher {
                 "task cwd must be absolute",
             ));
         }
-        let root = tempfile::Builder::new().prefix("harness-acp-").tempdir()?;
+        let root = tempfile::Builder::new()
+            .prefix("goose-acp-runner-")
+            .tempdir()?;
         let config = root.path().join("config");
         tokio::fs::create_dir_all(config.join("custom_providers")).await?;
         // Recipes supplement default builtins. Explicitly disable developer in

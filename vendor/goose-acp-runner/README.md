@@ -1,4 +1,4 @@
-# harness-acp
+# goose-acp-runner
 
 A shared Rust adapter for bounded application tasks using Goose over ACP.
 The initial backend starts a pinned `goose acp` process. `Launcher`,
@@ -107,18 +107,27 @@ binary and protocol fixtures together.
 
 This directory is the canonical local JJ repository for the shared library.
 Until a remote release location is chosen, each consumer carries a reproducible
-source snapshot in `vendor/harness-acp`. Cargo and Nix builds need no sibling
+source snapshot in `vendor/goose-acp-runner`. Cargo and Nix builds need no sibling
 checkout. Do not patch the copies independently.
 
 Refresh a consumer after changing and verifying this repository:
 
 ```console
-nix develop -c python3 scripts/vendor.py ../fiach/vendor/harness-acp
-nix develop -c python3 scripts/vendor.py ../vdh/vendor/harness-acp
-nix develop -c python3 scripts/vendor.py ../vuln_review/vendor/harness-acp
+nix develop -c python3 scripts/vendor.py ../fiach/vendor/goose-acp-runner
+nix develop -c python3 scripts/vendor.py ../vdh/vendor/goose-acp-runner
+nix develop -c python3 scripts/vendor.py ../vuln_review/vendor/goose-acp-runner
 ```
 
 Each snapshot records the canonical revision and file hashes in `SNAPSHOT.json`.
 The same command with `--check` verifies the copy against the canonical source.
 This explicit source-copy helper is needed while there is no published Git or
 registry dependency; it never modifies user configuration or installs tools.
+
+## Continuous integration
+
+`nix flake check -L` runs formatting, strict Clippy, ordinary tests, and the
+real pinned Goose conformance tests against a loopback scripted provider. The
+`conformance` check sets `GOOSE_TEST_BINARY` from the same pinned runtime as the
+development shell. Tests require no provider credentials or external services.
+The GitHub Actions workflow runs this gate on pull requests and pushes to main.
+For a focused local run, use `nix develop -c just conformance`.

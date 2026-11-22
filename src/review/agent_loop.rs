@@ -135,10 +135,10 @@ impl AgentLoop {
         *lock(&self.last_text) = result.text.clone();
         on_message(&Message::assistant().with_text(result.text));
         match result.status {
-            harness_acp::Completion::Completed | harness_acp::Completion::Cancelled => {
+            goose_acp_runner::Completion::Completed | goose_acp_runner::Completion::Cancelled => {
                 Ok(ReplyEnd::Finished)
             }
-            harness_acp::Completion::TurnLimit => Ok(ReplyEnd::TurnLimit),
+            goose_acp_runner::Completion::TurnLimit => Ok(ReplyEnd::TurnLimit),
             _ => {
                 let failure = anyhow::anyhow!(
                     "ACP session ended and cannot be replayed: {}",
