@@ -884,8 +884,10 @@ pub async fn post_pr_reaction(repo: &str, pr_number: u64, reaction: &str) -> Res
     Ok(())
 }
 
-/// Review outcomes that mean "nothing actionable" to the person who
-/// triggered the review by mention.
+/// Completed review outcomes that mean "nothing actionable": a clean review,
+/// one whose candidates were all rejected, or one with only already-reported
+/// findings. These earn the no-findings reaction on both the PR and the
+/// triggering mention.
 pub fn is_non_actionable_status(status: &str) -> bool {
     matches!(status, "none" | "rejected" | "already-reported")
 }
