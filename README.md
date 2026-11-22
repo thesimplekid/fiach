@@ -1000,8 +1000,10 @@ prompt to finish; the hard observed budget cancels the process. Cancellation and
 deadlines stop and reap owned processes. This boundary can later support VMs; no
 VM infrastructure is introduced here.
 
-The canonical library is maintained in `goose-acp-runner`; its versioned
-`vendor/goose-acp-runner` snapshot keeps Fiach independently buildable. Provider DTOs,
+The shared `goose-acp-runner` library comes from
+[`goose-acp-harness`](https://github.com/thesimplekid/goose-acp-harness), pinned to
+an exact Git revision in `Cargo.toml` and `Cargo.lock`. Update that pin, the
+lockfile, and its Nix source hash together. No sibling checkout is needed. Provider DTOs,
 workspace tool handlers, and one-shot classifier calls still use Goose libraries;
 agent orchestration always uses ACP.
 

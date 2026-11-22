@@ -120,6 +120,7 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               outputHashes = {
+                "goose-acp-runner-0.1.0" = "sha256-y5DNBxikjYGO6jSn0DjiCi1lE13hv4aB0L0ZXYxwoaI=";
                 "buzz-client-0.1.0" = "sha256-qxOkoR44k3pr9+TmRSZWmRZRXt+56ohCrE4zwF+/nMM=";
                 "goose-1.60.0" = "sha256-E2SZ8hG2DH5x6cIY57jFE1ujvOrRwM7onmxZrd56Kws=";
               };

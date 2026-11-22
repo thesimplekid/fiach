@@ -2151,6 +2151,7 @@ dependencies = [
 [[package]]
 name = "goose-acp-runner"
 version = "0.1.0"
+source = "git+https://github.com/thesimplekid/goose-acp-harness?rev=caa0e20a1fe6aa43652f0216fca139712f29b889#caa0e20a1fe6aa43652f0216fca139712f29b889"
 dependencies = [
  "async-trait",
  "axum",
