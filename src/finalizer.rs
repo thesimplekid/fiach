@@ -146,7 +146,10 @@ impl ReviewFinalizer {
         metadata.report_url.clone_from(&report_url);
         metadata.disclosure_url = report_url;
 
-        if metadata.status == ReviewStatus::None
+        // A completed review with nothing actionable (clean, every candidate
+        // rejected, or only already-reported findings) gets the no-findings
+        // PR reaction; failed or unverified reviews do not.
+        if disclose::is_non_actionable_status(metadata.status.as_str())
             && let Some(reaction) = spec.disclose.reactions.no_findings.as_deref()
             && let Err(error) =
                 disclose::post_pr_reaction(&spec.repository, spec.pr_number, reaction).await
@@ -347,6 +350,31 @@ mod tests {
             assert_eq!(metadata.status, ReviewStatus::Unverified);
             assert_eq!(metadata.findings_count, 0);
         }
+    }
+
+    #[test]
+    fn no_findings_reaction_covers_every_completed_non_actionable_status() {
+        let reacts = |status: ReviewStatus| disclose::is_non_actionable_status(status.as_str());
+
+        assert!(reacts(ReviewStatus::None));
+        assert!(reacts(ReviewStatus::Rejected));
+        assert!(reacts(ReviewStatus::AlreadyReported));
+
+        assert!(!reacts(ReviewStatus::Confirmed));
+        assert!(!reacts(ReviewStatus::Unverified));
+        assert!(!reacts(ReviewStatus::MarkdownOnly));
+        assert!(!reacts(ReviewStatus::Failed));
+    }
+
+    #[test]
+    fn all_candidates_rejected_finalizes_as_rejected() {
+        let mut outcome = clean_outcome(std::path::Path::new("."));
+        outcome.artifact.no_findings = None;
+        let mut metadata = outcome.completed.metadata.clone();
+        update_metadata(&mut metadata, &outcome, 42);
+        assert_eq!(metadata.status, ReviewStatus::Rejected);
+        assert_eq!(metadata.findings_count, 0);
+        assert!(disclose::is_non_actionable_status(metadata.status.as_str()));
     }
 
     #[tokio::test]

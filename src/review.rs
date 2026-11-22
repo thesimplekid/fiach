@@ -2107,7 +2107,7 @@ pub async fn run_review(
             completed.metadata.report_url.clone_from(&report_url);
             completed.metadata.disclosure_url = report_url;
 
-            if completed.metadata.status == "none"
+            if disclose::is_non_actionable_status(completed.metadata.status.as_str())
                 && let Some(reaction) = params.disclose_config.reactions.no_findings.as_deref()
                 && let Err(error) =
                     disclose::post_pr_reaction(&params.repo, params.pr_number, reaction).await
