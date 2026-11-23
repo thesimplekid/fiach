@@ -34,6 +34,17 @@ for line in sys.stdin:
         with open(log, "a") as stream:
             stream.write(json.dumps(dict(turns=os.environ["GOOSE_MAX_TURNS"], extensions=recipe["extensions"], prompt=request["params"]["prompt"])) + "\n")
         mode = os.environ.get("FIXTURE_MODE", "recovery")
+        if mode == "conversation":
+            prompt = request["params"]["prompt"][0]["text"]
+            if prompt == "cancel":
+                continue
+            if prompt != "silent":
+                update(dict(sessionUpdate="agent_message_chunk", content=dict(type="text", text="done")))
+            send(dict(id=request["id"], result=dict(stopReason="end_turn")))
+            continue
+        if mode == "missing_output" and attempts == 0:
+            send(dict(id=request["id"], result=dict(stopReason="end_turn")))
+            continue
         update(dict(sessionUpdate="agent_message_chunk", content=dict(type="text", text="Inspected source; regression did not finish.")))
         if mode == "stall":
             time.sleep(30)

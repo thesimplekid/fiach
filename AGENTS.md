@@ -7,7 +7,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 - **Pre-stage then delegate**: The app isolates work in a temp dir using host-side forge adapters *before* giving control to an agent session. This prevents wasting agent turns on git operations.
 - **ACP-only agent execution**: `src/review/agent_loop.rs` adapts persistent Goose ACP sessions; host tools run behind authenticated MCP bridges. `acp_command` overrides the default Goose executable. No embedded agent runtime remains.
 - **Issue worker completion**: Work uses developer MCP tools plus schema-validated final_output. The host validates and persists reports. At most two fresh report-only recovery sessions get three turns each and share the original deadline; failures never replay workspace actions.
-- **Host-driven review lanes**: `src/review/lanes.rs` runs each selected lane as an inspection-only child session (bounded concurrency, one deadline per attempt, one replacement only after a session error or empty result). The coordinator receives completed lane results and only synthesizes and submits.
+- **Host-driven review lanes**: `src/review/lanes.rs` runs each selected lane as an inspection-only child session (bounded concurrency, one deadline per attempt, one replacement if the session fails or its final output is missing or invalid). The coordinator receives completed lane results and only synthesizes and submits.
 - **Structured reporting first**: The coordinator submits candidates through the host `ReportingClient` tools (`submit_finding` / `submit_no_findings`). Markdown is rendered by the host from structured data.
 - **Separate verifier session**: Candidate findings are adjudicated in a second agent session. The verifier submits one `submit_verdict` per finding; structured verdicts are authoritative for metadata and disclosure.
 - **Host-only disclosure**: Models never post to a forge. `src/disclose.rs` applies deterministic policy checks before any forge side effect.
@@ -52,7 +52,7 @@ High-signal constraints and instructions for AI agents working in this repositor
 
 ## Dependencies & Overrides (CRITICAL)
 
-- **DO NOT** casually change dependency pins or overrides in `Cargo.toml` / `Cargo.lock`; Goose and RMCP versions are sensitive. All Goose crates (`goose`, `goose-providers`, `goose-agent`, `goose-context-management`) share one git rev, and `flake.nix` pins its vendored hash.
+- **DO NOT** casually change dependency pins or overrides in `Cargo.toml` / `Cargo.lock`; Goose and RMCP versions are sensitive. The Goose crates (`goose`, `goose-providers`) and the `goose` flake input (which supplies the packaged Goose CLI) must share one git rev; `flake.nix` also pins the vendored `outputHashes`. `goose-acp-runner` is pinned separately by git rev.
 
 ## Development Setup
 

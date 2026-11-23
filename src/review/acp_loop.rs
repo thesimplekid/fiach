@@ -8,14 +8,14 @@ use std::{
 
 use anyhow::Result;
 use goose_acp_runner::{
-    LaunchSpec, RunResult, Session, Task,
+    RunResult, Session, Task,
     mcp::{McpBridge, ToolHandler},
 };
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    agent_loop::{HostTools, UsageLog},
+    agent_loop::{HostTools, UsageLog, launch_spec},
     lanes::AcpUsage,
 };
 
@@ -69,28 +69,16 @@ impl AcpLoop {
         usage: &UsageLog,
     ) -> Result<RunResult> {
         let mut state = self.state.lock().await;
-        if state.is_none() {
+        let mut running = if let Some(running) = state.take() {
+            running
+        } else {
             let bridge = McpBridge::start(Arc::new(CurrentTools(self.tools.clone())))
                 .await
                 .map_err(|error| anyhow::anyhow!("Starting review MCP bridge: {error}"))?;
             let scratch = tempfile::Builder::new()
                 .prefix("fiach-acp-review-")
                 .tempdir()?;
-            let route = crate::broker::Provider::from_name(&self.provider)?;
-            let mut launch = LaunchSpec::new(&self.command);
-            for name in [
-                "PATH",
-                "TMPDIR",
-                "SSL_CERT_FILE",
-                "SSL_CERT_DIR",
-                "NIX_SSL_CERT_FILE",
-                route.key_env(),
-                route.host_env(),
-            ] {
-                if let Some(value) = std::env::var_os(name) {
-                    launch.env.insert(name.into(), value);
-                }
-            }
+            let launch = launch_spec(&self.command, &self.provider)?;
             let task = Task {
                 prompt: String::new(),
                 instructions: self.instructions.clone(),
@@ -108,23 +96,20 @@ impl AcpLoop {
                     return Ok(result);
                 }
             };
-            *state = Some(Running {
+            Running {
                 session,
                 _bridge: bridge,
                 _scratch: scratch,
                 usage_slot: usage.reserve(&self.model),
                 observed: Mutex::new(AcpUsage::default()),
-            });
-        }
-        let Some(running) = state.as_mut() else {
-            anyhow::bail!("ACP session did not initialize");
+            }
         };
         let Running {
             session,
             observed,
             usage_slot,
             ..
-        } = running;
+        } = &mut running;
         let observed: &Mutex<AcpUsage> = observed;
         let observe = |update: &serde_json::Value| {
             let mut observed = observed.lock().unwrap_or_else(|error| error.into_inner());
@@ -137,6 +122,9 @@ impl AcpLoop {
             .await;
         if let Some(current) = &result.usage {
             observe(current);
+        }
+        if result.status == goose_acp_runner::Completion::Completed {
+            *state = Some(running);
         }
         Ok(result)
     }

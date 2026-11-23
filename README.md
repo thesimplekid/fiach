@@ -418,7 +418,7 @@ The built-in `summary` lane produces a neutral structured description of what
 the PR changes. It does not make a review decision and is stored separately
 from findings. Buzz delivery enables this lane automatically.
 
-The host runs the selected lanes as inspection-only sessions, at most `max_review_lanes` at a time (including the mandatory persona lane and any summary lane). Each lane gets a bounded deadline per attempt and one replacement after a session error or empty result; a lane that hits its deadline, a provider failure, or its turn limit is not replaced. A lane that does not complete leaves the finder incomplete. The coordinator receives the completed lane results, merges candidates describing the same root cause, and submits `submit_finding` or `submit_no_findings`. Lanes return candidate JSON and do not call reporting tools; custom persona files keep their methodology and placeholders, but the appended lane execution contract overrides old instructions to submit findings or write reports.
+The host runs the selected lanes as inspection-only sessions, at most `max_review_lanes` at a time (including the mandatory persona lane and any summary lane). Each lane gets a bounded deadline per attempt and one replacement after a session error or invalid or missing final output; a lane that hits its deadline, a provider failure, or its turn limit is not replaced. A lane that does not complete leaves the finder incomplete. The coordinator receives the completed lane results, merges candidates describing the same root cause, and submits `submit_finding` or `submit_no_findings`. Lanes return candidate JSON and do not call reporting tools; custom persona files keep their methodology and placeholders, but the appended lane execution contract overrides old instructions to submit findings or write reports.
 
 You can optionally make a specialist lane conditional on the change being relevant:
 
@@ -467,7 +467,7 @@ Uncertain comparisons, oversized inputs, missing credentials, and service failur
 
 Lane selection captures the complete diff with three context lines per hunk, up to 80 KiB, plus up to 8 KiB of changed paths. Its serialized Jev request is capped at 96 KiB; deduplication requests retain a 24 KiB cap. These are byte limits, not token counts: Jev separately enforces its 32k-token state-plus-longest-question limit and 64k-token total request limit. API context-limit errors run all configured lanes. Diff-size failures and Git failures have distinct diagnostics, also recorded in lane-selection artifacts. Requests have a ten-second timeout and each Jev phase has a thirty-second total timeout. Inputs are never truncated to force a decision. Reported usage is included in review totals, using the pinned model's [published price](https://docs.typesafe.ai/models) of $0.042 per million input tokens (output is free). Estimated request cost is checked against the remaining budget before sending. Usage from requests that fail without a usable response cannot be accounted for; Fiach does not retry those requests before falling back.
 
-`lane_timeout_mins` in `[review]` or `[daemon]` (CLI: `--lane-timeout-mins`, NixOS: `services.fiach.laneTimeoutMins`) sets a positive timeout in minutes for each lane attempt. A lane that reaches this deadline is not replaced; only a session error or empty result earns one replacement, which receives the same allowance. For example, `timeoutMins = 60; laneTimeoutMins = 20;` allows up to twenty minutes per attempt. The overall finder phase deadline still includes lane selection, queued lanes, any replacement attempt, and coordinator work, so it can cut an attempt short. Unset, the per-attempt timeout remains one quarter of `timeout_mins`, capped at five minutes.
+`lane_timeout_mins` in `[review]` or `[daemon]` (CLI: `--lane-timeout-mins`, NixOS: `services.fiach.laneTimeoutMins`) sets a positive timeout in minutes for each lane attempt. A lane that reaches this deadline is not replaced; only a session error or invalid or missing final output earns one replacement, which receives the same allowance. For example, `timeoutMins = 60; laneTimeoutMins = 20;` allows up to twenty minutes per attempt. The overall finder phase deadline still includes lane selection, queued lanes, any replacement attempt, and coordinator work, so it can cut an attempt short. Unset, the per-attempt timeout remains one quarter of `timeout_mins`, capped at five minutes.
 
 `dedupe_existing_comments = false` disables both Jev and coordinator discussion comparison. The fallback coordinator uses the finder provider/model. Verifier provider/model settings remain independent. `timeout_mins` applies separately to the initial coordinator/lane phase, verifier phase, and fallback duplicate-decision continuation. The sandbox hard limit allows those enabled phases plus five minutes for setup and the bounded Jev phases.
 
@@ -659,7 +659,7 @@ In your `flake.nix` or `configuration.nix`:
             environmentFile = "/run/secrets/fiach-env";
 
             # Optional tracing filter. Use fiach=debug or fiach=trace when debugging.
-            logFilter = "fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error";
+            logFilter = "fiach=info,goose=warn,oi_kit=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,oi_kit_providers::http_status=error";
 
             # Sandbox Isolation (Highly Recommended)
             # Isolates each PR review inside a systemd-nspawn container.
@@ -776,7 +776,7 @@ The following options are available under `services.fiach`:
 | `verifierModel` | string or null | `null` | Model to use for the verifier pass. Defaults to `model` when unset. |
 | `environmentFile` | path | *none* | Environment file containing host-only forge tokens (`GITHUB_TOKEN` / `FORGEJO_TOKEN`), the selected provider API key, and optionally `FIACH_SERVER_TOKEN`. |
 | `forgejoHost` | string or null | `null` | Host authorized to receive `FORGEJO_TOKEN`, e.g. `git.cashu.dev`. |
-| `logFilter` | string | `"fiach=info,goose=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,goose_providers::http_status=error"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
+| `logFilter` | string | `"fiach=info,goose=warn,oi_kit=warn,rmcp=warn,sacp=warn,reqwest=warn,hyper=warn,oi_kit_providers::http_status=error"` | Tracing filter passed to `RUST_LOG` for the daemon and sandboxed review children. |
 | `persona` | string | `"builtin:security"` | Single persona source to use (e.g., `"builtin:security"`, `"builtin:pr-review"`, `"builtin:code-quality"`, or an absolute path). |
 | `personas` | list of string or null | `null` | Persona sources to run independently for each PR. Takes precedence over `persona`. |
 | `reviewLanes` | list of string | `[]` | Focused review lanes the host runs as inspection-only sessions inside each persona review before the coordinator submits one combined structured result. |
@@ -788,7 +788,7 @@ The following options are available under `services.fiach`:
 | `notifyOnEmpty` | boolean | `false` | Whether to create PRs or comments even if no findings were found. |
 | `verifyFindings` | boolean | `true` | Run a verifier pass before disclosure when findings are present. |
 | `timeoutMins` | integer | `30` | Timeout in minutes for each review session. |
-| `laneTimeoutMins` | positive integer or null | `null` | Timeout per lane attempt. A lane that times out is not replaced; a replacement after a session error or empty result gets the same allowance. Null preserves the derived default (one quarter of the phase timeout, capped at five minutes). |
+| `laneTimeoutMins` | positive integer or null | `null` | Timeout per lane attempt. A lane that times out is not replaced; a replacement after a session error or invalid or missing final output gets the same allowance. Null preserves the derived default (one quarter of the phase timeout, capped at five minutes). |
 | `maxRetries` | integer | `3` | Follow-up prompts for a successfully completed ACP turn with missing structured submissions. Distinct from `maxReviewRetries`. |
 | `maxReviewRetries` | unsigned integer | `5` | Whole-review retries per commit after a failed review attempt, with backoff. Failures while the provider circuit is open do not count. |
 | `retryDelaySecs` | integer | `10` | Initial delay in seconds before an ACP follow-up prompt; doubles after each retry. |
@@ -857,7 +857,7 @@ When using `bridge`, the host must create and maintain `br-nspawn`, addressing, 
 In daemon sandbox mode, the sandbox no longer gets write access to the whole `fiach` data directory.
 
 - The sandbox writes only per-review artifacts in a dedicated run directory.
-- The sandbox stdout/stderr stream is saved as `reports/runs/<repo>_PR<number>/nspawn.log` by default.
+- The sandbox stdout/stderr stream is saved as `reports/runs/<repo>_PR<number>[_<kind>]-<attempt>/nspawn.log` by default.
 - Review state in `fiach.redb` is recorded by the host daemon after the sandbox exits successfully.
 - Disclosure side effects are also performed by the host daemon after it validates the sandbox output.
 - GitHub disclosure is journaled before publication and tagged with a hidden stable marker. After an interrupted publication, the host reconciles GitHub history before retrying and reuses an existing review or comment instead of duplicating it.
@@ -889,7 +889,7 @@ This lets NixOS/systemd deployments keep using bundled skills such as `rust-secu
 - `src/state.rs`: Typed, versioned, async redb state adapter.
 
 Review lanes have host-enforced recovery. Each selected lane runs once and
-receives at most one replacement after a session error or empty result. A
+receives at most one replacement after a session error or invalid or missing final output. A
 deadline, provider failure, or turn limit is not retried, since a fresh attempt
 would most likely fail the same way and only add wall time. Each attempt is bounded by one quarter of the finder deadline,
 capped at 300 seconds. Completed lanes remain available when another lane fails.
@@ -983,7 +983,14 @@ directory. Authenticated MCP bridges expose existing host tools, and host-side
 validation and disclosure remain authoritative. Review phases use inspection
 and structured reporting tools; lane outputs use a validated final_output schema.
 Continuations retain the same ACP conversation and dispatch rechecks current
-permissions. Failed or cancelled sessions cannot be replayed.
+permissions. A silent finder or verifier turn succeeds when all required
+submissions have landed. Missing submissions at session closure fail that phase.
+If the coordinator session has closed, duplicate suppression starts
+a fresh session with its self-contained prompt and restricted reporting tools.
+The retry count and delay apply to follow-up prompts. Provider and transport
+failures end the phase after Goose's own retries, and the daemon applies
+`max_review_retries` to the whole review. A coordinator turn limit ends the
+finder immediately, without an additional submission prompt.
 
 Issue workers keep the existing container and host publication boundaries. Their
 work phase exposes the workspace developer tools through MCP and ends through
@@ -996,7 +1003,8 @@ closed; unconfirmed output is never accepted as a report.
 
 Cumulative usage updates drive observed budgets without double-counting prompt
 summaries or context occupancy. The advisory 80% budget nudge waits for the current
-prompt to finish; the hard observed budget cancels the process. Cancellation and
+prompt to finish. If the hard budget is reached during that prompt, cancellation
+preempts the nudge. Cancellation and
 deadlines stop and reap owned processes. This boundary can later support VMs; no
 VM infrastructure is introduced here.
 

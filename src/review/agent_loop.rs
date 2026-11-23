@@ -60,8 +60,21 @@ impl UsageLog {
 pub(crate) enum ReplyEnd {
     /// The model ended its turn.
     Finished,
+    /// The runner closed the session after a silent or cancelled turn.
+    Closed,
     /// The turn limit stopped the reply before another model call.
     TurnLimit,
+}
+
+impl ReplyEnd {
+    pub(super) fn needs_follow_up(&self, submissions_complete: bool) -> Result<bool> {
+        match self {
+            _ if submissions_complete => Ok(false),
+            Self::Closed => anyhow::bail!("ACP session closed with incomplete submissions"),
+            Self::TurnLimit => Ok(false),
+            Self::Finished => Ok(true),
+        }
+    }
 }
 
 pub(crate) struct LoopConfig {
@@ -81,7 +94,7 @@ pub(crate) struct AgentLoop {
     last_text: Mutex<String>,
 }
 impl AgentLoop {
-    pub fn new(_id: impl Into<String>, config: LoopConfig) -> Self {
+    pub fn new(config: LoopConfig) -> Self {
         let mut instructions = config.system_prompt;
         for tool in &config.tools {
             if let Some(guidance) = tool.instructions() {
@@ -135,9 +148,9 @@ impl AgentLoop {
         *lock(&self.last_text) = result.text.clone();
         on_message(&Message::assistant().with_text(result.text));
         match result.status {
-            goose_acp_runner::Completion::Completed | goose_acp_runner::Completion::Cancelled => {
-                Ok(ReplyEnd::Finished)
-            }
+            goose_acp_runner::Completion::Completed => Ok(ReplyEnd::Finished),
+            goose_acp_runner::Completion::InvalidOutput
+            | goose_acp_runner::Completion::Cancelled => Ok(ReplyEnd::Closed),
             goose_acp_runner::Completion::TurnLimit => Ok(ReplyEnd::TurnLimit),
             _ => {
                 let failure = anyhow::anyhow!(
@@ -157,6 +170,34 @@ impl AgentLoop {
 }
 pub(crate) fn executable(command: Option<&Path>) -> PathBuf {
     command.unwrap_or_else(|| Path::new("goose")).to_path_buf()
+}
+
+/// Environment a Goose ACP process may inherit, besides its provider route.
+const LAUNCH_ENV: [&str; 5] = [
+    "PATH",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NIX_SSL_CERT_FILE",
+];
+
+/// Launch Goose with only this provider's route. In sandbox children these are
+/// the broker URL and per-job key, never the host provider credentials.
+pub(crate) fn launch_spec(
+    command: impl Into<PathBuf>,
+    provider: &str,
+) -> Result<goose_acp_runner::LaunchSpec> {
+    let route = crate::broker::Provider::from_name(provider)?;
+    let mut launch = goose_acp_runner::LaunchSpec::new(command);
+    for name in LAUNCH_ENV
+        .into_iter()
+        .chain([route.key_env(), route.host_env()])
+    {
+        if let Some(value) = std::env::var_os(name) {
+            launch.env.insert(name.into(), value);
+        }
+    }
+    Ok(launch)
 }
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
@@ -222,15 +263,16 @@ impl HostTools for PlatformTools {
     }
 }
 
-/// Retry budget shared by every reply within one agent phase.
-pub(crate) struct LoopRetry {
+/// Follow-up prompts allowed within one agent phase after a completed turn
+/// that left required structured submissions missing.
+pub(crate) struct FollowUpBudget {
     phase: &'static str,
     max_retries: u32,
     retries: u32,
     delay_secs: u64,
 }
 
-impl LoopRetry {
+impl FollowUpBudget {
     pub fn new(phase: &'static str, max_retries: u32, delay_secs: u64) -> Self {
         Self {
             phase,
@@ -254,10 +296,90 @@ impl LoopRetry {
             attempt = self.retries + 1,
             max_retries = self.max_retries,
             delay_secs = self.delay_secs,
-            "Retrying agent reply"
+            "Sending follow-up prompt"
         );
         tokio::time::sleep(Duration::from_secs(self.delay_secs)).await;
         self.retries += 1;
         self.delay_secs *= 2;
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn fixture_command(dir: &Path, mode: &str, output: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let log = serde_json::to_string(&dir.join("sessions.jsonl").to_string_lossy()).unwrap();
+    let script = include_str!("../../tests/fixtures/acp_worker.py")
+        .replace("os.environ[\"FIXTURE_LOG\"]", &log)
+        .replace(
+            "os.environ.get(\"FIXTURE_MODE\", \"recovery\")",
+            &serde_json::to_string(mode).unwrap(),
+        )
+        .replace(
+            "os.environ[\"FIXTURE_OUTPUT\"]",
+            &serde_json::to_string(output).unwrap(),
+        );
+    let command = dir.join("acp-fixture");
+    let python = tokio::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .await
+        .unwrap();
+    assert!(python.status.success());
+    let python = String::from_utf8(python.stdout).unwrap();
+    std::fs::write(&command, format!("#!{}\n{script}", python.trim())).unwrap();
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn silent_and_cancelled_turns_allow_a_fresh_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = AgentLoop::new(LoopConfig {
+            command: fixture_command(dir.path(), "conversation", "{}").await,
+            provider: "openai".into(),
+            model: "test".into(),
+            system_prompt: "Inspect".into(),
+            tools: vec![],
+            max_turns: 5,
+            timeout: Duration::from_secs(10),
+        });
+        for prompt in ["silent", "cancel", "dedupe", "followup"] {
+            let cancel = CancellationToken::new();
+            let log = dir.path().join("sessions.jsonl");
+            let monitor = async {
+                if prompt == "cancel" {
+                    while !std::fs::read_to_string(&log)
+                        .unwrap_or_default()
+                        .contains("cancel")
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    cancel.cancel();
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+                tokio::join!(
+                    agent.reply(Message::user().with_text(prompt), &cancel, |_| {}),
+                    monitor
+                )
+            })
+            .await
+            .unwrap();
+            let end = result.unwrap();
+            if matches!(prompt, "silent" | "cancel") {
+                assert!(end.needs_follow_up(false).is_err());
+                assert!(!end.needs_follow_up(true).unwrap());
+            } else {
+                assert!(end.needs_follow_up(false).unwrap());
+            }
+            if prompt == "silent" {
+                assert!(agent.final_text().is_empty());
+            }
+        }
+        assert_eq!(agent.usage().len(), 3);
     }
 }

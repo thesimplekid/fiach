@@ -17,7 +17,7 @@ use super::{
     config::{Area, Project, WorkerConfig},
     github::{command, git},
 };
-use crate::review::agent_loop::{HostTools, PlatformTools};
+use crate::review::agent_loop::{HostTools, PlatformTools, executable, launch_spec};
 
 mod reporting;
 
@@ -683,23 +683,25 @@ async fn sandbox(
     // dropped. Cleanup runs in a separate task and may outlive the caller.
     let run = run.keep();
     let output = output.keep();
-    if let Some(network) = &network
+    let mut outcome: Result<()> = if let Some(network) = &network
         && let Err(error) = crate::daemon::configure_sandbox_veth_host(&machine, network).await
     {
-        child
-            .shutdown()
-            .await
-            .context("Cleaning up worker after network setup failure")?;
-        return Err(error);
-    }
-    let mut outcome: Result<()> = tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(input.config.timeout_secs), child.wait()) => {
-            match result {
-                Ok(status) => status.and_then(|s| { ensure!(s.success(), "Issue worker failed"); Ok(()) }),
-                Err(_) => { match child.shutdown().await { Ok(_) => Err(anyhow::anyhow!("Issue worker timed out")), Err(error) => Err(error.context("Issue worker timed out; cleaning up container")) } }
-            }
+        match child.shutdown().await {
+            Ok(_) => Err(error),
+            Err(cleanup) => Err(cleanup.context(format!(
+                "Cleaning up after network setup failure: {error:#}"
+            ))),
         }
-        _ = cancel.cancelled() => { match child.shutdown().await { Ok(_) => Err(anyhow::anyhow!("Issue worker cancelled")), Err(error) => Err(error.context("Issue worker cancelled; cleaning up container")) } }
+    } else {
+        tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(input.config.timeout_secs), child.wait()) => {
+                match result {
+                    Ok(status) => status.and_then(|s| { ensure!(s.success(), "Issue worker failed"); Ok(()) }),
+                    Err(_) => { match child.shutdown().await { Ok(_) => Err(anyhow::anyhow!("Issue worker timed out")), Err(error) => Err(error.context("Issue worker timed out; cleaning up container")) } }
+                }
+            }
+            _ = cancel.cancelled() => { match child.shutdown().await { Ok(_) => Err(anyhow::anyhow!("Issue worker cancelled")), Err(error) => Err(error.context("Issue worker cancelled; cleaning up container")) } }
+        }
     };
     // A quarantined phase fails even if the worker succeeded.
     if let Some(broker) = broker
@@ -711,17 +713,26 @@ async fn sandbox(
         let artifacts = output;
         // Preserve edits and untracked tests without executing repository code on the host.
         // Never automatically apply this unvalidated workspace to a later attempt.
-        if child.is_reaped()
-            && let Err(retention_error) =
-                tokio::fs::rename(root.join("workspace"), artifacts.join("workspace")).await
-        {
-            tracing::warn!(error = %retention_error, artifacts = %artifacts.display(), "Failed to retain issue workspace");
+        let mut failure = format!("{error:#}");
+        if child.is_reaped() {
+            match tokio::fs::rename(root.join("workspace"), artifacts.join("workspace")).await {
+                Ok(()) => {
+                    if let Err(cleanup) = tokio::fs::remove_dir_all(&run).await {
+                        failure
+                            .push_str(&format!("\nRemoving scratch {}: {cleanup}", run.display()));
+                    }
+                }
+                Err(retention_error) => {
+                    failure.push_str(&format!(
+                        "\nWorkspace retained in {}: {retention_error}",
+                        run.display()
+                    ));
+                }
+            }
+        } else {
+            failure.push_str(&format!("\nContainer scratch: {}", run.display()));
         }
-        let _ = tokio::fs::write(
-            artifacts.join("failure.txt"),
-            format!("{error:#}\nContainer scratch: {}", run.display()),
-        )
-        .await;
+        let _ = tokio::fs::write(artifacts.join("failure.txt"), failure).await;
         return Err(error).with_context(|| format!("Worker artifacts: {}", artifacts.display()));
     }
     let path = output;
@@ -839,21 +850,9 @@ pub async fn run_child(input_path: PathBuf, cancel: CancellationToken) -> Result
     let prompt = serde_json::to_string(
         &serde_json::json!({"issue": input.issue, "base": input.base, "candidate": input.report, "project_areas": input.areas, "fix_kind": input.fix_kind, "revision": input.revision, "triage": input.triage}),
     )?;
-    let route = crate::broker::Provider::from_name(provider)?;
-    let mut launch = LaunchSpec::new("goose");
-    for name in [
-        "PATH",
-        "TMPDIR",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "NIX_SSL_CERT_FILE",
-        route.key_env(),
-        route.host_env(),
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            launch.env.insert(name.into(), value);
-        }
-    }
+    // Workers run inside the container, whose root filesystem supplies the
+    // pinned Goose on PATH; the review `acp_command` override does not apply.
+    let launch = launch_spec(executable(None), provider)?;
     let mut transcript = std::fs::File::create("/output/transcript.jsonl")?;
     let report = run_acp_worker(
         &launch,
@@ -1036,7 +1035,17 @@ async fn run_acp_worker(
 // Keep recovery below the ACP frame bound even when transcripts reach their
 // durable artifact limit. Missing evidence must produce needs_review.
 fn bounded_context(text: &str, max_chars: usize) -> serde_json::Value {
-    serde_json::json!({"text":text.chars().take(max_chars).collect::<String>(),"truncated":text.chars().count()>max_chars})
+    if text.chars().take(max_chars + 1).count() <= max_chars {
+        return serde_json::json!({"text":text,"truncated":false});
+    }
+    let head_chars = max_chars / 2;
+    let head: String = text.chars().take(head_chars).collect();
+    let tail_start = text
+        .char_indices()
+        .rev()
+        .nth(max_chars - head_chars)
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+    serde_json::json!({"text":format!("{head}\n[…]\n{}", &text[tail_start..]),"truncated":true})
 }
 
 struct WorkerTools(Arc<dyn HostTools>);
@@ -1254,8 +1263,14 @@ mod tests {
 
     #[test]
     fn recovery_context_stays_below_acp_frame_bound_with_explicit_truncation() {
-        let large = "\u{0001}".repeat(4 * 1024 * 1024);
+        let large = format!("{}final result ✓", "\u{0001}".repeat(4 * 1024 * 1024));
         let context = serde_json::json!({"request":bounded_context(&large,64*1024),"evidence":bounded_context(&large,256*1024)});
+        assert!(
+            context["evidence"]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("final result ✓")
+        );
         assert!(context["request"]["truncated"].as_bool().unwrap());
         assert!(context["evidence"]["truncated"].as_bool().unwrap());
         assert!(serde_json::to_vec(&context).unwrap().len() < 2 * 1024 * 1024);

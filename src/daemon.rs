@@ -1772,17 +1772,11 @@ async fn run_sandboxed_review(
         review_params.pr_number,
         &review_params.review_kind,
     )?;
-    tokio::fs::create_dir_all(&run_dir).await.with_context(|| {
-        format!(
-            "Failed to create sandbox run directory at {}",
-            run_dir.display()
-        )
-    })?;
     let report_path = run_dir.join("report.md");
     let result_json = run_dir.join("result.json");
     let nspawn_log = run_dir.join("nspawn.log");
-    let runtime_rootfs = prepare_runtime_rootfs(rootfs, &run_dir).await?;
-    let mut runtime_rootfs_guard = RuntimeRootfsGuard::new(runtime_rootfs.clone());
+    let mut runtime_rootfs_guard = prepare_runtime_rootfs(rootfs, &run_dir).await?;
+    let runtime_rootfs = runtime_rootfs_guard.path.clone();
     let sandbox_home = "/tmp";
     let sandbox_xdg_state_home = "/tmp/.local/state";
 
@@ -2324,6 +2318,7 @@ async fn start_review_broker(
     .map(Some)
 }
 
+#[derive(Debug)]
 struct RuntimeRootfsGuard {
     path: PathBuf,
     remove_on_drop: bool,
@@ -2353,7 +2348,10 @@ impl Drop for RuntimeRootfsGuard {
     }
 }
 
-async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<PathBuf> {
+async fn prepare_runtime_rootfs(
+    source_rootfs: &Path,
+    run_dir: &Path,
+) -> Result<RuntimeRootfsGuard> {
     let runtime_rootfs = run_dir.join("rootfs");
 
     anyhow::ensure!(
@@ -2362,6 +2360,7 @@ async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<
         runtime_rootfs.display()
     );
 
+    let guard = RuntimeRootfsGuard::new(runtime_rootfs.clone());
     tracing::debug!(
         source = %source_rootfs.display(),
         destination = %runtime_rootfs.display(),
@@ -2391,7 +2390,7 @@ async fn prepare_runtime_rootfs(source_rootfs: &Path, run_dir: &Path) -> Result<
         })?;
     }
 
-    Ok(runtime_rootfs)
+    Ok(guard)
 }
 
 fn sandbox_run_dir(
@@ -2412,7 +2411,13 @@ fn sandbox_run_dir(
     } else {
         format!("{}_PR{}_{}", safe_repo, pr_number, review_kind)
     };
-    Ok(base_dir.join("runs").join(run_name))
+    let runs = base_dir.join("runs");
+    std::fs::create_dir_all(&runs).context("Creating sandbox runs directory")?;
+    Ok(tempfile::Builder::new()
+        .prefix(&format!("{run_name}-"))
+        .tempdir_in(runs)
+        .context("Creating sandbox attempt directory")?
+        .keep())
 }
 
 fn sandbox_machine_name_for_run(repo: &str, pr_number: u64, review_kind: &str) -> String {
@@ -2864,6 +2869,31 @@ mod tests {
             std::fs::read_to_string(root.join("evidence")).unwrap(),
             "active"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_rootfs_preparation_removes_partial_copy() {
+        let source = tempfile::tempdir().unwrap();
+        let run = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("tmp"), "not a directory").unwrap();
+        assert!(
+            prepare_runtime_rootfs(source.path(), run.path())
+                .await
+                .is_err()
+        );
+        assert!(!run.path().join("rootfs").exists());
+    }
+
+    #[test]
+    fn retained_rootfs_does_not_block_the_next_attempt() {
+        let base = tempfile::tempdir().unwrap();
+        let attempt = || sandbox_run_dir(Some(base.path()), "owner/repo", 7, "security").unwrap();
+        let previous = attempt();
+        std::fs::create_dir(previous.join("rootfs")).unwrap();
+        let next = attempt();
+        assert!(previous.join("rootfs").is_dir());
+        assert!(next.is_dir());
+        assert!(!next.join("rootfs").exists());
     }
 
     #[test]

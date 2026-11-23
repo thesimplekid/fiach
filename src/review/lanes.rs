@@ -1,9 +1,9 @@
 //! Review lanes: inspection-only child sessions run by the host.
 //!
 //! The host starts every selected lane, bounds concurrency, applies one
-//! deadline per attempt, and replaces a lane once after a session error or an
-//! empty result. The coordinator receives completed results and only
-//! synthesizes them.
+//! deadline per attempt, and replaces a lane once if the session fails or its
+//! final output is missing or invalid. The coordinator synthesizes the completed
+//! results.
 
 use std::{
     collections::BTreeMap,
@@ -17,7 +17,10 @@ use goose_providers::model::ModelConfig;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use super::{agent_loop::UsageLog, classify_lane_load_text};
+use super::{
+    agent_loop::{UsageLog, executable, launch_spec},
+    classify_lane_load_text,
+};
 use crate::{
     inspection::Inspection,
     reporting::{LaneSnapshot, LaneStatus},
@@ -104,12 +107,12 @@ impl Lanes {
             tasks,
             snapshots: Mutex::new(snapshots),
             provider_failure: Mutex::new(None),
-            command: PathBuf::from("goose"),
+            command: executable(None),
         }
     }
 
     pub fn with_command(mut self, command: Option<&Path>) -> Self {
-        self.command = super::agent_loop::executable(command);
+        self.command = executable(command);
         self
     }
 
@@ -187,7 +190,7 @@ impl Lanes {
                 snapshot.reason = None;
             });
             tracing::info!(lane, session_id = %session_id, recovery_attempt = attempt, "Review lane started");
-            let failure = match self.attempt(&session_id, task, cancel).await {
+            let failure = match self.attempt(task, cancel).await {
                 Ok(output) => {
                     let findings = classify_lane_load_text(&output);
                     tracing::info!(
@@ -239,26 +242,14 @@ impl Lanes {
         None
     }
 
-    async fn attempt(
-        &self,
-        _session_id: &str,
-        task: &LaneTask,
-        cancel: &CancellationToken,
-    ) -> Result<String, LaneFailure> {
-        self.acp_attempt(&self.command, &self.provider, task, cancel)
-            .await
-    }
-
     fn update(&self, lane: &str, change: impl FnOnce(&mut LaneSnapshot)) {
         if let Some(snapshot) = lock(&self.snapshots).get_mut(lane) {
             change(snapshot);
         }
     }
 
-    async fn acp_attempt(
+    async fn attempt(
         &self,
-        command: &Path,
-        provider: &str,
         task: &LaneTask,
         cancel: &CancellationToken,
     ) -> Result<String, LaneFailure> {
@@ -274,24 +265,9 @@ impl Lanes {
             .prefix("fiach-acp-lane-")
             .tempdir()
             .map_err(|_| failed("session_error", String::new()))?;
-        let mut launch = goose_acp_runner::LaunchSpec::new(command);
-        // Pass only this provider's route. In sandbox children these are the
-        // broker URL and per-job key, never the host provider credentials.
-        let route = crate::broker::Provider::from_name(provider)
+        let provider = self.provider.as_str();
+        let launch = launch_spec(&self.command, provider)
             .map_err(|_| failed("unsupported_acp_provider", String::new()))?;
-        for name in [
-            "PATH",
-            "TMPDIR",
-            "SSL_CERT_FILE",
-            "SSL_CERT_DIR",
-            "NIX_SSL_CERT_FILE",
-            route.key_env(),
-            route.host_env(),
-        ] {
-            if let Some(value) = std::env::var_os(name) {
-                launch.env.insert(name.into(), value);
-            }
-        }
         let request = goose_acp_runner::Task {
             prompt: task.instructions.clone(),
             instructions: format!(
@@ -434,9 +410,9 @@ fn lane_schema(lane: &str) -> serde_json::Value {
 
 /// Whether a failed attempt earns a replacement. A deadline, provider failure,
 /// or turn limit would most likely recur with a fresh attempt and only add
-/// wall time, so only session errors and empty results are retried.
+/// wall time, so only session errors and missing or invalid final outputs are retried.
 fn replaceable(reason: &str) -> bool {
-    matches!(reason, "session_error" | "empty_result")
+    matches!(reason, "session_error" | "invalid_output")
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -488,31 +464,9 @@ mod tests {
         assert!(!validator.is_valid(&serde_json::json!({"summary":"Looks fine"})));
     }
     async fn acp_lanes_fixture(mode: &str) -> (super::Lanes, tempfile::TempDir) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let log =
-            serde_json::to_string(&dir.path().join("sessions.jsonl").to_string_lossy()).unwrap();
         let output = serde_json::json!({"status":"no_findings","candidates":[]}).to_string();
-        let script = include_str!("../../tests/fixtures/acp_worker.py")
-            .replace("os.environ[\"FIXTURE_LOG\"]", &log)
-            .replace(
-                "os.environ.get(\"FIXTURE_MODE\", \"recovery\")",
-                &serde_json::to_string(mode).unwrap(),
-            )
-            .replace(
-                "os.environ[\"FIXTURE_OUTPUT\"]",
-                &serde_json::to_string(&output).unwrap(),
-            );
-        let command = dir.path().join("acp-fixture");
-        let python = tokio::process::Command::new("python3")
-            .args(["-c", "import sys; print(sys.executable)"])
-            .output()
-            .await
-            .unwrap();
-        assert!(python.status.success());
-        let python = String::from_utf8(python.stdout).unwrap();
-        std::fs::write(&command, format!("#!{}\n{script}", python.trim())).unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let command = super::super::agent_loop::fixture_command(dir.path(), mode, &output).await;
         let inspection =
             crate::inspection::Inspection::new(dir.path(), &[], &"a".repeat(40), &"b".repeat(40))
                 .unwrap();
@@ -539,6 +493,19 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(lanes.complete());
         assert!(results[0].output.contains("no_findings"));
+    }
+
+    #[tokio::test]
+    async fn missing_final_output_gets_one_replacement() {
+        let (lanes, _dir) = acp_lanes_fixture("missing_output").await;
+        assert_eq!(
+            lanes
+                .run(&tokio_util::sync::CancellationToken::new())
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(lanes.snapshots()[0].recovery_attempt, 1);
     }
 
     #[tokio::test]

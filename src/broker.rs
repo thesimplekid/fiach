@@ -22,6 +22,7 @@ use std::{
     fmt,
     io::Write as _,
     net::SocketAddr,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -1546,11 +1547,11 @@ fn group_uses(
 
 /// A broker serving one nspawn sandbox over Unix sockets.
 ///
-/// `state_dir` must be host-only: it holds the request log, and only its
-/// `sockets` subdirectory is bound (read-only) into the sandbox.
+/// The host-only state directory holds the request log. The sandbox receives
+/// a read-only bind mount of a separate directory containing the sockets and manifest.
 pub struct SandboxBroker {
     broker: Broker,
-    sockets: PathBuf,
+    sockets: tempfile::TempDir,
     log: PathBuf,
 }
 
@@ -1562,22 +1563,17 @@ impl SandboxBroker {
         canaries: Vec<Canary>,
         breaker: Option<CircuitBreaker>,
     ) -> Result<Self> {
-        let sockets = state_dir.join("sockets");
-        match std::fs::remove_dir_all(&sockets) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Removing stale broker sockets {}", sockets.display())
-                });
-            }
-        }
         create_private_dir(state_dir)?;
-        create_private_dir(&sockets)?;
+        // Unix socket addresses must fit sockaddr_un even for long artifact paths.
+        let sockets = tempfile::Builder::new()
+            .prefix("fiach-broker-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .context("Creating private broker socket directory")?;
         let log = state_dir.join("requests.jsonl");
         let broker = Broker::start(BrokerConfig {
             routes,
-            listen: Listen::Unix(sockets.clone()),
+            listen: Listen::Unix(sockets.path().to_owned()),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_cost_usd,
             log_path: Some(log.clone()),
@@ -1585,7 +1581,7 @@ impl SandboxBroker {
             breaker,
         })
         .await?;
-        broker.write_manifest(&sockets.join(MANIFEST_NAME))?;
+        broker.write_manifest(&sockets.path().join(MANIFEST_NAME))?;
         Ok(Self {
             broker,
             sockets,
@@ -1596,7 +1592,10 @@ impl SandboxBroker {
     /// The `systemd-nspawn` argument exposing the sockets to the sandbox.
     /// Connecting to a Unix socket works on a read-only bind mount.
     pub fn nspawn_bind_arg(&self) -> String {
-        format!("--bind-ro={}:{SANDBOX_MOUNT}", self.sockets.display())
+        format!(
+            "--bind-ro={}:{SANDBOX_MOUNT}",
+            self.sockets.path().display()
+        )
     }
 
     /// Arguments for `fiach` inside the sandbox that run the following
@@ -1618,7 +1617,6 @@ impl SandboxBroker {
     /// quarantined, so callers never use its results.
     pub async fn finish(self) -> Result<BrokerReport> {
         let report = self.broker.shutdown().await;
-        let _ = std::fs::remove_dir_all(&self.sockets);
         tracing::info!(
             requests = report.usage.requests,
             input_tokens = report.usage.input_tokens,
@@ -2869,7 +2867,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let case = &cases()[0];
         let (upstream, _mock) = mock_upstream(case.response).await;
-        let state_dir = dir.path().join("run.broker");
+        let state_dir = dir.path().join("a".repeat(120)).join("run.broker");
         let broker = SandboxBroker::start(
             &state_dir,
             vec![route(case.provider, &upstream, case.model)],
@@ -2882,16 +2880,12 @@ mod tests {
         )
         .await
         .unwrap();
+        let sockets = broker.sockets.path().to_owned();
         assert_eq!(
             broker.nspawn_bind_arg(),
-            format!(
-                "--bind-ro={}:/run/fiach-broker",
-                state_dir.join("sockets").display()
-            )
+            format!("--bind-ro={}:/run/fiach-broker", sockets.display())
         );
-        let bridge = Bridge::start(&state_dir.join("sockets/manifest.json"))
-            .await
-            .unwrap();
+        let bridge = Bridge::start(&sockets.join(MANIFEST_NAME)).await.unwrap();
         let env: std::collections::HashMap<_, _> = bridge.env().iter().cloned().collect();
         let response = reqwest::Client::new()
             .post(format!("{}{}", env["OPENROUTER_HOST"], case.path))
@@ -2904,7 +2898,7 @@ mod tests {
         let error = broker.finish().await.unwrap_err().to_string();
         assert!(error.contains("review GitHub token"), "{error}");
         assert!(!error.contains("github_pat_canary"), "{error}");
-        assert!(!state_dir.join("sockets").exists());
+        assert!(!sockets.exists());
         assert!(state_dir.join("requests.jsonl").exists());
     }
 

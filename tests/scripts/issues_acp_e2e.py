@@ -304,7 +304,6 @@ def main():
     artifacts = artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
     assert not any(artifacts.iterdir()), 'Artifact directory must be empty'
-    assert len(str(artifacts / 'lost_response/fiach-artifacts-XXXXXX.broker/sockets/openai.sock').encode()) < 108, 'Artifact path is too long for Linux Unix sockets'
     print(f'Artifacts: {artifacts}', flush=True)
     runner = Runner(rootfs, artifacts, args.sudo, args.timeout_scale)
     try:

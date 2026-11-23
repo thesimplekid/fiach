@@ -23,7 +23,7 @@ use crate::process::CommandExt as _;
 use crate::reporting::{self, ReportingArtifact, ReviewPhase};
 use crate::state;
 use crate::workspace;
-use agent_loop::{AgentLoop, HostTools, LoopConfig, LoopRetry, ReplyEnd};
+use agent_loop::{AgentLoop, FollowUpBudget, HostTools, LoopConfig};
 
 mod acp_loop;
 pub(crate) mod agent_loop;
@@ -1506,24 +1506,21 @@ pub async fn run_review(
 
     // The coordinator may inspect cited locations; it cannot execute or delegate.
     let coordinator_id = params.persona.session_name().to_string();
-    let coordinator = AgentLoop::new(
-        coordinator_id.clone(),
-        LoopConfig {
-            provider: params.provider.clone(),
-            model: params.model.clone(),
-            command: agent_loop::executable(params.acp_command.as_deref()),
-            timeout: Duration::from_secs(params.timeout_mins.saturating_mul(60)),
-            system_prompt: COORDINATOR_PROMPT.to_string(),
-            tools: vec![
-                Arc::new(inspection),
-                Arc::new(ReportingClient {
-                    phase: ReviewPhase::Finder,
-                    artifact: reporting_artifact.clone(),
-                }),
-            ],
-            max_turns: params.max_turns,
-        },
-    );
+    let coordinator = AgentLoop::new(LoopConfig {
+        provider: params.provider.clone(),
+        model: params.model.clone(),
+        command: agent_loop::executable(params.acp_command.as_deref()),
+        timeout: Duration::from_secs(params.timeout_mins.saturating_mul(60)),
+        system_prompt: COORDINATOR_PROMPT.to_string(),
+        tools: vec![
+            Arc::new(inspection),
+            Arc::new(ReportingClient {
+                phase: ReviewPhase::Finder,
+                artifact: reporting_artifact.clone(),
+            }),
+        ],
+        max_turns: params.max_turns,
+    });
     let direct_cost = direct_call_cost_usd;
     let usage_cost = |usage: &[ProviderUsage]| {
         cost_from_usage(
@@ -1577,7 +1574,7 @@ pub async fn run_review(
             return Ok(());
         }
 
-        let mut retry = LoopRetry::new("finder", params.max_retries, params.retry_delay_secs);
+        let mut retry = FollowUpBudget::new("finder", params.max_retries, params.retry_delay_secs);
         let mut budget_nudged = false;
         let mut message = Message::user().with_text(coordinator_kickoff(
             params.pr_number,
@@ -1601,19 +1598,16 @@ pub async fn run_review(
                 tracing::warn!("Review cancelled by user (Ctrl+C)");
                 bail!("Review cancelled by user");
             }
-            if reporting_artifact
+            let complete = reporting_artifact
                 .lock()
                 .await
-                .finder_complete_with_summary(require_pr_summary)
-            {
+                .finder_complete_with_summary(require_pr_summary);
+            if !end.needs_follow_up(complete)? {
                 return Ok(());
             }
 
             let last_text = coordinator.final_text();
             let last_text = last_text.trim();
-            if end == ReplyEnd::TurnLimit {
-                return Ok(());
-            }
             if nudge_requested.load(Ordering::SeqCst) && !budget_nudged {
                 // Advisory nudges wait for a completed prompt; never cancel a session.
                 budget_nudged = true;
@@ -1625,34 +1619,28 @@ pub async fn run_review(
                 message = Message::user().with_text(FINDER_BUDGET_NUDGE);
                 continue;
             }
-            let follow_up = match end {
-                ReplyEnd::TurnLimit => return Ok(()),
-
-                ReplyEnd::Finished => {
-                    if budget_nudged && retry.retries() > 0 {
-                        return Ok(());
-                    }
-                    if retry.exhausted() {
-                        tracing::warn!(
-                            repo = %params.repo,
-                            pr = params.pr_number,
-                            review_kind = %params.review_kind,
-                            phase = "finder",
-                            session_id = %coordinator_id,
-                            "Agent stopped prematurely and reached retry limit without writing report"
-                        );
-                        return Ok(());
-                    }
-                    if budget_nudged {
-                        FINDER_BUDGET_FINAL.to_string()
-                    } else if last_text.is_empty() {
-                        "You stopped before submitting a complete structured review result. Continue the review, call `submit_pr_summary` if a summary lane was requested, and call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using the required reporting tools.".to_string()
-                    } else {
-                        format!(
-                            "You stopped before submitting a complete structured review result. Continue from where you left off. If a summary lane was requested, call `submit_pr_summary`. Then call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using the required reporting tools. Your last visible message was:\n\n{last_text}"
-                        )
-                    }
-                }
+            if budget_nudged && retry.retries() > 0 {
+                return Ok(());
+            }
+            if retry.exhausted() {
+                tracing::warn!(
+                    repo = %params.repo,
+                    pr = params.pr_number,
+                    review_kind = %params.review_kind,
+                    phase = "finder",
+                    session_id = %coordinator_id,
+                    "Agent stopped prematurely and reached retry limit without writing report"
+                );
+                return Ok(());
+            }
+            let follow_up = if budget_nudged {
+                FINDER_BUDGET_FINAL.to_string()
+            } else if last_text.is_empty() {
+                "You stopped before submitting a complete structured review result. Continue the review, call `submit_pr_summary` if a summary lane was requested, and call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using the required reporting tools.".to_string()
+            } else {
+                format!(
+                    "You stopped before submitting a complete structured review result. Continue from where you left off. If a summary lane was requested, call `submit_pr_summary`. Then call `submit_finding` for each candidate or `submit_no_findings` if there are no candidates. Do not stop without using the required reporting tools. Your last visible message was:\n\n{last_text}"
+                )
             };
             tracing::info!(
                 repo = %params.repo,
@@ -1665,7 +1653,7 @@ pub async fn run_review(
                 "Coordinator stopped before a structured result; retrying with a follow-up prompt"
             );
             retry.backoff().await;
-            message = Message::user().with_text(&follow_up);
+            message = Message::user().with_text(follow_up);
         }
     };
     // Cost is polled independently of the coordinator, since lanes and long
@@ -2678,8 +2666,8 @@ async fn resume_coordinator_for_duplicates(params: DedupeParams<'_>) -> Result<(
             params.output_price_per_m,
         )
     };
-    // Embedded logs append model calls; ACP updates one cumulative session
-    // entry. A cost difference handles both without ignoring continuations.
+    // ACP updates one cumulative usage entry per session, so the continuation
+    // costs whatever the session total grew by after this point.
     let initial_cost = session_cost();
     let continuation_cost =
         || session_cost().map(|cost| (cost - initial_cost.unwrap_or(0.0)).max(0.0));
@@ -2717,7 +2705,7 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
     let phase_cancel_token = params.cancel_token.child_token();
     let mut budget_reached = false;
     let dedupe_future = async {
-        let mut retry = LoopRetry::new(
+        let mut retry = FollowUpBudget::new(
             "duplicate suppression",
             params.max_retries,
             params.retry_delay_secs,
@@ -2744,18 +2732,17 @@ Call submit_duplicate_decision exactly once for each supplied finding_id. Set al
             if phase_cancel_token.is_cancelled() {
                 bail!("Duplicate suppression pass cancelled by user");
             }
-            let follow_up = match end {
-                ReplyEnd::TurnLimit => return Ok(()),
-
-                ReplyEnd::Finished => {
-                    if dedupe_complete(&params.artifact, &expected_ids).await || retry.exhausted() {
-                        return Ok(());
-                    }
-                    "You stopped before submitting duplicate decisions for all verified findings. Continue and call `submit_duplicate_decision` exactly once for every remaining finding.".to_string()
-                }
-            };
+            // Duplicate decisions are independent. On session closure the caller
+            // can still validate every decision that landed before the turn ended.
+            if end != agent_loop::ReplyEnd::Finished
+                || retry.exhausted()
+                || dedupe_complete(&params.artifact, &expected_ids).await
+            {
+                return Ok(());
+            }
+            let follow_up = "You stopped before submitting duplicate decisions for all verified findings. Continue and call `submit_duplicate_decision` exactly once for every remaining finding.";
             retry.backoff().await;
-            message = Message::user().with_text(&follow_up);
+            message = Message::user().with_text(follow_up);
         }
     };
 
@@ -2846,24 +2833,21 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     }
     verifier_prompt.push_str(params.repo_guidance);
 
-    let agent = AgentLoop::new(
-        "review-verifier",
-        LoopConfig {
-            provider: params.provider_name.into(),
-            model: params.model.into(),
-            command: agent_loop::executable(params.acp_command),
-            timeout: Duration::from_secs(params.timeout_mins.saturating_mul(60)),
-            system_prompt: VERIFIER_POLICY.to_string(),
-            tools: vec![
-                Arc::new(inspection),
-                Arc::new(ReportingClient {
-                    phase: ReviewPhase::Verifier,
-                    artifact: params.artifact.clone(),
-                }),
-            ],
-            max_turns: params.max_turns,
-        },
-    );
+    let agent = AgentLoop::new(LoopConfig {
+        provider: params.provider_name.into(),
+        model: params.model.into(),
+        command: agent_loop::executable(params.acp_command),
+        timeout: Duration::from_secs(params.timeout_mins.saturating_mul(60)),
+        system_prompt: VERIFIER_POLICY.to_string(),
+        tools: vec![
+            Arc::new(inspection),
+            Arc::new(ReportingClient {
+                phase: ReviewPhase::Verifier,
+                artifact: params.artifact.clone(),
+            }),
+        ],
+        max_turns: params.max_turns,
+    });
     let usage_cost = |usage: &[ProviderUsage]| {
         cost_from_usage(
             usage,
@@ -2877,7 +2861,8 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
     let phase_cancel_token = params.cancel_token.child_token();
     let mut budget_exceeded = false;
     let verifier_future = async {
-        let mut retry = LoopRetry::new("verifier", params.max_retries, params.retry_delay_secs);
+        let mut retry =
+            FollowUpBudget::new("verifier", params.max_retries, params.retry_delay_secs);
         let mut message = Message::user().with_text(&verifier_prompt);
         loop {
             let end = agent
@@ -2900,18 +2885,14 @@ async fn run_verification_pass(params: VerificationParams<'_>) -> Result<Verific
             if phase_cancel_token.is_cancelled() {
                 bail!("Verifier pass cancelled by user");
             }
-            let follow_up = match end {
-                ReplyEnd::TurnLimit => return Ok(()),
-
-                ReplyEnd::Finished => {
-                    if params.artifact.lock().await.verification_settled() || retry.exhausted() {
-                        return Ok(());
-                    }
-                    "You stopped before adjudicating everything supplied. Continue verification and call `submit_verdict` exactly once for every remaining candidate and `submit_prior_finding_status` exactly once for every remaining earlier finding.".to_string()
-                }
-            };
+            if !end.needs_follow_up(params.artifact.lock().await.verification_settled())?
+                || retry.exhausted()
+            {
+                return Ok(());
+            }
+            let follow_up = "You stopped before adjudicating everything supplied. Continue verification and call `submit_verdict` exactly once for every remaining candidate and `submit_prior_finding_status` exactly once for every remaining earlier finding.";
             retry.backoff().await;
-            message = Message::user().with_text(&follow_up);
+            message = Message::user().with_text(follow_up);
         }
     };
 
@@ -3749,6 +3730,68 @@ Reviewed the PR and found no vulnerabilities.
             ..ReportingArtifact::default()
         };
         (artifact, vec![finding], vec![comment])
+    }
+
+    #[tokio::test]
+    async fn silent_dedupe_close_preserves_only_submitted_matches() {
+        let (artifact, mut findings, comments) = duplicate_fixture();
+        let mut second = findings[0].clone();
+        second.finding_id = "F2".into();
+        second.verdict.finding_id = second.finding_id.clone();
+        findings.push(second);
+
+        // F1's decision has landed. The ACP fixture closes silently before deciding F2.
+        let shared = Arc::new(Mutex::new(artifact));
+        let dir = tempfile::tempdir().unwrap();
+        let agent = AgentLoop::new(LoopConfig {
+            command: agent_loop::fixture_command(dir.path(), "missing_output", "{}").await,
+            provider: "openai".into(),
+            model: "test".into(),
+            system_prompt: "Check duplicates".into(),
+            tools: vec![],
+            max_turns: 5,
+            timeout: Duration::from_secs(5),
+        });
+        resume_coordinator_for_duplicates(DedupeParams {
+            agent: &agent,
+            artifact: shared.clone(),
+            repo: "owner/repo",
+            pr_number: 1,
+            pr_context: &reporting::PrContext {
+                state: "OPEN".into(),
+                merged: false,
+                base_ref_name: "main".into(),
+                default_branch: "main".into(),
+                base_commit: "base".into(),
+                head_commit: "head".into(),
+            },
+            findings: &findings,
+            existing_comments: &comments,
+            provider_name: "openai",
+            model: "test",
+            input_price_per_m: None,
+            output_price_per_m: None,
+            max_retries: 1,
+            retry_delay_secs: 0,
+            timeout_mins: 1,
+            max_cost_usd: None,
+            cancel_token: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+
+        let updated = shared.lock().await;
+        let decisions = validated_duplicate_decisions(&updated, &findings, &comments).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0].suppresses_finding("F1"));
+        assert!(!decisions[0].suppresses_finding("F2"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sessions.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 
     #[test]
